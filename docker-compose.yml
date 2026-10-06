@@ -1,0 +1,39 @@
+name: chota-conversation-local
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: conversation
+      POSTGRES_DB: conversation
+      POSTGRES_PASSWORD: ${DATABASE_PASSWORD:?Set DATABASE_PASSWORD in untracked .env}
+    ports:
+      - "127.0.0.1:55595:5432"
+    volumes:
+      - conversation-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U conversation -d conversation"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+    networks: [conversation-local]
+  conversation:
+    build: .
+    environment:
+      DATABASE_URL: postgresql+asyncpg://conversation:${DATABASE_PASSWORD:?Set DATABASE_PASSWORD}@postgres:5432/conversation
+      CONVERSATION_AUTH_PRINCIPALS: ${CONVERSATION_AUTH_PRINCIPALS:?Set exact private scope grants}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    ports:
+      - "127.0.0.1:55585:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks: [conversation-local]
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+networks:
+  conversation-local:
+    internal: true
+volumes:
+  conversation-postgres:
