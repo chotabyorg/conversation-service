@@ -73,6 +73,7 @@ class TurnFailureCode(str, Enum):
     PROCESSING_ERROR = "PROCESSING_ERROR"
     TIMEOUT = "TIMEOUT"
     INVALID_RESULT = "INVALID_RESULT"
+    EXECUTION_UNKNOWN = "EXECUTION_UNKNOWN"
 
 
 class OperationOrigin(str, Enum):
@@ -120,6 +121,7 @@ class ErrorCode(str, Enum):
     LEASE_EXPIRED = "LEASE_EXPIRED"
     STALE_CLAIM = "STALE_CLAIM"
     TERMINAL_RESULT_CONFLICT = "TERMINAL_RESULT_CONFLICT"
+    MANAGED_EXECUTION_STARTED = "MANAGED_EXECUTION_STARTED"
     NO_DRAFT = "NO_DRAFT"
     DELIVERY_IDENTITY_CONFLICT = "DELIVERY_IDENTITY_CONFLICT"
     DELIVERY_INTENT_EXISTS = "DELIVERY_INTENT_EXISTS"
@@ -371,6 +373,11 @@ class TurnRenew(Contract):
     lease_seconds: LeaseSeconds
 
 
+class TurnExecute(Contract):
+    claim_epoch: PositiveCounter
+    claim_token: ClaimToken = Field(repr=False)
+
+
 class TerminalRequest(Contract):
     claim_epoch: PositiveCounter
     claim_token: ClaimToken = Field(repr=False)
@@ -417,6 +424,10 @@ class TurnRead(Contract):
     draft_text: TextContent | None
     failure_code: TurnFailureCode | None
     operation_refs: list[OperationReference] = Field(max_length=32)
+    managed_agent_id: UUID | None
+    managed_dispatch_epoch: PositiveCounter | None
+    managed_dispatch_started_at: UtcTimestamp | None
+    managed_request_fingerprint: Annotated[str, Field(pattern=r"^[a-f0-9]{64}$")] | None
 
 
 class TurnResult(Contract):

@@ -2,9 +2,9 @@
 
 from uuid import UUID
 
-from fastapi import APIRouter, Query, Response
+from fastapi import APIRouter, Query, Request, Response
 
-from api.dependencies import AppDatabase, TrustedPrincipal
+from api.dependencies import AppDatabase, AppManagedPort, AppSettings, TrustedPrincipal
 from core.errors import DomainError
 from core.logging import logger
 from schemas.contracts import (
@@ -25,12 +25,13 @@ from schemas.contracts import (
     TurnClaimResult,
     TurnComplete,
     TurnCreate,
+    TurnExecute,
     TurnFail,
     TurnRead,
     TurnRenew,
     TurnResult,
 )
-from services import authority, delivery, journal, turns
+from services import authority, delivery, journal, managed_execution, turns
 
 router = APIRouter(prefix="/internal/v1")
 
@@ -144,6 +145,22 @@ async def renew(
     principal: TrustedPrincipal,
 ) -> TurnRead:
     return await turns.renew_turn(database, principal, turn_id, request)
+
+
+@router.post("/turns/{turn_id}/execute", response_model=TurnResult)
+async def execute(
+    turn_id: UUID,
+    request: TurnExecute,
+    http_request: Request,
+    database: AppDatabase,
+    principal: TrustedPrincipal,
+    settings: AppSettings,
+    port: AppManagedPort,
+) -> TurnResult:
+    return await managed_execution.execute_claimed_turn(
+        database, principal, turn_id, request, settings, port,
+        getattr(http_request.state, "request_id", ""),
+    )
 
 
 @router.post("/turns/{turn_id}/complete", response_model=TurnResult)

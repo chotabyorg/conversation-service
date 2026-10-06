@@ -4,7 +4,8 @@ All business paths use `/internal/v1`. Exactly one dedicated `X-Service-Token`
 authenticates a token-free Principal with server-provisioned exact grants. Missing,
 wrong, duplicated or malformed credentials are uniformly 401 before parsing a
 body. Scope mismatch and guessed UUID are uniformly 404. There is no public route,
-gateway change, provider send or AI invocation. X-User headers provide no authority.
+gateway change or provider send. The unconsumed managed executor is described in
+[managed execution](managed-execution.md). X-User headers provide no authority.
 
 | Method/path | Request | Response and retry behavior |
 | --- | --- | --- |
@@ -16,6 +17,7 @@ gateway change, provider send or AI invocation. X-User headers provide no author
 | GET `/turns/{id}` | UUID | TurnRead without claim secret/digest/fingerprints |
 | POST `/turns/{id}/claim` | worker_ref, lease_seconds1..300 | TurnClaimResult with raw claim_token only here; 200. Not idempotent: lost response recovers same Turn after lease expiry |
 | POST `/turns/{id}/renew` | claim_epoch, claim_token, lease_seconds | TurnRead; live winning proof extends expiry without changing epoch/token; no secret echo |
+| POST `/turns/{id}/execute` | claim_epoch, claim_token only | TurnResult; one-attempt managed execution; sameepoch unfinished duplicate409 MANAGED_EXECUTION_STARTED; recovered marked epoch completes EXECUTION_UNKNOWN without AI; winning terminal proof replays without AI |
 | POST `/turns/{id}/complete` | claim_epoch, claim_token, outcome DRAFT_READY/NO_RESPONSE, draft_text optional, operation_refs=[] | TurnResult; first mutation needs live winning proof; exact terminal replay needs stored winning proof and identical result, even after expiry |
 | POST `/turns/{id}/fail` | claim_epoch, claim_token, failure_code, operation_refs=[] | TurnResult with inspectable failure; same terminal replay/fencing contract |
 | POST `/conversations/{id}/control` | expected_authority_revision, control_mode | ConversationRead; every accepted CAS increments revision, including same-mode; stale retry conflicts |
@@ -28,7 +30,7 @@ resource is created. There is no 202 implying that work executed. No deletion,
 Message edit/outbound append or implicit draft promotion exists.
 
 `GET /health` returns `{status:"ok",service:"conversation-service"}`.
-`GET /ready` returns ready200 only when DB query, migration `0001_foundation` and
+`GET /ready` returns ready200 only when DB query, migration `0002_managed_execution` and
 required Conversation query succeed; otherwise not_ready503. These are the only
 unauthenticated routes. `GET /internal/openapi.json` requires the service header.
 Default `/docs`, `/redoc`, `/openapi.json` are disabled. The fetched schema provides
@@ -60,7 +62,7 @@ DRAFT_READY requires draft_text; NO_RESPONSE requires null. Input first must not
 exceed last. Reconciliation expected_authority_revision is required exactly for
 DISPATCH_REQUESTED and forbidden otherwise. error_code is allowed only for
 FAILED/UNKNOWN/PARTIAL/INTERRUPTED. Failure codes are PROCESSING_ERROR, TIMEOUT,
-INVALID_RESULT; delivery errors are PROVIDER_REJECTED, TRANSPORT_ERROR, TIMEOUT,
+INVALID_RESULT, EXECUTION_UNKNOWN; delivery errors are PROVIDER_REJECTED, TRANSPORT_ERROR, TIMEOUT,
 INTERRUPTED, UNSPECIFIED. No arbitrary diagnostic error string is accepted.
 
 ## Fingerprints and errors
@@ -94,3 +96,8 @@ it never includes input/context, rejected values, tokens, SQL or exception text.
 
 For control/delivery transitions and clock/replay details see
 [states and transactions](states-and-transactions.md).
+
+TurnRead additively exposes nullable managed_agent_id, managed_dispatch_epoch,
+managed_dispatch_started_at and managed_request_fingerprint. The hash excludes
+tokens. Marker metadata is execution association, not a provider receipt.
+MANAGED_EXECUTION_STARTED is a fixed409 conflict and does not fail live work.

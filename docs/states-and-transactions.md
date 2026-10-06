@@ -130,5 +130,16 @@ omitted/null update keeps existing known reference. Positive current state clear
 safe error_code; prior negative evidence remains in reconciliation history.
 
 Future provider adapters/retries, outbound Message promotion, input freshness,
-supersede, settling and managed AI policy require separate contracts. Goal 1
+supersede, settling and managed business safety require separate contracts. Goal 1
 retains evidence for them without implementing them.
+
+## Managed processing uncertainty
+
+Goal2 adds four same-Turn nullable marker columns and EXECUTION_UNKNOWN failure
+without altering retained creation/terminal proofs or the delivery state machine.
+See [managed execution](managed-execution.md) for the snapshot→committed marker→
+one HTTP→fenced finish algorithm. AI work holds no DB session or row lock. Marker
+and result decisions use the DB clock after the final lock, as claims already do.
+Sameepoch duplicate conflicts without terminalizing the live worker. Recovery of
+an expired marked Turn increments epoch normally, then records EXECUTION_UNKNOWN
+without sending another request. Late displaced work remains STALE_CLAIM.

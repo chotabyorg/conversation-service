@@ -79,17 +79,25 @@ def migrated(database_url: str) -> None:
         )
 
 
-@pytest.fixture(autouse=True)
-def no_external_network(monkeypatch: pytest.MonkeyPatch, database_url: str) -> None:
-    """ASGI is local; only the selected PostgreSQL socket may leave the process."""
+@pytest.fixture
+def network_allowlist(database_url: str) -> set[tuple[str, int]]:
+    """Only explicit fresh test endpoints may extend the designated DB sockets."""
     port = make_url(database_url).port or 5432
+    return {("127.0.0.1", port), ("::1", port)}
+
+
+@pytest.fixture(autouse=True)
+def no_external_network(
+    monkeypatch: pytest.MonkeyPatch, network_allowlist: set[tuple[str, int]]
+) -> None:
+    """Ordinary tests remain PG-only; harness fixtures add exact loopback ports."""
     original = socket.socket.connect
 
     def guarded(sock: socket.socket, address: Any) -> Any:
         if sock.family in {socket.AF_INET, socket.AF_INET6}:
             host, target_port = address[:2]
-            assert host in {"127.0.0.1", "::1"} and target_port == port, (
-                "Unexpected non-PostgreSQL network access is forbidden in foundation tests"
+            assert host in {"127.0.0.1", "::1"} and (host, target_port) in network_allowlist, (
+                "Unexpected non-PostgreSQL endpoint outside the explicit test allowlist"
             )
         return original(sock, address)
 

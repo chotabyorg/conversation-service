@@ -5,8 +5,9 @@ This is the Main Platform communication authority defined by the merged
 The paused Chota 2.0 fashion/e-commerce repository and Project #6 are separate.
 
 Goal 1 supplies a durable journal and processing/authority primitives. Existing
-production channels and legacy AI calls have no consumer of this service. There
-is no provider/AI/CP networking, Redis authority, broker, workflow framework,
+production channels and legacy AI calls have no consumer of this service. Goal2
+adds one protected managed AI HTTP port and no provider/CP networking,
+Redis authority, broker, workflow framework,
 public API, webhook, deploy workflow or GitOps service resources.
 
 | Entity | Foundation ownership |
@@ -48,5 +49,6 @@ Business operation coordination**; there is no BusinessOperation/confirmation
 ledger or UNKNOWN business-write reconciliation here.
 
 See [states and transactions](states-and-transactions.md) for durable primitives
-and [API](api.md) for the internal contracts. Goal 2 introduces managed AI Turn
-execution while preserving every existing legacy `/v1/chat/completions` caller.
+and [API](api.md) for the internal contracts. [Managed execution](managed-execution.md)
+uses canonical Messages and same-Turn claims while AI remains prompt/KB/model/tool
+authority. Existing legacy `/v1/chat/completions` callers remain unchanged.

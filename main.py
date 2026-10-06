@@ -1,4 +1,4 @@
-"""Main Chota Conversation application; no provider or AI execution."""
+"""Main Chota journal with an unconsumed internal managed AI execution harness."""
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -12,9 +12,13 @@ from api.middleware import BoundaryMiddleware
 from core.config import Settings, load_settings
 from core.logging import configure_logging, logger
 from db.database import Database
+from services.managed_client import ManagedAIClient, ManagedAIPort
 
 
-def create_app(settings: Settings | None = None, database: Database | None = None) -> FastAPI:
+def create_app(
+    settings: Settings | None = None, database: Database | None = None,
+    managed_port: ManagedAIPort | None = None,
+) -> FastAPI:
     @asynccontextmanager
     async def lifespan(application: FastAPI) -> AsyncIterator[None]:
         active_settings = settings if settings is not None else load_settings()
@@ -30,6 +34,9 @@ def create_app(settings: Settings | None = None, database: Database | None = Non
             raise RuntimeError("Invalid conversation-service database configuration.") from None
         application.state.settings = active_settings
         application.state.database = active_database
+        application.state.managed_port = (
+            managed_port if managed_port is not None else ManagedAIClient(active_settings)
+        )
         logger.info("", extra={"stage": "startup", "code": "STARTED"})
         try:
             yield
