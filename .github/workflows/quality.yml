@@ -1,0 +1,62 @@
+name: Quality
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: conversation_test
+          POSTGRES_PASSWORD: isolated_ci_fixture_only
+          POSTGRES_DB: conversation_test
+        ports: [5432:5432]
+        options: >-
+          --health-cmd "pg_isready -U conversation_test -d conversation_test"
+          --health-interval 2s --health-timeout 2s --health-retries 20
+    env:
+      DATABASE_URL: postgresql+asyncpg://conversation_test:isolated_ci_fixture_only@127.0.0.1:5432/conversation_test
+      TEST_DATABASE_URL: postgresql+asyncpg://conversation_test:isolated_ci_fixture_only@127.0.0.1:5432/conversation_test
+      TEST_DATABASE_DISPOSABLE: "yes"
+      CONVERSATION_AUTH_PRINCIPALS: '[{"principal_id":"ci-worker","token":"ci-synthetic-token-00000000000000000000","grants":[{"owner_id":"ci-owner","integration_id":"00000000-0000-4000-8000-000000000001","channel":"WEBSITE_WIDGET","provider_namespace":"ci.widget"}]}]'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: python -m pip install -r requirements-dev.txt
+      - run: python -m pip check
+      - name: Migrate empty disposable PostgreSQL
+        run: python -m alembic upgrade head
+      - name: Start migrated service and check readiness
+        run: |
+          python -m uvicorn main:app --host 127.0.0.1 --port 8000 --no-access-log > /tmp/conversation-ci.log 2>&1 &
+          service_pid=$!
+          trap 'kill "$service_pid" 2>/dev/null || true' EXIT
+          python - <<'PY'
+          import time
+          import urllib.error
+          import urllib.request
+          for attempt in range(30):
+              try:
+                  with urllib.request.urlopen("http://127.0.0.1:8000/ready", timeout=2) as response:
+                      assert response.status == 200
+                  break
+              except (urllib.error.URLError, AssertionError):
+                  time.sleep(1)
+          else:
+              raise SystemExit("Migrated service readiness failed")
+          PY
+      - run: python -m pytest
+      - run: python -m ruff check .
+      - run: python -m mypy
+      - name: Build local verification image
+        run: docker build -t conversation-service:ci .
