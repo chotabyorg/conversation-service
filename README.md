@@ -82,6 +82,10 @@ database password and an independent service token (32..256 ASCII characters fro
 startup DATABASE_URL must be `postgresql+asyncpg` and point to the local instance.
 Percent-encode any database password characters reserved by a URL. Compose's
 DATABASE_PASSWORD is local orchestration configuration and is ignored by Settings.
+The native application and migration commands below read `.env` in the current
+directory. Migrations read only DATABASE_URL, without variable interpolation or
+loading authentication configuration. An exported DATABASE_URL takes precedence,
+including an empty or invalid value, which fails validation instead of falling back.
 
 ```bash
 docker compose up -d postgres
@@ -105,6 +109,12 @@ only against migration `0001_foundation` and the required table query. `/health`
 checks process liveness. Both return bounded public status only.
 
 ## Internal authentication
+
+Programmatic `Settings` construction accepts the field names `database_url`,
+`auth_principals`, `log_level` and their uppercase environment aliases. Explicit
+constructor values take precedence over environment, then `.env`, then defaults;
+invalid explicit values fail validation. When both constructor spellings of a
+field are supplied, its uppercase alias takes precedence.
 
 `CONVERSATION_AUTH_PRINCIPALS` is private server-provisioned JSON with 1..32 entries:
 

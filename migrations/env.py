@@ -4,6 +4,7 @@ import asyncio
 import os
 
 from alembic import context
+from dotenv import dotenv_values
 from sqlalchemy import Connection
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
@@ -25,8 +26,12 @@ def run_migrations(connection: Connection) -> None:
 
 
 async def online() -> None:
+    # Read only the database setting. An exported value, even empty, outranks .env.
+    database_url = os.environ.get("DATABASE_URL")
+    if database_url is None:
+        database_url = dotenv_values(".env", interpolate=False).get("DATABASE_URL")
     engine = create_async_engine(
-        validated_url(os.environ.get("DATABASE_URL", "")),
+        validated_url(database_url or ""),
         poolclass=NullPool,
         echo=False,
         hide_parameters=True,

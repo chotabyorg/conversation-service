@@ -6,6 +6,7 @@ import json
 from typing import Annotated, Literal
 
 from pydantic import (
+    AliasChoices,
     BaseModel,
     BeforeValidator,
     ConfigDict,
@@ -51,15 +52,24 @@ class Settings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         extra="ignore",
-        populate_by_name=True,
         frozen=True,
     )
-    database_url: SecretStr = Field(alias="DATABASE_URL", repr=False)
+    # Both constructor spellings use one source key, so explicit values outrank env/dotenv.
+    # If both are supplied, the uppercase alias wins deterministically.
+    database_url: SecretStr = Field(
+        alias="DATABASE_URL",
+        validation_alias=AliasChoices("DATABASE_URL", "database_url"),
+        repr=False,
+    )
     auth_principals: Annotated[tuple[AuthPrincipal, ...], NoDecode] = Field(
-        alias="CONVERSATION_AUTH_PRINCIPALS", min_length=1, max_length=32, repr=False
+        alias="CONVERSATION_AUTH_PRINCIPALS",
+        validation_alias=AliasChoices("CONVERSATION_AUTH_PRINCIPALS", "auth_principals"),
+        min_length=1,
+        max_length=32,
+        repr=False,
     )
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = Field(
-        default="INFO", alias="LOG_LEVEL"
+        default="INFO", alias="LOG_LEVEL", validation_alias=AliasChoices("LOG_LEVEL", "log_level")
     )
 
     @field_validator("database_url")
