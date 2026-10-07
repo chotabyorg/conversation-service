@@ -126,4 +126,7 @@ def test_application_source_contains_no_provider_ai_cp_or_broker_clients():
                     imports.update(alias.name.split(".")[0] for alias in node.names)
                 elif isinstance(node, ast.ImportFrom) and node.module:
                     imports.add(node.module.split(".")[0])
-            assert not imports & forbidden, f"Unexpected runtime network client in {path.name}"
+            allowed = {"httpx"} if path == root / "services" / "managed_client.py" else set()
+            assert not imports & (forbidden - allowed), (
+                f"Unexpected runtime network client in {path.name}"
+            )

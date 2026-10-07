@@ -3,13 +3,19 @@
 Durable provider-neutral communication journal and processing primitives for Main
 Chota Platform. PostgreSQL owns accepted inbound events, canonical Messages,
 Conversation identity, stable AgentTurns, delivery evidence and control authority.
-It does not execute AI work or send anything to a provider.
+An unconsumed protected managed executor calls `ai-agent-service` for a claimed
+Turn. It sends nothing to a messaging or business provider.
 
 Goal 1 is tracked in [issue #1](https://github.com/chotabyorg/conversation-service/issues/1),
 linked to the [Project #3 Foundation initiative](https://github.com/orgs/chotabyorg/projects/3/views/1?pane=issue&itemId=263003543).
 The [Main Conversation ADR](https://github.com/chotabyorg/gitops/blob/05867486c8de6292f6b5679391e84c19d3421557/docs/main-chota-conversation-foundation.md)
 defines this boundary. Foundation remains an umbrella for later stages; Goal 1
 alone does not complete it.
+
+Goal 2 is tracked in [issue #3](https://github.com/chotabyorg/conversation-service/issues/3).
+See [managed execution](docs/managed-execution.md) for the independent v1 AI contract,
+one-attempt semantics and private local binding configuration. No scheduler or
+channel consumer invokes this path.
 
 **Not deployed. No production channel uses this service.** There is no public
 KrakenD route, provider webhook, automatic deployment workflow, registry push or
@@ -67,7 +73,8 @@ See [API contracts](docs/api.md), [states and transactions](docs/states-and-tran
 Python 3.11, PostgreSQL 16, FastAPI/Pydantic 2, async SQLAlchemy 2 and Alembic are
 required. Runtime and dev dependency closures use exact `==` pins in requirements
 files; pyproject configures checks only. No Redis, broker, provider, Control Plane,
-LLM or external business API is needed.
+LLM or external business API is needed for the service suite; managed HTTP tests
+use explicit local fakes.
 
 ```bash
 python3.11 -m venv .venv
@@ -105,7 +112,7 @@ Compose binds only `127.0.0.1:55585` (HTTP) and `127.0.0.1:55595` (PostgreSQL),
 using its own internal network rather than the existing microservices network.
 The application image runs as UID 10001 and Compose uses a read-only filesystem.
 Migrations are explicit; startup never substitutes `create_all`. `/ready` succeeds
-only against migration `0001_foundation` and the required table query. `/health`
+only against migration `0002_managed_execution` and the required table query. `/health`
 checks process liveness. Both return bounded public status only.
 
 ## Internal authentication
@@ -169,8 +176,8 @@ the evidence record for what actually ran.
 
 ## Next stage
 
-**Goal 2 — introduce the managed AgentTurn contract between Conversation Service
-and `ai-agent-service`, while preserving the legacy `/v1/chat/completions` path for
-all existing integrations.** Goal 1 does not start that integration, settling,
+**Goal 3 — business-operation safety for managed Turns**, reconciling stable Turn
+identities with AI-owned durable operation receipts and UNKNOWN recovery before
+any real channel is migrated. Goal2 source remains unconsumed, with no settling,
 human Inbox/handoff, CRM projection, attachments, Voice processing or provider
-delivery.
+delivery. Goal3 is planned, not implemented here.

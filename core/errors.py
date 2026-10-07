@@ -23,6 +23,7 @@ _CONFLICT_MESSAGES = {
     ErrorCode.LEASE_EXPIRED: "Turn lease has expired.",
     ErrorCode.STALE_CLAIM: "Turn claim is stale.",
     ErrorCode.TERMINAL_RESULT_CONFLICT: "Terminal result has different content.",
+    ErrorCode.MANAGED_EXECUTION_STARTED: "Managed execution already started.",
     ErrorCode.NO_DRAFT: "A completed draft is required.",
     ErrorCode.DELIVERY_IDENTITY_CONFLICT: "Delivery identity has different content.",
     ErrorCode.DELIVERY_INTENT_EXISTS: "A delivery attempt already exists for this draft.",

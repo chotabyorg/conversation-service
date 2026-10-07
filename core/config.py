@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 from typing import Annotated, Literal
+from urllib.parse import urlsplit
+from uuid import UUID
 
 from pydantic import (
     AliasChoices,
@@ -20,7 +22,7 @@ from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 from pydantic_settings.exceptions import SettingsError
 from sqlalchemy.engine import make_url
 
-from schemas.contracts import Principal, ScopeGrant, WorkerRef, validate_ascii
+from schemas.contracts import Channel, OwnerId, Principal, ScopeGrant, WorkerRef, validate_ascii
 
 
 def validate_service_token(value: object) -> SecretStr:
@@ -47,6 +49,21 @@ class AuthPrincipal(BaseModel):
         return Principal(principal_id=self.principal_id, grants=self.grants)
 
 
+class ManagedBinding(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    owner_id: OwnerId
+    integration_id: UUID
+    channel: Channel
+    agent_id: UUID
+    service_token: ServiceToken = Field(repr=False)
+
+    def scope(self) -> tuple[str, UUID, Channel]:
+        return self.owner_id, self.integration_id, self.channel
+
+
+TimeoutSeconds = Annotated[float, Field(strict=True, gt=0, le=240, allow_inf_nan=False)]
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -71,6 +88,80 @@ class Settings(BaseSettings):
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = Field(
         default="INFO", alias="LOG_LEVEL", validation_alias=AliasChoices("LOG_LEVEL", "log_level")
     )
+    managed_ai_bindings: Annotated[tuple[ManagedBinding, ...], NoDecode] = Field(
+        default=(), alias="MANAGED_AI_BINDINGS",
+        validation_alias=AliasChoices("MANAGED_AI_BINDINGS", "managed_ai_bindings"),
+        max_length=64, repr=False,
+    )
+    managed_ai_base_url: str | None = Field(
+        default=None, alias="MANAGED_AI_BASE_URL",
+        validation_alias=AliasChoices("MANAGED_AI_BASE_URL", "managed_ai_base_url"), repr=False,
+    )
+    managed_ai_connect_seconds: TimeoutSeconds = Field(
+        default=5.0, alias="MANAGED_AI_CONNECT_SECONDS",
+        validation_alias=AliasChoices("MANAGED_AI_CONNECT_SECONDS", "managed_ai_connect_seconds"),
+    )
+    managed_ai_write_seconds: TimeoutSeconds = Field(
+        default=10.0, alias="MANAGED_AI_WRITE_SECONDS",
+        validation_alias=AliasChoices("MANAGED_AI_WRITE_SECONDS", "managed_ai_write_seconds"),
+    )
+    managed_ai_read_seconds: TimeoutSeconds = Field(
+        default=100.0, alias="MANAGED_AI_READ_SECONDS",
+        validation_alias=AliasChoices("MANAGED_AI_READ_SECONDS", "managed_ai_read_seconds"),
+    )
+    managed_ai_pool_seconds: TimeoutSeconds = Field(
+        default=5.0, alias="MANAGED_AI_POOL_SECONDS",
+        validation_alias=AliasChoices("MANAGED_AI_POOL_SECONDS", "managed_ai_pool_seconds"),
+    )
+    managed_ai_total_seconds: TimeoutSeconds = Field(
+        default=120.0, alias="MANAGED_AI_TOTAL_SECONDS",
+        validation_alias=AliasChoices("MANAGED_AI_TOTAL_SECONDS", "managed_ai_total_seconds"),
+    )
+
+    @field_validator(
+        "managed_ai_connect_seconds", "managed_ai_write_seconds", "managed_ai_read_seconds",
+        "managed_ai_pool_seconds", "managed_ai_total_seconds", mode="before",
+    )
+    @classmethod
+    def managed_timeout(cls, value: object) -> object:
+        # Environment scalar values arrive as text; validate after numeric parsing.
+        if isinstance(value, bool):
+            raise ValueError("invalid managed AI configuration")
+        if isinstance(value, str):
+            try:
+                return float(value)
+            except ValueError:
+                raise ValueError("invalid managed AI configuration") from None
+        return value
+
+    @field_validator("managed_ai_base_url")
+    @classmethod
+    def managed_origin(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        try:
+            url = urlsplit(value)
+            if (not value.isascii() or any(ord(c) <= 32 for c in value)
+                    or url.scheme not in {"http", "https"} or not url.hostname
+                    or url.username is not None or url.password is not None
+                    or url.path not in {"", "/"} or url.query or url.fragment
+                    or (url.port is not None and not 1 <= url.port <= 65535)):
+                raise ValueError
+        except (ValueError, TypeError):
+            raise ValueError("invalid managed AI configuration") from None
+        return value.rstrip("/")
+
+    @field_validator("managed_ai_bindings", mode="before")
+    @classmethod
+    def managed_registry(cls, value: object) -> object:
+        if isinstance(value, str):
+            if len(value) > 4194304:
+                raise ValueError("invalid managed AI configuration")
+            try:
+                return json.loads(value)
+            except (ValueError, TypeError):
+                raise ValueError("invalid managed AI configuration") from None
+        return value
 
     @field_validator("database_url")
     @classmethod
@@ -101,6 +192,12 @@ class Settings(BaseSettings):
         tokens = [entry.token.get_secret_value() for entry in self.auth_principals]
         if len(set(ids)) != len(ids) or len(set(tokens)) != len(tokens):
             raise ValueError("duplicate principal configuration")
+        scopes = [entry.scope() for entry in self.managed_ai_bindings]
+        if len(set(scopes)) != len(scopes):
+            raise ValueError("invalid managed AI configuration")
+        if any(entry.service_token.get_secret_value() in tokens
+               for entry in self.managed_ai_bindings):
+            raise ValueError("invalid managed AI configuration")
         return self
 
 

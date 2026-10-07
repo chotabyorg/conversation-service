@@ -4,6 +4,7 @@ from datetime import datetime
 from uuid import UUID, uuid4
 
 from sqlalchemy import (
+    CHAR,
     BigInteger,
     CheckConstraint,
     DateTime,
@@ -34,6 +35,16 @@ REFS_CHECK = (
     "CASE WHEN jsonb_typeof(operation_refs) = 'array' THEN "
     "jsonb_array_length(operation_refs) <= 32 ELSE false END"
 )
+MANAGED_MARKER = """
+ (managed_agent_id IS NULL AND managed_dispatch_epoch IS NULL
+  AND managed_dispatch_started_at IS NULL AND managed_request_fingerprint IS NULL)
+ OR (managed_agent_id IS NOT NULL AND managed_dispatch_epoch IS NOT NULL
+  AND managed_dispatch_started_at IS NOT NULL AND managed_request_fingerprint IS NOT NULL
+  AND managed_dispatch_epoch >= 1 AND managed_dispatch_epoch <= claim_epoch
+  AND status <> 'PENDING' AND started_at IS NOT NULL
+  AND managed_dispatch_started_at >= started_at
+  AND managed_request_fingerprint ~ '^[0-9a-f]{64}$')
+"""
 TURN_LIFECYCLE = """
  (status = 'PENDING' AND claim_epoch = 0 AND claim_token_digest IS NULL
   AND worker_ref IS NULL AND lease_expires_at IS NULL AND started_at IS NULL
@@ -263,6 +274,10 @@ class AgentTurn(Base):
         JSONB, default=list, server_default=sql_text("'[]'::jsonb")
     )
     terminal_fingerprint: Mapped[str | None] = mapped_column(String(64))
+    managed_agent_id: Mapped[UUID | None] = mapped_column()
+    managed_dispatch_epoch: Mapped[int | None] = mapped_column(BigInteger)
+    managed_dispatch_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    managed_request_fingerprint: Mapped[str | None] = mapped_column(CHAR(64))
     __table_args__ = (
         UniqueConstraint("conversation_id", "selection_key", name="uq_turn_selection"),
         UniqueConstraint("id", "conversation_id", name="uq_turn_id_conversation"),
@@ -309,12 +324,13 @@ class AgentTurn(Base):
         CheckConstraint("worker_ref ~ '^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$'", name="ck_turn_worker"),
         CheckConstraint("outcome IN ('DRAFT_READY','NO_RESPONSE')", name="ck_turn_outcome"),
         CheckConstraint(
-            "failure_code IN ('PROCESSING_ERROR','TIMEOUT','INVALID_RESULT')",
+            "failure_code IN ('PROCESSING_ERROR','TIMEOUT','INVALID_RESULT','EXECUTION_UNKNOWN')",
             name="ck_turn_failure",
         ),
         CheckConstraint(content_check("draft_text"), name="ck_turn_draft_bounds"),
         CheckConstraint(REFS_CHECK, name="ck_turn_operation_refs"),
         CheckConstraint(TURN_LIFECYCLE, name="ck_turn_lifecycle"),
+        CheckConstraint(MANAGED_MARKER, name="ck_turn_managed_marker"),
         Index(
             "uq_turn_one_active",
             "conversation_id",

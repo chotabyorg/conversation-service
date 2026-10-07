@@ -68,3 +68,34 @@ At this authoring stage final code reviews, independent verification, merge and
 tracker reconciliation remain orchestrator gates. No result for those gates is
 claimed here. There is no production/provider traffic, deployment, GitOps runtime
 change, existing gateway modification or AI runtime change in this foundation.
+
+## Goal 2 Conversation author checks
+
+On 2026-10-06 the Conversation author implemented Issue3 in its isolated service
+worktree after the independently approved revised design and the AI provider's
+stable schema/security checkpoint. The sole AI HTTP port is bounded and makes one
+attempt. Conversation freezes canonical context and commits the same-Turn marker
+before dispatch; existing winning-proof terminal fencing remains authoritative.
+Migration 0002 is additive and refuses downgrade after managed history exists.
+
+The initial unmodified service baseline passed 230 tests. The authored service
+candidate passed 355 tests in 54.98s with
+`python -m pytest -q`. These checks used an
+explicitly designated, disposable PostgreSQL 16 database, including observed real
+lock waits for snapshot/marker/result post-lock expiry and joined cancellation
+finalization. Populated 0001 upgrade, exact catalog/constraint negatives, refused
+downgrade, retained database restart, ambiguous marker/result commit outcomes,
+non-suffix ordered context and bounded local HTTP failure responses all passed.
+No critical service test was skipped. The separately authored, mandatory
+`tests/managed_cross_service/acceptance_http.py` gate requires explicit
+AI/runtime/database inputs;
+its results belong to its own author record and fresh final verification.
+
+Ruff, strict mypy, pip check, explicit Alembic upgrade, readiness and Alembic check
+passed. The migration drift result was `No new upgrade operations detected.`
+A local Python3.11 Linux image build installed the exact runtime dependency closure
+and passed pip check. Author image:
+`sha256:20eb4fdda2a61e317e9a7e6395335d9c7b41935a8a6ca55064260eb2b952268c`.
+Exact authored source commit, commands, disposable environment ownership and safe
+logs are recorded in the external Goal2 implementation note. These are source
+author checks, not independent review, final verification or global acceptance.
