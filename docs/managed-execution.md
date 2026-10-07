@@ -26,9 +26,18 @@ MANAGED_AI_BASE_URL is optional without a production default. It permits only an
 HTTP(S) origin, without credentials/path/query/fragment. Missing binding/URL returns
 fixed 503 before marker/network. Connect/write/read/pool/total defaults are
 5/10/100/5/120 seconds; all finite positive settings<=240. Total is independent
-of component timeouts. Choose AI/CS deadlines together: default AI90s work plus
-owned cleanup fits CS 120s. Claim an appropriate lease (e.g. 300s); execution does
-not secretly renew it. `.env.example` has commented synthetic local placeholders.
+of component timeouts. Choose AI/CS deadlines together: AI90s work and ordinary
+cleanup targets normally fit the CS120s coordination cutoff. Retained final AI
+resource joins can exceed those targets; CS may time out while AI is still joining
+its owner. CS preserves EXECUTION_UNKNOWN/the durable marker and never resends.
+Claim an appropriate lease (e.g. 300s); execution does not secretly renew it.
+The outgoing HTTP port retains native TCP stream objects immediately on acquisition,
+before TLS/protocol setup can lose them, and joins their close before returning or
+propagating cancellation. Repeated caller cancellation joins the same request-local
+HTTP owner; cleanup does not issue another request. Its private native HTTP/1 ABI is
+HTTPX0.28.1/httpcore1.0.9/AnyIO4.15.1 on asyncio; HTTP/2, custom transports/backends
+and other versions are unsupported. Final native joins have no universal OS bound.
+`.env.example` has commented synthetic local placeholders.
 
 ## Request and result
 

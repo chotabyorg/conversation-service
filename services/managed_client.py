@@ -12,6 +12,7 @@ import httpx
 from core.config import ManagedBinding, Settings
 from schemas.contracts import TurnFailureCode
 from schemas.managed import MAX_RESULT_BYTES, ManagedTurnResult, PreparedManagedRequest
+from services.managed_http_owner import NativeHTTPResourceOwner
 
 MANAGED_PATH = "/internal/v1/managed-turns/execute"
 # Only an exact provider boundary envelope is affirmative preexecution evidence.
@@ -83,6 +84,36 @@ class ManagedAIClient:
     async def execute(
         self, prepared: PreparedManagedRequest, binding: ManagedBinding, request_id: str = ""
     ) -> ManagedTurnResult:
+        owner = asyncio.create_task(
+            self._execute_owned(prepared, binding, request_id), name="managed-ai-http-owner"
+        )
+        cancellation = None
+        while True:
+            try:
+                result = await asyncio.shield(owner)
+                break
+            except asyncio.CancelledError as exc:
+                if cancellation is None:
+                    cancellation = exc
+                    owner.cancel(exc.args[0] if exc.args else None)
+                if owner.done():
+                    # Retrieve failure without changing the original caller's cancel.
+                    try:
+                        owner.result()
+                    except BaseException:
+                        pass
+                    raise cancellation
+            except BaseException:
+                if cancellation is not None:
+                    raise cancellation
+                raise
+        if cancellation is not None:
+            raise cancellation
+        return result
+
+    async def _execute_owned(
+        self, prepared: PreparedManagedRequest, binding: ManagedBinding, request_id: str
+    ) -> ManagedTurnResult:
         settings = self.settings
         if settings.managed_ai_base_url is None:
             raise ManagedPortFailure()
@@ -99,14 +130,17 @@ class ManagedAIClient:
             pool=settings.managed_ai_pool_seconds,
         )
         limits = httpx.Limits(max_connections=10, max_keepalive_connections=5)
+        transport = httpx.AsyncHTTPTransport(retries=0, limits=limits, trust_env=False)
+        resources = NativeHTTPResourceOwner()
         try:
+            resources.own_pool(transport._pool)
             async with asyncio.timeout(settings.managed_ai_total_seconds):
                 async with httpx.AsyncClient(
                     timeout=timeout,
                     limits=limits,
                     trust_env=False,
                     follow_redirects=False,
-                    transport=httpx.AsyncHTTPTransport(retries=0, limits=limits, trust_env=False),
+                    transport=transport,
                 ) as client:
                     async with client.stream(
                         "POST",
@@ -132,3 +166,10 @@ class ManagedAIClient:
             raise
         except Exception:
             raise ManagedPortFailure() from None
+        finally:
+            # Native TLS can be cancelled before HTTPcore installs a connection,
+            # leaving its pool empty. The acquisition owner still holds the socket.
+            try:
+                await resources.aclose()
+            except Exception:
+                raise ManagedPortFailure() from None
