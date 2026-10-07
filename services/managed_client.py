@@ -84,8 +84,10 @@ class ManagedAIClient:
     async def execute(
         self, prepared: PreparedManagedRequest, binding: ManagedBinding, request_id: str = ""
     ) -> ManagedTurnResult:
+        resources = NativeHTTPResourceOwner()
         owner = asyncio.create_task(
-            self._execute_owned(prepared, binding, request_id), name="managed-ai-http-owner"
+            self._execute_owned(prepared, binding, request_id, resources),
+            name="managed-ai-http-owner",
         )
         cancellation = None
         while True:
@@ -95,7 +97,9 @@ class ManagedAIClient:
             except asyncio.CancelledError as exc:
                 if cancellation is None:
                     cancellation = exc
-                    owner.cancel(exc.args[0] if exc.args else None)
+                    # Signal work only. Raw Task.cancel can interrupt an already
+                    # running native close despite its AnyIO shield.
+                    resources.cancel_operation()
                 if owner.done():
                     # Retrieve failure without changing the original caller's cancel.
                     try:
@@ -112,7 +116,8 @@ class ManagedAIClient:
         return result
 
     async def _execute_owned(
-        self, prepared: PreparedManagedRequest, binding: ManagedBinding, request_id: str
+        self, prepared: PreparedManagedRequest, binding: ManagedBinding, request_id: str,
+        resources: NativeHTTPResourceOwner,
     ) -> ManagedTurnResult:
         settings = self.settings
         if settings.managed_ai_base_url is None:
@@ -131,10 +136,10 @@ class ManagedAIClient:
         )
         limits = httpx.Limits(max_connections=10, max_keepalive_connections=5)
         transport = httpx.AsyncHTTPTransport(retries=0, limits=limits, trust_env=False)
-        resources = NativeHTTPResourceOwner()
+        result = None
         try:
             resources.own_pool(transport._pool)
-            async with asyncio.timeout(settings.managed_ai_total_seconds):
+            with resources.operation(settings.managed_ai_total_seconds) as operation:
                 async with httpx.AsyncClient(
                     timeout=timeout,
                     limits=limits,
@@ -161,7 +166,10 @@ class ManagedAIClient:
                             if len(body) + len(chunk) > MAX_RESULT_BYTES:
                                 raise ManagedPortFailure()
                             body.extend(chunk)
-                        return parse_response(bytes(body), response.status_code, prepared)
+                        result = parse_response(bytes(body), response.status_code, prepared)
+            if operation.cancel_called or result is None:
+                raise ManagedPortFailure()
+            return result
         except ManagedPortFailure:
             raise
         except Exception:

@@ -32,9 +32,14 @@ resource joins can exceed those targets; CS may time out while AI is still joini
 its owner. CS preserves EXECUTION_UNKNOWN/the durable marker and never resends.
 Claim an appropriate lease (e.g. 300s); execution does not secretly renew it.
 The outgoing HTTP port retains native TCP stream objects immediately on acquisition,
-before TLS/protocol setup can lose them, and joins their close before returning or
-propagating cancellation. Repeated caller cancellation joins the same request-local
-HTTP owner; cleanup does not issue another request. Its private native HTTP/1 ABI is
+before TLS/protocol setup can lose them. First and repeated caller cancellation
+signal only the active operation CancelScope and join the same request-local HTTP
+owner; they never cancel its teardown task. Native operation/TLS closes have a
+shielded two-second failure-detection budget. Final cleanup runs after the operation
+scope exits, finishes abort on each captured actual transport (including an
+already-closing transport with buffered writes), and joins physical socket release
+before returning or propagating the original cancellation. Failed close certainty
+maps to EXECUTION_UNKNOWN; cleanup does not issue another request. Its private native HTTP/1 ABI is
 HTTPX0.28.1/httpcore1.0.9/AnyIO4.15.1 on asyncio; HTTP/2, custom transports/backends
 and other versions are unsupported. Final native joins have no universal OS bound.
 `.env.example` has commented synthetic local placeholders.
