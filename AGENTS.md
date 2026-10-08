@@ -18,8 +18,11 @@ TEST_DATABASE_DISPOSABLE=yes; never fall back to shared/runtime DATABASE_URL. Ru
 migrations, pytest, Ruff, mypy and container build for changes affecting behavior.
 Source authoring does not replace independent review or final verification.
 
-Goal 1 has no production deployment or channel consumer. Do not add registry push,
-deploy workflows, GitOps resources/image tags, public routes, AI/provider calls,
-settling, BusinessOperation ledger, CRM or Voice implementation. Existing Main
-runtime services remain outside this repository's changes. Goal 2 requires its own
-authorization and preserves the legacy AI path.
+Historical Goal1 scope was foundation-only. Current explicit Goal4A authorizes
+narrow Website admission/FIFO worker/transport/evidence-read, additive migrations,
+manual image publication and independently reviewed GitOps production rollout.
+Source authoring alone never authorizes a live mutation or smoke; preserve exact
+Main-cluster/release/logging/widget-binding/no-business-effect gates. Production
+cohorts start empty and only the dedicated technical session may later be selected.
+Never add public routes, Goal5 settling, a BusinessOperation ledger, CRM policy,
+Telegram migration or Voice work. Managed v1 DTOs remain the stable boundary.

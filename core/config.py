@@ -36,6 +36,7 @@ ServiceToken = Annotated[SecretStr, BeforeValidator(validate_service_token)]
 class AuthPrincipal(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
     principal_id: WorkerRef
+    role: Literal["FULL", "WEBSITE", "PROCESSING"] = "FULL"
     token: ServiceToken = Field(repr=False)
     grants: tuple[ScopeGrant, ...] = Field(min_length=1, max_length=64, repr=False)
 
@@ -46,7 +47,14 @@ class AuthPrincipal(BaseModel):
         return self
 
     def principal(self) -> Principal:
-        return Principal(principal_id=self.principal_id, grants=self.grants)
+        return Principal(principal_id=self.principal_id, role=self.role, grants=self.grants)
+
+
+class WebsiteBinding(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    owner_id: OwnerId
+    integration_id: UUID
+    agent_id: UUID
 
 
 class ManagedBinding(BaseModel):
@@ -118,6 +126,33 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("MANAGED_AI_TOTAL_SECONDS", "managed_ai_total_seconds"),
     )
 
+    website_bindings: Annotated[tuple[WebsiteBinding, ...], NoDecode] = Field(
+        default=(), alias="WEBSITE_BINDINGS",
+        validation_alias=AliasChoices("WEBSITE_BINDINGS", "website_bindings"),
+        max_length=64, repr=False,
+    )
+    website_worker_enabled: bool = Field(
+        default=False, alias="WEBSITE_WORKER_ENABLED",
+        validation_alias=AliasChoices("WEBSITE_WORKER_ENABLED", "website_worker_enabled"),
+    )
+    website_worker_principal_id: WorkerRef | None = Field(
+        default=None, alias="WEBSITE_WORKER_PRINCIPAL_ID",
+        validation_alias=AliasChoices("WEBSITE_WORKER_PRINCIPAL_ID", "website_worker_principal_id"),
+    )
+    website_worker_lease_seconds: int = Field(
+        default=30, ge=5, le=300, alias="WEBSITE_WORKER_LEASE_SECONDS",
+        validation_alias=AliasChoices("WEBSITE_WORKER_LEASE_SECONDS",
+                                     "website_worker_lease_seconds"),
+    )
+    website_worker_poll_seconds: float = Field(
+        default=1.0, ge=0.1, le=10, allow_inf_nan=False, alias="WEBSITE_WORKER_POLL_SECONDS",
+        validation_alias=AliasChoices("WEBSITE_WORKER_POLL_SECONDS", "website_worker_poll_seconds"),
+    )
+    website_worker_health_port: int = Field(
+        default=8001, ge=1, le=65535, alias="WEBSITE_WORKER_HEALTH_PORT",
+        validation_alias=AliasChoices("WEBSITE_WORKER_HEALTH_PORT", "website_worker_health_port"),
+    )
+
     @field_validator(
         "managed_ai_connect_seconds", "managed_ai_write_seconds", "managed_ai_read_seconds",
         "managed_ai_pool_seconds", "managed_ai_total_seconds", mode="before",
@@ -151,7 +186,7 @@ class Settings(BaseSettings):
             raise ValueError("invalid managed AI configuration") from None
         return value.rstrip("/")
 
-    @field_validator("managed_ai_bindings", mode="before")
+    @field_validator("managed_ai_bindings", "website_bindings", mode="before")
     @classmethod
     def managed_registry(cls, value: object) -> object:
         if isinstance(value, str):
@@ -198,6 +233,25 @@ class Settings(BaseSettings):
         if any(entry.service_token.get_secret_value() in tokens
                for entry in self.managed_ai_bindings):
             raise ValueError("invalid managed AI configuration")
+        identities = [(entry.owner_id, entry.integration_id) for entry in self.website_bindings]
+        if len(set(identities)) != len(identities):
+            raise ValueError("invalid website configuration")
+        if self.website_worker_enabled:
+            principal = next((entry for entry in self.auth_principals
+                              if entry.principal_id == self.website_worker_principal_id), None)
+            if (principal is None or principal.role not in {"FULL", "PROCESSING"}
+                    or not self.website_bindings or self.managed_ai_base_url is None):
+                raise ValueError("invalid website worker configuration")
+            for entry in self.website_bindings:
+                if not any(g.owner_id == entry.owner_id and g.integration_id == entry.integration_id
+                           and g.channel == Channel.WEBSITE_WIDGET
+                           and g.provider_namespace == "main-chota.website-widget.v1"
+                           for g in principal.grants):
+                    raise ValueError("invalid website worker configuration")
+                if not any(b.owner_id == entry.owner_id and b.integration_id == entry.integration_id
+                           and b.channel == Channel.WEBSITE_WIDGET and b.agent_id == entry.agent_id
+                           for b in self.managed_ai_bindings):
+                    raise ValueError("invalid website worker configuration")
         return self
 
 

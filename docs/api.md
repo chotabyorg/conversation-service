@@ -4,7 +4,7 @@ All business paths use `/internal/v1`. Exactly one dedicated `X-Service-Token`
 authenticates a token-free Principal with server-provisioned exact grants. Missing,
 wrong, duplicated or malformed credentials are uniformly 401 before parsing a
 body. Scope mismatch and guessed UUID are uniformly 404. There is no public route,
-gateway change or provider send. The unconsumed managed executor is described in
+gateway change or provider send. The managed executor is described in
 [managed execution](managed-execution.md). X-User headers provide no authority.
 
 | Method/path | Request | Response and retry behavior |
@@ -30,8 +30,8 @@ resource is created. There is no 202 implying that work executed. No deletion,
 Message edit/outbound append or implicit draft promotion exists.
 
 `GET /health` returns `{status:"ok",service:"conversation-service"}`.
-`GET /ready` returns ready200 only when DB query, migration `0002_managed_execution` and
-required Conversation query succeed; otherwise not_ready503. These are the only
+`GET /ready` returns ready200 only when DB query, migration `0003_website_canary` and
+required Conversation and Website journal queries succeed; otherwise not_ready503. These are the only
 unauthenticated routes. `GET /internal/openapi.json` requires the service header.
 Default `/docs`, `/redoc`, `/openapi.json` are disabled. The fetched schema provides
 every exact DTO/property and X-Service-Token security requirement.
@@ -101,3 +101,13 @@ TurnRead additively exposes nullable managed_agent_id, managed_dispatch_epoch,
 managed_dispatch_started_at and managed_request_fingerprint. The hash excludes
 tokens. Marker metadata is execution association, not a provider receipt.
 MANAGED_EXECUTION_STARTED is a fixed409 conflict and does not fail live work.
+
+## Goal4A narrow Website adapter
+
+See [Website canary contract and lifecycle](website-canary.md) for frozen routing,
+FIFO coordination and socket-only evidence. New private routes are POST
+`/internal/v1/website/admissions`, `/results`, `/responses/begin`,
+`/responses/complete` under that same prefix, plus protected GET
+`/internal/v1/processing/turns/{turn_id}/evidence`. They use explicit WEBSITE or
+PROCESSING credentials and exact current bindings. Existing foundation routes and
+managed v1 contracts remain compatible for FULL principals.

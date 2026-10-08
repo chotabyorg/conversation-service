@@ -75,6 +75,19 @@ class BoundaryMiddleware:
                 if principal is None:
                     await reject(ErrorCode.UNAUTHENTICATED)
                     return
+                path = scope["path"]
+                website_paths = {"/internal/v1/website/admissions", "/internal/v1/website/results",
+                                 "/internal/v1/website/responses/begin",
+                                 "/internal/v1/website/responses/complete"}
+                if principal.role == "WEBSITE" and (path not in website_paths
+                                                      or scope["method"] != "POST"):
+                    await reject(ErrorCode.NOT_FOUND)
+                    return
+                if principal.role == "PROCESSING" and (not path.startswith(
+                        "/internal/v1/processing/turns/") or not path.endswith("/evidence")
+                        or scope["method"] != "GET"):
+                    await reject(ErrorCode.NOT_FOUND)
+                    return
                 state["principal"] = principal
             # Content-Length is merely an early upper-bound hint, never the actual cap.
             lengths = [v for k, v in headers if k.lower() == b"content-length"]

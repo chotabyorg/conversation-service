@@ -99,3 +99,39 @@ and passed pip check. Author image:
 Exact authored source commit, commands, disposable environment ownership and safe
 logs are recorded in the external Goal2 implementation note. These are source
 author checks, not independent review, final verification or global acceptance.
+
+## Goal4A source author verification
+
+Author candidate is isolated on `codex/goal4a-website-canary`, based on current Main
+`d238064215d3875c5d2061bba5a00b55dc5fad0e`. Existing checkout was not switched.
+This record is source author evidence, not independent review or runtime rollout.
+
+- Final complete standard service suite: **404 passed in109.77s**, real PostgreSQL16
+  in a separately created disposable author database. Existing374 tests retained.
+- Ruff: PASS. Strict mypy: PASS,35 source files. pip check: PASS.
+- New behavior tests cover positive sticky arbitration in both policy directions,
+  observed independent PG advisory-lock waits, atomic rollback on failed admission,
+  different IDs/same text, FIFO and frozen prefix, stable pending/reclaimed Turn,
+  marked UNKNOWN without execution, genuine and late refs, post-I/O lease fencing,
+  context bound known failure, lease renewal, narrow roles/scope, authority changes,
+  immutable local write facts, response replay and exact worker startup bindings.
+- Migrations: empty→head via the standard fixture; populated0002→0003 preserves
+  journal IDs, fingerprints, leases and drafts. Retained LEGACY arbitration blocks
+  downgrade; older populated0001 upgrade/evidence refusal regressions still pass.
+- Safe-log sink sentinel tests include descendants, independently attached handlers,
+  DEBUG, raw exception/stack fields and logging reconfiguration. Actual process
+  logging/live Website/CP credential protection remains a separate release gate.
+- Final local Docker image:
+  `sha256:bbfe2eba96b9557706a41f7c76b3c0fea4aac2dac945264104d02044d90e1787`.
+  API and separate worker both reached readiness200 in read-only containers at
+  UID10001 with capability drop/no-new-privileges, using a separate disposable
+  lifecycle DB. Both gracefully exited0; captured logs contained none of the
+  synthetic dedicated registry/AI/database credentials. This local image was not
+  published. Main GHCR build/digest proof is a later reviewed publishing gate.
+
+Orchestrator owns `tests/website_cross_service` real-process A–H/overlap acceptance;
+its immutable source/evidence is committed and reported separately. No real widget
+key, production admission, provider mutation, image push, deployment or source
+merge was performed by this author lane. Independent full source review remains
+required. Full demo activation additionally requires the separately reviewed
+assistant-history/context-limit policy and stable frontend message identities.

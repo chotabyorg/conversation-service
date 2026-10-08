@@ -3,8 +3,9 @@
 Durable provider-neutral communication journal and processing primitives for Main
 Chota Platform. PostgreSQL owns accepted inbound events, canonical Messages,
 Conversation identity, stable AgentTurns, delivery evidence and control authority.
-An unconsumed protected managed executor calls `ai-agent-service` for a claimed
-Turn. It sends nothing to a messaging or business provider.
+A protected managed executor calls `ai-agent-service` for a claimed Turn. The
+Goal4A Website worker consumes only explicitly admitted, authorized Website work;
+Conversation itself sends nothing to a messaging or business provider.
 
 Goal 1 is tracked in [issue #1](https://github.com/chotabyorg/conversation-service/issues/1),
 linked to the [Project #3 Foundation initiative](https://github.com/orgs/chotabyorg/projects/3/views/1?pane=issue&itemId=263003543).
@@ -14,19 +15,20 @@ alone does not complete it.
 
 Goal 2 is tracked in [issue #3](https://github.com/chotabyorg/conversation-service/issues/3).
 See [managed execution](docs/managed-execution.md) for the independent v1 AI contract,
-one-attempt semantics and private local binding configuration. No scheduler or
-channel consumer invokes this path.
+one-attempt semantics and private local binding configuration. Goal4A adds the
+separate immediate Website coordinator described in [Website canary](docs/website-canary.md).
 
-**Not deployed. No production channel uses this service.** There is no public
-KrakenD route, provider webhook, automatic deployment workflow, registry push or
-GitOps runtime resource. Existing Telegram, Instagram, Website, WhatsApp and AI
+**Source implementation; production rollout requires separate evidence.** There
+is no public KrakenD route or provider webhook. The manual publisher builds only
+immutable images and has no deployment/promotion job. Existing Telegram, Instagram, Website, WhatsApp and AI
 callers continue their existing paths.
 
 This is separate from paused fashion/e-commerce **Chota 2.0**
 (`chotabyorg/chota`, Project #6); none of its Conversation code is a dependency or
 implementation template. Conversation coordination is separate from Business
-operation coordination. AI Business V2 PR #43 was OPEN/DRAFT/unmerged at discovery;
-this foundation neither depends on nor implements its operation ledger.
+operation coordination. AI Business V2 PR #43 was OPEN/DRAFT/unmerged at the
+historical Goal1 discovery. The Goal4A runtime baseline includes accepted newer
+Business work; this service preserves that boundary and stores only opaque refs.
 
 ## Foundation contracts
 
@@ -49,8 +51,9 @@ Message or revision.
 The Conversation row serializes its own mutations; unrelated Conversations can
 progress independently. Unique identity/event/Message indexes and the active-Turn
 partial unique index defend the invariants at PostgreSQL level. `PENDING` and
-`CLAIMED` both occupy the one active logical Turn slot. New inbound remains durable
-without automatic scheduling, debounce or supersede policy.
+`CLAIMED` both occupy the one active logical Turn slot. Generic ingress primitives
+do not schedule work. Goal4A explicitly admitted Website Messages use the durable
+immediate worker; debounce and supersede remain outside this policy.
 
 A claim fences a stable Turn using a monotonically increasing epoch and a random
 256-bit bearer whose SHA-256 digest alone is persisted. Expired recovery rotates
@@ -90,7 +93,11 @@ startup DATABASE_URL must be `postgresql+asyncpg` and point to the local instanc
 Percent-encode any database password characters reserved by a URL. Compose's
 DATABASE_PASSWORD is local orchestration configuration and is ignored by Settings.
 The native application and migration commands below read `.env` in the current
-directory. Migrations read only DATABASE_URL, without variable interpolation or
+directory. [Goal4A Website canary](docs/website-canary.md) documents the private admission API,
+separate `python worker.py` process, narrow roles, evidence recovery and rollout
+gates. Empty Website bindings and disabled worker preserve the dark default.
+
+Migrations read only DATABASE_URL, without variable interpolation or
 loading authentication configuration. An exported DATABASE_URL takes precedence,
 including an empty or invalid value, which fails validation instead of falling back.
 
@@ -112,7 +119,7 @@ Compose binds only `127.0.0.1:55585` (HTTP) and `127.0.0.1:55595` (PostgreSQL),
 using its own internal network rather than the existing microservices network.
 The application image runs as UID 10001 and Compose uses a read-only filesystem.
 Migrations are explicit; startup never substitutes `create_all`. `/ready` succeeds
-only against migration `0002_managed_execution` and the required table query. `/health`
+only against migration `0003_website_canary` and the required table queries. `/health`
 checks process liveness. Both return bounded public status only.
 
 ## Internal authentication
@@ -137,7 +144,9 @@ registration API. Future production provisioning requires separate integration
 work. Current CP does not yet implement WHATSAPP despite the reserved generic
 identity value here.
 
-Every business/OpenAPI request requires exactly one `X-Service-Token`; malformed,
+Registry roles are `FULL` (existing default), `WEBSITE` and `PROCESSING`; narrow
+roles cannot call foundation/control/execution/OpenAPI routes. Every business/OpenAPI
+request requires exactly one `X-Service-Token`; malformed,
 duplicated, wrong and missing tokens return the same 401. Authentication precedes
 body parsing and DB work. `X-User-Id`/`X-User-Role` cannot expand access. Ingestion
 must match one complete four-field grant; entity UUID access must join through a
@@ -174,10 +183,11 @@ It has no deployment credentials or publishing step. Implementation checks are
 distinct from the fresh independent review/verification required by Goal 1; see
 the evidence record for what actually ran.
 
-## Next stage
+## Goal4A and handoff
 
-**Goal 3 — business-operation safety for managed Turns**, reconciling stable Turn
-identities with AI-owned durable operation receipts and UNKNOWN recovery before
-any real channel is migrated. Goal2 source remains unconsumed, with no settling,
-human Inbox/handoff, CRM projection, attachments, Voice processing or provider
-delivery. Goal3 is planned, not implemented here.
+[Website canary source](docs/website-canary.md) adds immediate FIFO execution and
+protected evidence reads while retaining legacy Website traffic unless exact
+configured admission selects it. Production rollout/smoke require independent
+release and runtime verification. Full demo cutover additionally requires stable
+frontend message IDs and a separate reviewed assistant-history/context-limit
+policy. Goal4B Telegram and Goal5 settling are outside this change.

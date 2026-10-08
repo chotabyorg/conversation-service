@@ -12,6 +12,7 @@ import httpx
 from core.config import ManagedBinding, Settings
 from schemas.contracts import TurnFailureCode
 from schemas.managed import MAX_RESULT_BYTES, ManagedTurnResult, PreparedManagedRequest
+from schemas.website import ManagedEvidenceRequest, ManagedEvidenceResult
 from services.managed_http_owner import NativeHTTPResourceOwner
 
 MANAGED_PATH = "/internal/v1/managed-turns/execute"
@@ -181,3 +182,69 @@ class ManagedAIClient:
                 await resources.aclose()
             except Exception:
                 raise ManagedPortFailure() from None
+
+    async def evidence(self, request: ManagedEvidenceRequest,
+                       binding: ManagedBinding) -> ManagedEvidenceResult:
+        resources = NativeHTTPResourceOwner()
+        owner = asyncio.create_task(self._evidence_owned(request, binding, resources),
+                                    name="managed-evidence-http-owner")
+        cancellation = None
+        while True:
+            try:
+                result = await asyncio.shield(owner)
+                break
+            except asyncio.CancelledError as exc:
+                cancellation = cancellation or exc
+                resources.cancel_operation()
+                if owner.done():
+                    try:
+                        owner.result()
+                    except BaseException:
+                        pass
+                    raise cancellation
+            except BaseException:
+                if cancellation is not None:
+                    raise cancellation
+                raise
+        if cancellation is not None:
+            raise cancellation
+        return result
+
+    async def _evidence_owned(self, request: ManagedEvidenceRequest, binding: ManagedBinding,
+                              resources: NativeHTTPResourceOwner) -> ManagedEvidenceResult:
+        if self.settings.managed_ai_base_url is None:
+            raise ManagedPortFailure()
+        transport = httpx.AsyncHTTPTransport(retries=0, trust_env=False)
+        resources.own_pool(transport._pool)
+        result = None
+        try:
+            total = min(self.settings.managed_ai_total_seconds, 10.0)
+            with resources.operation(total) as operation:
+                async with httpx.AsyncClient(transport=transport, trust_env=False,
+                                             follow_redirects=False, timeout=10.0) as client:
+                    async with client.stream(
+                        "POST", self.settings.managed_ai_base_url +
+                        "/internal/v1/managed-turns/evidence",
+                        content=request.model_dump_json().encode("utf-8"),
+                        headers={"Content-Type": "application/json", "X-Service-Token":
+                                 binding.service_token.get_secret_value()},
+                    ) as response:
+                        if (response.status_code != 200 or response.headers.get_list(
+                                "content-type") != ["application/json"]
+                                or response.headers.get_list("content-encoding")):
+                            raise ManagedPortFailure()
+                        body = bytearray()
+                        async for chunk in response.aiter_raw():
+                            if len(body) + len(chunk) > 32768:
+                                raise ManagedPortFailure()
+                            body.extend(chunk)
+                        value = json.loads(body, object_pairs_hook=unique_json_object,
+                                           parse_constant=reject_constant)
+                        result = ManagedEvidenceResult.model_validate(value)
+            if operation.cancel_called or result is None:
+                raise ManagedPortFailure()
+            return result
+        except Exception:
+            raise ManagedPortFailure() from None
+        finally:
+            await resources.aclose()
