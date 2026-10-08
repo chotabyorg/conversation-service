@@ -5,6 +5,9 @@ from models.entities import (
     DeliveryReconciliation,
     InboundEvent,
     Message,
+    WebsiteAdmission,
+    WebsiteImmediateTurn,
+    WebsiteResponseAttempt,
 )
 
 __all__ = [
@@ -14,4 +17,7 @@ __all__ = [
     "DeliveryReconciliation",
     "InboundEvent",
     "Message",
+    "WebsiteAdmission",
+    "WebsiteImmediateTurn",
+    "WebsiteResponseAttempt",
 ]

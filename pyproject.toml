@@ -15,7 +15,7 @@ select = ["E", "F", "I", "UP"]
 
 [tool.mypy]
 python_version = "3.11"
-files = ["main.py", "core", "db", "models", "schemas", "services", "api"]
+files = ["main.py", "worker.py", "core", "db", "models", "schemas", "services", "api"]
 strict = true
 plugins = ["pydantic.mypy"]
 warn_unreachable = true

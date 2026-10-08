@@ -220,6 +220,7 @@ class Message(Base):
     __table_args__ = (
         UniqueConstraint("conversation_id", "sequence", name="uq_message_sequence"),
         UniqueConstraint("source_inbound_event_id", name="uq_message_source_event"),
+        UniqueConstraint("id", "conversation_id", name="uq_message_id_conversation"),
         ForeignKeyConstraint(
             ["conversation_id"],
             ["conversations.id"],
@@ -461,4 +462,87 @@ class DeliveryReconciliation(Base):
             ),
             name="ck_reconciliation_authority",
         ),
+    )
+
+
+class WebsiteAdmission(Base):
+    """Frozen arbitration, including legacy reservations without canonical content."""
+    __tablename__ = "website_admissions"
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    owner_id: Mapped[str] = mapped_column(String(255, collation="C"), nullable=False)
+    integration_id: Mapped[UUID] = mapped_column(nullable=False)
+    agent_id: Mapped[UUID] = mapped_column(nullable=False)
+    channel: Mapped[str] = mapped_column(String(32), server_default="WEBSITE_WIDGET")
+    provider_namespace: Mapped[str] = mapped_column(String(128), nullable=False)
+    message_id: Mapped[UUID] = mapped_column(nullable=False)
+    session_id: Mapped[UUID] = mapped_column(nullable=False)
+    fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    route: Mapped[str] = mapped_column(String(16), nullable=False)
+    conversation_id: Mapped[UUID | None] = mapped_column()
+    canonical_message_id: Mapped[UUID | None] = mapped_column()
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=sql_text("clock_timestamp()")
+    )
+    __table_args__ = (
+        UniqueConstraint("owner_id", "integration_id", "channel", "provider_namespace",
+                         "message_id", name="uq_website_admission_identity"),
+        UniqueConstraint("canonical_message_id", name="uq_website_admission_message"),
+        UniqueConstraint("id", "conversation_id", name="uq_website_admission_parent"),
+        ForeignKeyConstraint(["conversation_id", "owner_id", "integration_id", "channel"],
+                             ["conversations.id", "conversations.owner_id",
+                              "conversations.integration_id", "conversations.channel"],
+                             ondelete="RESTRICT"),
+        ForeignKeyConstraint(["canonical_message_id", "conversation_id"],
+                             ["messages.id", "messages.conversation_id"], ondelete="RESTRICT"),
+        CheckConstraint(OWNER_BOUNDS, name="ck_website_admission_owner"),
+        CheckConstraint("channel='WEBSITE_WIDGET' AND "
+                        "provider_namespace='main-chota.website-widget.v1'",
+                        name="ck_website_admission_namespace"),
+        CheckConstraint(digest_check("fingerprint"), name="ck_website_admission_fingerprint"),
+        CheckConstraint("(route='LEGACY' AND conversation_id IS NULL "
+                        "AND canonical_message_id IS NULL) OR (route='MANAGED' "
+                        "AND conversation_id IS NOT NULL AND canonical_message_id IS NOT NULL)",
+                        name="ck_website_admission_route"),
+        Index("ix_website_admission_processing", "conversation_id"),
+    )
+
+
+class WebsiteImmediateTurn(Base):
+    __tablename__ = "website_immediate_turns"
+    message_id: Mapped[UUID] = mapped_column(primary_key=True)
+    conversation_id: Mapped[UUID] = mapped_column(nullable=False)
+    turn_id: Mapped[UUID] = mapped_column(nullable=False, unique=True)
+    __table_args__ = (
+        ForeignKeyConstraint(["message_id"], ["website_admissions.canonical_message_id"],
+                             ondelete="RESTRICT"),
+        ForeignKeyConstraint(["message_id", "conversation_id"],
+                             ["messages.id", "messages.conversation_id"], ondelete="RESTRICT"),
+        ForeignKeyConstraint(["turn_id", "conversation_id"],
+                             ["agent_turns.id", "agent_turns.conversation_id"],
+                             ondelete="RESTRICT"),
+    )
+
+
+class WebsiteResponseAttempt(Base):
+    """Local HTTP write fact; never an application acknowledgement."""
+    __tablename__ = "website_response_attempts"
+    id: Mapped[UUID] = mapped_column(primary_key=True)
+    admission_id: Mapped[UUID] = mapped_column(nullable=False)
+    delivery_id: Mapped[UUID] = mapped_column(nullable=False)
+    conversation_id: Mapped[UUID] = mapped_column(nullable=False)
+    outcome: Mapped[str | None] = mapped_column(String(32))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=sql_text("clock_timestamp()")
+    )
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    __table_args__ = (
+        ForeignKeyConstraint(["admission_id", "conversation_id"],
+                             ["website_admissions.id", "website_admissions.conversation_id"],
+                             ondelete="RESTRICT"),
+        ForeignKeyConstraint(["delivery_id", "conversation_id"],
+                             ["delivery_attempts.id", "delivery_attempts.conversation_id"],
+                             ondelete="RESTRICT"),
+        CheckConstraint("(outcome IS NULL AND finished_at IS NULL) OR "
+                        "(outcome IN ('WRITE_COMPLETED','WRITE_FAILED','UNKNOWN') "
+                        "AND finished_at IS NOT NULL)", name="ck_website_response_outcome"),
     )

@@ -50,7 +50,7 @@ class Database:
     async def dispose(self) -> None:
         await self.engine.dispose()
 
-    async def ready(self, expected_revision: str = "0002_managed_execution") -> bool:
+    async def ready(self, expected_revision: str = "0003_website_canary") -> bool:
         try:
             async with self.engine.connect() as connection:
                 if await connection.scalar(text("SELECT 1")) != 1:
@@ -68,6 +68,11 @@ class Database:
                         "FROM conversations LIMIT 1"
                     )
                 )
+                await connection.execute(text(
+                    "SELECT a.id,t.turn_id,r.id FROM website_admissions a "
+                    "LEFT JOIN website_immediate_turns t ON t.message_id=a.canonical_message_id "
+                    "LEFT JOIN website_response_attempts r ON r.admission_id=a.id LIMIT 1"
+                ))
                 return True
         except (SQLAlchemyError, OSError, TimeoutError):
             return False

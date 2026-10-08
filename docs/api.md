@@ -101,3 +101,13 @@ TurnRead additively exposes nullable managed_agent_id, managed_dispatch_epoch,
 managed_dispatch_started_at and managed_request_fingerprint. The hash excludes
 tokens. Marker metadata is execution association, not a provider receipt.
 MANAGED_EXECUTION_STARTED is a fixed409 conflict and does not fail live work.
+
+## Goal4A narrow Website adapter
+
+See [Website canary contract and lifecycle](website-canary.md) for frozen routing,
+FIFO coordination and socket-only evidence. New private routes are POST
+`/internal/v1/website/admissions`, `/results`, `/responses/begin`,
+`/responses/complete` under that same prefix, plus protected GET
+`/internal/v1/processing/turns/{turn_id}/evidence`. They use explicit WEBSITE or
+PROCESSING credentials and exact current bindings. Existing foundation routes and
+managed v1 contracts remain compatible for FULL principals.

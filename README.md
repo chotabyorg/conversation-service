@@ -17,9 +17,9 @@ See [managed execution](docs/managed-execution.md) for the independent v1 AI con
 one-attempt semantics and private local binding configuration. No scheduler or
 channel consumer invokes this path.
 
-**Not deployed. No production channel uses this service.** There is no public
-KrakenD route, provider webhook, automatic deployment workflow, registry push or
-GitOps runtime resource. Existing Telegram, Instagram, Website, WhatsApp and AI
+**Source implementation; production rollout requires separate evidence.** There
+is no public KrakenD route or provider webhook. The manual publisher builds only
+immutable images and has no deployment/promotion job. Existing Telegram, Instagram, Website, WhatsApp and AI
 callers continue their existing paths.
 
 This is separate from paused fashion/e-commerce **Chota 2.0**
@@ -90,7 +90,11 @@ startup DATABASE_URL must be `postgresql+asyncpg` and point to the local instanc
 Percent-encode any database password characters reserved by a URL. Compose's
 DATABASE_PASSWORD is local orchestration configuration and is ignored by Settings.
 The native application and migration commands below read `.env` in the current
-directory. Migrations read only DATABASE_URL, without variable interpolation or
+directory. [Goal4A Website canary](docs/website-canary.md) documents the private admission API,
+separate `python worker.py` process, narrow roles, evidence recovery and rollout
+gates. Empty Website bindings and disabled worker preserve the dark default.
+
+Migrations read only DATABASE_URL, without variable interpolation or
 loading authentication configuration. An exported DATABASE_URL takes precedence,
 including an empty or invalid value, which fails validation instead of falling back.
 
@@ -137,7 +141,9 @@ registration API. Future production provisioning requires separate integration
 work. Current CP does not yet implement WHATSAPP despite the reserved generic
 identity value here.
 
-Every business/OpenAPI request requires exactly one `X-Service-Token`; malformed,
+Registry roles are `FULL` (existing default), `WEBSITE` and `PROCESSING`; narrow
+roles cannot call foundation/control/execution/OpenAPI routes. Every business/OpenAPI
+request requires exactly one `X-Service-Token`; malformed,
 duplicated, wrong and missing tokens return the same 401. Authentication precedes
 body parsing and DB work. `X-User-Id`/`X-User-Role` cannot expand access. Ingestion
 must match one complete four-field grant; entity UUID access must join through a
@@ -174,10 +180,11 @@ It has no deployment credentials or publishing step. Implementation checks are
 distinct from the fresh independent review/verification required by Goal 1; see
 the evidence record for what actually ran.
 
-## Next stage
+## Goal4A and handoff
 
-**Goal 3 — business-operation safety for managed Turns**, reconciling stable Turn
-identities with AI-owned durable operation receipts and UNKNOWN recovery before
-any real channel is migrated. Goal2 source remains unconsumed, with no settling,
-human Inbox/handoff, CRM projection, attachments, Voice processing or provider
-delivery. Goal3 is planned, not implemented here.
+[Website canary source](docs/website-canary.md) adds immediate FIFO execution and
+protected evidence reads while retaining legacy Website traffic unless exact
+configured admission selects it. Production rollout/smoke require independent
+release and runtime verification. Full demo cutover additionally requires stable
+frontend message IDs and a separate reviewed assistant-history/context-limit
+policy. Goal4B Telegram and Goal5 settling are outside this change.

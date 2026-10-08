@@ -1,10 +1,11 @@
-# Unconsumed managed AgentTurn execution v1
+# Managed AgentTurn execution v1
 
 `POST /internal/v1/turns/{turn_id}/execute` accepts only existing claim_epoch and
 SecretStr claim_token. Authentication is the existing auth-before-body boundary;
 UUID access resolves through a complete trusted parent grant. Response is
-TurnResult. This harness has no production caller/scheduler, public gateway route,
-channel migration or provider delivery.
+TurnResult. The separate opt-in Goal4A Website worker uses this service primitive;
+[Website canary](website-canary.md) defines its scheduling/recovery boundary.
+There is no public gateway route or provider delivery in Conversation.
 
 Conversation owns Messages, sequence, selection, stable Turn, claim/epoch, draft
 and execution uncertainty. AI owns Agent configuration, prompts, KB, model context
@@ -63,8 +64,8 @@ Result echoes version/conversation/turn/agent and all frozen counters exactly.
 Status is DRAFT_READY/NO_RESPONSE/FAILED/UNKNOWN; draft exists only for DRAFT_READY,
 error_code only for FAILED/UNKNOWN. Closed causal codes are in independently
 mirrored `schemas/managed.py`. Operation_refs defaults [], with <=32 unique sorted
-existing opaque AI references and explicit nullable outcome; current AI has no
-durable receipts and returns []. No reasoning, secret, provider delivery or raw
+existing opaque AI references and explicit nullable outcome. Goal3 AI may retain
+durable references; Conversation stores no raw Business receipt or ledger. No reasoning, secret, provider delivery or raw
 business receipt belongs in results.
 
 Client streams at most 262144 response bytes, requires JSON media and identity/no
@@ -87,7 +88,9 @@ marker commit means no send. Fingerprint covers canonical v1 request plus namesp
 
 Same-epoch unfinished marker returns 409 MANAGED_EXECUTION_STARTED without changing
 live work. Expired marked Turn recovers on the same UUID with a new epoch; execute
-saves FAILED/EXECUTION_UNKNOWN without HTTP. Marker is never cleared or reassigned.
+saves FAILED/EXECUTION_UNKNOWN without a second execution request. Goal4A Website
+recovery may read genuine references from the protected AI evidence endpoint,
+rechecking current proof/live lease around that read. Marker is never cleared or reassigned.
 Terminal winning proof returns retained result/replayed=true without HTTP even
 after expiry. Displaced proof stays stale; late work cannot overwrite a winner.
 
@@ -104,15 +107,15 @@ between marker and HTTP conservatively sacrifices availability: recovery is UNKN
 even if nothing was sent. Result commit uncertainty permits only the same exact DB
 terminal request/proof retry; executor never repeats HTTP. EXECUTION_UNKNOWN means
 effects may have happened, not proof of failed mutation. No exactly-once business/
-cross-Turn guarantee or replacement-Turn retry exists. Goal3 owns receipts and
-reconciliation before real channel use.
+cross-Turn guarantee or replacement-Turn retry exists. Goal3 AI owns receipts and
+reconciliation; read-only late-reference queries never alter terminal fingerprints.
 
 ## Additive schema and checks
 
 0002_managed_execution adds nullable markers with null-safe shape, epoch/status/
 time/lowercase-digest CHECK and extends failure CHECK. 0001 stays unchanged. Goal1
 rows start with null markers and retain fingerprints/replay. Readiness requires
-exactly 0002. Downgrade locks the table and refuses any marker/EXECUTION_UNKNOWN row
+exactly 0003_website_canary, including the new Website journals. Downgrade locks the table and refuses any marker/EXECUTION_UNKNOWN row
 before removing columns. Test downgrade only on an empty explicit disposable DB.
 No production migration is applied here.
 
@@ -124,5 +127,7 @@ Service tests require explicit disposable PG16 URL and exact endpoint guards. Th
 separate mandatory `python -m pytest tests/managed_cross_service/acceptance_http.py`
 gate requires explicit AI candidate/runtime and separate disposable PG inputs,
 runs real apps/client over HTTP with fake model/KB/MCP only and fails missing inputs.
-The standard service suite remains runnable independently. Author checks,
+The standard service suite remains runnable independently. Goal4A real-process
+crash tests require their explicit Website candidate/runtime inputs; see
+`tests/website_cross_service/README.md`. Author checks,
 independent review and fresh verification remain separate evidence.

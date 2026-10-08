@@ -9,7 +9,7 @@ ENV PATH="/opt/venv/bin:$PATH" PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 RUN groupadd --gid 10001 conversation && useradd --uid 10001 --gid conversation --no-create-home conversation
 WORKDIR /app
 COPY --from=dependencies /opt/venv /opt/venv
-COPY main.py alembic.ini ./
+COPY main.py worker.py alembic.ini ./
 COPY core/ ./core/
 COPY db/ ./db/
 COPY models/ ./models/
@@ -18,5 +18,5 @@ COPY services/ ./services/
 COPY api/ ./api/
 COPY migrations/ ./migrations/
 USER conversation
-EXPOSE 8000
+EXPOSE 8000 8001
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--no-access-log"]

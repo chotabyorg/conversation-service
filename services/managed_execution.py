@@ -39,6 +39,7 @@ from schemas.managed import (
 from services import turns
 from services.common import db_clock, locked_turn
 from services.managed_client import ManagedAIPort, ManagedPortFailure
+from services.website_evidence import recovery_refs
 
 FINALIZATION_SECONDS = 5.0
 
@@ -245,9 +246,10 @@ async def execute_claimed_turn(
     if isinstance(snapshot, TurnResult):
         return snapshot
     if isinstance(snapshot, RecoverMarked):
-        return await turns.finish_turn(
-            database, principal, turn_id, fail_request(proof, TurnFailureCode.EXECUTION_UNKNOWN)
-        )
+        terminal_unknown = fail_request(proof, TurnFailureCode.EXECUTION_UNKNOWN)
+        terminal_unknown.operation_refs = await recovery_refs(
+            database, principal, turn_id, proof, settings, port)
+        return await turns.finish_turn(database, principal, turn_id, terminal_unknown)
     prepared = prepare_snapshot(snapshot)
     retained = await mark_dispatch(database, principal, turn_id, proof, prepared)
     if isinstance(retained, TurnResult):
@@ -266,5 +268,10 @@ async def execute_claimed_turn(
         terminal = fail_request(proof, failure.failure_code)
     except Exception:
         terminal = fail_request(proof, TurnFailureCode.EXECUTION_UNKNOWN)
+    if (isinstance(terminal, TurnFail)
+            and terminal.failure_code == TurnFailureCode.EXECUTION_UNKNOWN):
+        refs = await recovery_refs(database, principal, turn_id, proof, settings, port)
+        if refs:
+            terminal.operation_refs = refs
     # A finish/commit failure must never re-enter HTTP or use a different fingerprint.
     return await turns.finish_turn(database, principal, turn_id, terminal)
