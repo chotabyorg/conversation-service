@@ -4,7 +4,7 @@ All business paths use `/internal/v1`. Exactly one dedicated `X-Service-Token`
 authenticates a token-free Principal with server-provisioned exact grants. Missing,
 wrong, duplicated or malformed credentials are uniformly 401 before parsing a
 body. Scope mismatch and guessed UUID are uniformly 404. There is no public route,
-gateway change or provider send. The unconsumed managed executor is described in
+gateway change or provider send. The managed executor is described in
 [managed execution](managed-execution.md). X-User headers provide no authority.
 
 | Method/path | Request | Response and retry behavior |
@@ -30,8 +30,8 @@ resource is created. There is no 202 implying that work executed. No deletion,
 Message edit/outbound append or implicit draft promotion exists.
 
 `GET /health` returns `{status:"ok",service:"conversation-service"}`.
-`GET /ready` returns ready200 only when DB query, migration `0002_managed_execution` and
-required Conversation query succeed; otherwise not_ready503. These are the only
+`GET /ready` returns ready200 only when DB query, migration `0003_website_canary` and
+required Conversation and Website journal queries succeed; otherwise not_ready503. These are the only
 unauthenticated routes. `GET /internal/openapi.json` requires the service header.
 Default `/docs`, `/redoc`, `/openapi.json` are disabled. The fetched schema provides
 every exact DTO/property and X-Service-Token security requirement.
