@@ -3,8 +3,9 @@
 Durable provider-neutral communication journal and processing primitives for Main
 Chota Platform. PostgreSQL owns accepted inbound events, canonical Messages,
 Conversation identity, stable AgentTurns, delivery evidence and control authority.
-An unconsumed protected managed executor calls `ai-agent-service` for a claimed
-Turn. It sends nothing to a messaging or business provider.
+A protected managed executor calls `ai-agent-service` for a claimed Turn. The
+Goal4A Website worker consumes only explicitly admitted, authorized Website work;
+Conversation itself sends nothing to a messaging or business provider.
 
 Goal 1 is tracked in [issue #1](https://github.com/chotabyorg/conversation-service/issues/1),
 linked to the [Project #3 Foundation initiative](https://github.com/orgs/chotabyorg/projects/3/views/1?pane=issue&itemId=263003543).
@@ -14,8 +15,8 @@ alone does not complete it.
 
 Goal 2 is tracked in [issue #3](https://github.com/chotabyorg/conversation-service/issues/3).
 See [managed execution](docs/managed-execution.md) for the independent v1 AI contract,
-one-attempt semantics and private local binding configuration. No scheduler or
-channel consumer invokes this path.
+one-attempt semantics and private local binding configuration. Goal4A adds the
+separate immediate Website coordinator described in [Website canary](docs/website-canary.md).
 
 **Source implementation; production rollout requires separate evidence.** There
 is no public KrakenD route or provider webhook. The manual publisher builds only
@@ -25,8 +26,9 @@ callers continue their existing paths.
 This is separate from paused fashion/e-commerce **Chota 2.0**
 (`chotabyorg/chota`, Project #6); none of its Conversation code is a dependency or
 implementation template. Conversation coordination is separate from Business
-operation coordination. AI Business V2 PR #43 was OPEN/DRAFT/unmerged at discovery;
-this foundation neither depends on nor implements its operation ledger.
+operation coordination. AI Business V2 PR #43 was OPEN/DRAFT/unmerged at the
+historical Goal1 discovery. The Goal4A runtime baseline includes accepted newer
+Business work; this service preserves that boundary and stores only opaque refs.
 
 ## Foundation contracts
 
@@ -49,8 +51,9 @@ Message or revision.
 The Conversation row serializes its own mutations; unrelated Conversations can
 progress independently. Unique identity/event/Message indexes and the active-Turn
 partial unique index defend the invariants at PostgreSQL level. `PENDING` and
-`CLAIMED` both occupy the one active logical Turn slot. New inbound remains durable
-without automatic scheduling, debounce or supersede policy.
+`CLAIMED` both occupy the one active logical Turn slot. Generic ingress primitives
+do not schedule work. Goal4A explicitly admitted Website Messages use the durable
+immediate worker; debounce and supersede remain outside this policy.
 
 A claim fences a stable Turn using a monotonically increasing epoch and a random
 256-bit bearer whose SHA-256 digest alone is persisted. Expired recovery rotates
@@ -116,7 +119,7 @@ Compose binds only `127.0.0.1:55585` (HTTP) and `127.0.0.1:55595` (PostgreSQL),
 using its own internal network rather than the existing microservices network.
 The application image runs as UID 10001 and Compose uses a read-only filesystem.
 Migrations are explicit; startup never substitutes `create_all`. `/ready` succeeds
-only against migration `0002_managed_execution` and the required table query. `/health`
+only against migration `0003_website_canary` and the required table queries. `/health`
 checks process liveness. Both return bounded public status only.
 
 ## Internal authentication
