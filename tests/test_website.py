@@ -374,8 +374,8 @@ def test_logging_all_sinks_descendants_exceptions_and_reconfiguration_are_safe()
     configure_logging("INFO")
 
 
-async def test_unmarked_projection_failure_terminalizes_same_turn_without_dispatch(wh, sql):
-    # The managed v1 prefix is bounded256; Goal4A must not stall indefinitely.
+async def test_new_website_window_continues_beyond_v1_prefix_limit(wh, sql):
+    # New Website work freezes a bounded absolute v2 window beyond sequence256.
     value = payload(wh)
     for index in range(257):
         await admit(wh, dict(value, message_id=str(uuid4()), text=str(index)))
@@ -385,9 +385,11 @@ async def test_unmarked_projection_failure_terminalizes_same_turn_without_dispat
         final = await session.scalar(select(AgentTurn).order_by(
             AgentTurn.input_last_sequence.desc()).limit(1))
         assert final.input_last_sequence == 257
-        assert final.status == "FAILED" and final.failure_code == "INVALID_RESULT"
-        assert final.managed_dispatch_epoch is None
-    assert len(wh.ai.calls) == 256
+        assert final.status == "COMPLETED" and final.failure_code is None
+        assert final.managed_contract_version == 2
+        assert final.managed_context_first_sequence == 2
+    assert len(wh.ai.calls) == 257
+    assert [m.sequence for m in wh.ai.calls[-1].request.messages] == list(range(2, 258))
 
 
 async def test_recovery_no_evidence_stays_unknown_and_does_not_repeat(wh, sql):

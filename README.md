@@ -14,7 +14,7 @@ defines this boundary. Foundation remains an umbrella for later stages; Goal 1
 alone does not complete it.
 
 Goal 2 is tracked in [issue #3](https://github.com/chotabyorg/conversation-service/issues/3).
-See [managed execution](docs/managed-execution.md) for the independent v1 AI contract,
+See [managed execution](docs/managed-execution.md) for the independent versioned AI contract,
 one-attempt semantics and private local binding configuration. Goal4A adds the
 separate immediate Website coordinator described in [Website canary](docs/website-canary.md).
 
@@ -61,7 +61,8 @@ proof on the same Turn UUID. Lease decisions use the DB clock after acquiring
 locks; stale or expired claimants cannot renew/finish. Exact terminal replay is
 accepted only for the winning proof and identical result, even after expiry.
 
-Completed draft text is an internal candidate response, not a delivered Message.
+Completed draft text is an internal candidate response until eligible Website write
+evidence creates canonical history; see [history policy](docs/history-projection.md).
 DeliveryAttempt references that immutable draft Turn. One journal attempt per
 draft and retained reconciliation keys prevent duplicate/reverted evidence.
 `UNKNOWN`, `FAILED`, `PARTIAL` and `INTERRUPTED` remain distinct. Control CAS
@@ -119,7 +120,7 @@ Compose binds only `127.0.0.1:55585` (HTTP) and `127.0.0.1:55595` (PostgreSQL),
 using its own internal network rather than the existing microservices network.
 The application image runs as UID 10001 and Compose uses a read-only filesystem.
 Migrations are explicit; startup never substitutes `create_all`. `/ready` succeeds
-only against migration `0003_website_canary` and the required table queries. `/health`
+only against migration `0004_website_history` and the required table queries. `/health`
 checks process liveness. Both return bounded public status only.
 
 ## Internal authentication
@@ -189,5 +190,5 @@ the evidence record for what actually ran.
 protected evidence reads while retaining legacy Website traffic unless exact
 configured admission selects it. Production rollout/smoke require independent
 release and runtime verification. Full demo cutover additionally requires stable
-frontend message IDs and a separate reviewed assistant-history/context-limit
-policy. Goal4B Telegram and Goal5 settling are outside this change.
+frontend message IDs, independent review of the [history policy](docs/history-projection.md)
+and a separately approved routing gate. Goal4B Telegram and Goal5 settling are outside this change.

@@ -43,7 +43,9 @@ retained key lookup precedes checking current history/control/active work: exact
 creation replay returns the original Turn (including terminal); changed request
 under that key conflicts. New work requires AGENT control, exact snapshots and
 valid same-Conversation Message endpoints. Context freezes at current last sequence.
-This foundation currently contains only inbound Messages in the selected range.
+Canonical history may include eligible Website AGENT Messages. input_revision
+counts accepted customer input only; assistant append advances sequence alone.
+New Website windows follow the [explicit freeze policy](history-projection.md).
 
 `uq_turn_selection` retains logical creation identity. Composite Message FKs
 retain same-Conversation boundaries. `uq_turn_one_active` is a partial UNIQUE
@@ -129,7 +131,8 @@ Known provider operation/message ID cannot be replaced. Null may be enriched;
 omitted/null update keeps existing known reference. Positive current state clears
 safe error_code; prior negative evidence remains in reconciliation history.
 
-Future provider adapters/retries, outbound Message promotion, input freshness,
+Website promotion follows the [explicit write policy](history-projection.md).
+Future provider adapters/retries, other outbound promotion, input freshness,
 supersede, settling and managed business safety require separate contracts. Goal 1
 retains evidence for them without implementing them.
 

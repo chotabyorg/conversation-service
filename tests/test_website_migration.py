@@ -3,7 +3,7 @@ from uuid import uuid4
 
 from sqlalchemy import text
 
-from tests.test_managed_migration import migrate, rows
+from tests.test_managed_migration import HISTORY_COLUMNS, migrate, rows
 from tests.test_website import admit, payload
 from tests.test_website import wh as website_fixture
 
@@ -20,14 +20,14 @@ async def test_populated0002_to_head_keeps_ids_fingerprints_leases_drafts_and_re
             "managed_dispatch_started_at=started_at,managed_request_fingerprint=:digest "
             "WHERE id=:id"
         ), {"agent": str(uuid4()), "digest": "b" * 64, "id": turn["id"]})
-    before = await rows(sql)
+    before = await rows(sql, exclude=HISTORY_COLUMNS)
     await h.database.dispose()
     migrate(database_url, "downgrade", "0002_managed_execution")
     assert not await h.database.ready()
-    assert await rows(sql) == before
+    assert await rows(sql, exclude=HISTORY_COLUMNS) == before
     migrate(database_url, "upgrade", "head")
     assert await h.database.ready()
-    assert await rows(sql) == before
+    assert await rows(sql, exclude=HISTORY_COLUMNS) == before
     assert (await h.call("GET", f"/messages/{accepted['message']['id']}")).status_code == 200
 
 

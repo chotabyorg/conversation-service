@@ -33,6 +33,18 @@ async def wait_terminal(h, message_id):
     pytest.fail("Stable Turn did not terminalize after process recovery")
 
 
+async def wait_history(h, conversation_id, expected_agents):
+    deadline = asyncio.get_running_loop().time() + 8
+    while asyncio.get_running_loop().time() < deadline:
+        rows = await h.rows("SELECT id,sequence,actor,direction,content_type,text,"
+            "source_agent_turn_id "
+            "FROM messages WHERE conversation_id=:id ORDER BY sequence", id=conversation_id)
+        if sum(row["actor"] == "AGENT" for row in rows) == expected_agents:
+            return rows
+        await asyncio.sleep(0.02)
+    pytest.fail("Required durable assistant history was not committed")
+
+
 def record(point, before, after, observations, attempts):
     safe = {"scenario": point, "admission_id": after["admission_id"],
             "conversation_id": after["conversation_id"],
@@ -121,10 +133,14 @@ async def test_crash_commit_boundaries_keep_same_turn_and_no_repeat_effect(wh, p
     assert len(observations["managed"]) == expected_calls
     assert len(observations["effects"]) == expected_calls
     assert observations["legacy"] == []
+    history = await wait_history(h, final["conversation_id"], 0 if uncertain else 1)
+    if not uncertain:
+        assert history[-1]["source_agent_turn_id"] == final["turn_id"]
+        assert history[-1]["text"] == final["draft_text"]
     counts = await h.rows("SELECT (SELECT count(*) FROM messages) AS messages,"
                          "(SELECT count(*) FROM inbound_events) AS events,"
                          "(SELECT count(*) FROM agent_turns) AS turns")
-    assert counts == [{"messages": 1, "events": 1, "turns": 1}]
+    assert counts == [{"messages": 1 if uncertain else 2, "events": 1, "turns": 1}]
     attempts = await h.rows("SELECT id,outcome FROM website_response_attempts ORDER BY created_at")
     if not uncertain:
         assert final["delivery_status"] == "UNKNOWN"
@@ -132,6 +148,108 @@ async def test_crash_commit_boundaries_keep_same_turn_and_no_repeat_effect(wh, p
         if point in ("G", "H"):
             assert attempts[0]["outcome"] is None  # Crash intent never becomes browser ACK.
     record(point, before, final, observations, attempts)
+
+
+@pytest.mark.parametrize("customer,replies", [
+    (["Привет", "Какие услуги", "А маникюр"],
+     ["Здравствуйте", "Маникюр и педикюр", "Есть маникюр"]),
+    (["Хочу записаться", "Маникюр", "Завтра"],
+     ["На какую услугу?", "На какой день?", "Есть 18:00, записать?"]),
+    (["Хочу завтра в 18", "+"], ["Записать?", "Технический ответ без Business операции"]),
+])
+async def test_deterministic_dialogs_actual_processes_use_prior_canonical_agents(
+    wh, customer, replies
+):
+    h = wh
+    h.replies = dict(zip(customer, replies, strict=True))
+    await h.restart("fake")
+    await start_chain(h)
+    previous = []
+    bodies = []
+    for index, message in enumerate(customer):
+        body = h.body(message=message)
+        bodies.append(body)
+        response = await h.eventual_chat(body)
+        assert response.json()["reply"] == replies[index]
+        state = await h.state(body["message_id"])
+        history = await wait_history(h, state["conversation_id"], index + 1)
+        request = h.observations()["managed"][-1]
+        assert request["contract_version"] == 2
+        assert request["input_revision"] == index + 1
+        assert request["context_last_sequence"] == index * 2 + 1
+        assert request["selected_input_message_ids"] == [str(state["canonical_message_id"])]
+        assert [m["actor"] for m in request["messages"]] == ["CUSTOMER", "AGENT"] * index + [
+            "CUSTOMER"]
+        assert [m["id"] for m in request["messages"][:-1]] == [str(m["id"]) for m in previous]
+        assert [m["text"] for m in request["messages"]] == [
+            item for pair in zip(customer[:index], replies[:index], strict=True) for item in pair
+        ] + [message]
+        previous = history
+    await h.restart("cs")
+    await h.restart("worker")
+    await h.restart("website")
+    for body, reply in zip(bodies, replies, strict=True):
+        assert (await h.chat(body)).json()["reply"] == reply
+    history = await wait_history(h, state["conversation_id"], len(customer))
+    assert len(history) == 2 * len(customer)
+    assert len({m["source_agent_turn_id"] for m in history
+                if m["actor"] == "AGENT"}) == len(customer)
+    assert len(h.observations()["managed"]) == len(customer)
+    assert h.observations()["legacy"] == []
+    # Every external endpoint is denied by all process guards; this fake has no
+    # Business/provider mutation route. Its effects are execution-count sentinels.
+    EVIDENCE.append({"scenario": "Goal4A.1 deterministic dialog", "customer_turns": len(customer),
+                     "canonical_messages": len(history), "prior_agent_rows_in_final_request":
+                     len(customer) - 1, "ai_http_calls": len(h.observations()["managed"]),
+                     "business_provider_calls": 0})
+
+
+@pytest.mark.parametrize("outcome", ["WRITE_FAILED", "UNKNOWN"])
+async def test_failed_or_unknown_physical_fact_later_success_appends_in_commit_order(wh, outcome):
+    h = wh
+    await start_chain(h, fault="F")
+    first = h.body(message="first-draft")
+    pending = asyncio.create_task(h.chat(first))
+    await h.barrier("F")  # Actual draft retained, before Website physical write.
+    state = await h.state(first["message_id"])
+    h.kill("website")
+    await settle_request(pending)
+    assert len(await wait_history(h, state["conversation_id"], 0)) == 1
+    attempt = {"owner_id": h.ids["owner"], "integration_id": h.ids["integration"],
+               "agent_id": h.ids["agent"], "session_id": first["session_id"],
+               "message_id": first["message_id"], "response_attempt_id": str(uuid4())}
+    # Explicit fixture transport fact exercises the real protected HTTP API.
+    # No success is invented: only the later actual Website response promotes.
+    for path, body in (("begin", attempt), ("complete", dict(attempt, outcome=outcome))):
+        response = await h.client.post(h.url("cs") + "/internal/v1/website/responses/" + path,
+            headers={"X-Service-Token": h.tokens["website"]}, json=body)
+        assert response.status_code == 200
+    assert len(await wait_history(h, state["conversation_id"], 0)) == 1
+    h.start("website")
+    await h.wait_ready("website")
+    second = h.body(message="second-draft")
+    assert (await h.eventual_chat(second)).status_code == 200
+    second_state = await h.state(second["message_id"])
+    before_retry = await wait_history(h, state["conversation_id"], 1)
+    second_request = h.observations()["managed"][-1]
+    assert [m["actor"] for m in second_request["messages"]] == ["CUSTOMER", "CUSTOMER"]
+    assert (await h.chat(first)).status_code == 200
+    after_retry = await wait_history(h, state["conversation_id"], 2)
+    assert after_retry[-2]["source_agent_turn_id"] == second_state["turn_id"]
+    assert after_retry[-1]["source_agent_turn_id"] == state["turn_id"]
+    assert after_retry[:3] == before_retry
+    third = h.body(message="third-draft")
+    assert (await h.eventual_chat(third)).status_code == 200
+    await wait_history(h, state["conversation_id"], 3)
+    request = h.observations()["managed"][-1]
+    assert [m["actor"] for m in request["messages"]] == [
+        "CUSTOMER", "CUSTOMER", "AGENT", "AGENT", "CUSTOMER"]
+    assert [m["id"] for m in request["messages"][:-1]] == [str(m["id"]) for m in after_retry]
+    assert len(h.observations()["managed"]) == 3
+    assert h.observations()["legacy"] == []
+    EVIDENCE.append({"scenario": "Goal4A.1 physical retry", "first_outcome": outcome,
+                     "agent_commit_order": "second Turn, first Turn, third Turn",
+                     "ai_http_calls": 3, "duplicate_assistant_rows": 0})
 
 
 async def test_real_http_identity_replay_conflict_same_text_new_id_and_isolation(wh):

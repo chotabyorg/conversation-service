@@ -74,6 +74,7 @@ class WebsiteHarness:
     tokens: dict = field(repr=False)
     processes: dict = field(default_factory=dict, repr=False)
     handles: list = field(default_factory=list, repr=False)
+    replies: dict = field(default_factory=dict)
 
     def url(self, name):
         return f"http://127.0.0.1:{self.ports[name]}"
@@ -140,7 +141,7 @@ class WebsiteHarness:
         config = {"name": name, "state_dir": str(self.root), "port": self.ports[name],
                   "allowlist": [["127.0.0.1", self.ports[key]] for key in self.ports] +
                   [["127.0.0.1", make_url(self.database_url).port or 5432]],
-                  "widgets": widgets, "fault": fault}
+                  "widgets": widgets, "fault": fault, "replies": self.replies}
         private_json(config_path, config)
         env["GOAL4A_BOOTSTRAP_CONFIG"] = str(config_path)
         log = (self.root / (name + ".log")).open("ab")

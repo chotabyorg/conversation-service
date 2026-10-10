@@ -27,10 +27,11 @@ gateway change or provider send. The managed executor is described in
 
 All outputs occur after commit. Mutation successes are 200 unless a new immutable
 resource is created. There is no 202 implying that work executed. No deletion,
-Message edit/outbound append or implicit draft promotion exists.
+Message edit or generic outbound append exists. Website response completion adds
+canonical assistant history only under the [explicit write policy](history-projection.md).
 
 `GET /health` returns `{status:"ok",service:"conversation-service"}`.
-`GET /ready` returns ready200 only when DB query, migration `0003_website_canary` and
+`GET /ready` returns ready200 only when DB query, migration `0004_website_history` and
 required Conversation and Website journal queries succeed; otherwise not_ready503. These are the only
 unauthenticated routes. `GET /internal/openapi.json` requires the service header.
 Default `/docs`, `/redoc`, `/openapi.json` are disabled. The fetched schema provides

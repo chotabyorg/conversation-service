@@ -50,7 +50,7 @@ class Database:
     async def dispose(self) -> None:
         await self.engine.dispose()
 
-    async def ready(self, expected_revision: str = "0003_website_canary") -> bool:
+    async def ready(self, expected_revision: str = "0004_website_history") -> bool:
         try:
             async with self.engine.connect() as connection:
                 if await connection.scalar(text("SELECT 1")) != 1:
@@ -69,9 +69,14 @@ class Database:
                     )
                 )
                 await connection.execute(text(
-                    "SELECT a.id,t.turn_id,r.id FROM website_admissions a "
+                    "SELECT a.id,t.turn_id,r.id,m.source_agent_turn_id, "
+                    "v.managed_contract_version,v.managed_context_first_sequence, "
+                    "v.managed_projection_agent_id,v.managed_projection_fingerprint "
+                    "FROM website_admissions a "
                     "LEFT JOIN website_immediate_turns t ON t.message_id=a.canonical_message_id "
-                    "LEFT JOIN website_response_attempts r ON r.admission_id=a.id LIMIT 1"
+                    "LEFT JOIN website_response_attempts r ON r.admission_id=a.id "
+                    "LEFT JOIN agent_turns v ON v.id=t.turn_id "
+                    "LEFT JOIN messages m ON m.source_agent_turn_id=v.id LIMIT 1"
                 ))
                 return True
         except (SQLAlchemyError, OSError, TimeoutError):

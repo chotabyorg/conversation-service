@@ -6,14 +6,13 @@ import asyncio
 from dataclasses import dataclass
 from uuid import UUID
 
-from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.config import ManagedBinding, Settings
 from core.errors import DomainError
 from db.database import Database
-from models import AgentTurn, Conversation, Message
+from models import AgentTurn, Conversation, WebsiteAdmission, WebsiteImmediateTurn
 from schemas.contracts import (
     Channel,
     ErrorCode,
@@ -28,7 +27,6 @@ from schemas.contracts import (
     TurnResult,
 )
 from schemas.managed import (
-    MAX_MESSAGES,
     MAX_RESULT_BYTES,
     ManagedMessage,
     ManagedTurnRequest,
@@ -38,6 +36,7 @@ from schemas.managed import (
 )
 from services import turns
 from services.common import db_clock, locked_turn
+from services.history_projection import canonical_window, projected_request
 from services.managed_client import ManagedAIPort, ManagedPortFailure
 from services.website_evidence import recovery_refs
 
@@ -52,11 +51,26 @@ class Snapshot:
     channel: Channel
     binding: ManagedBinding
     messages: tuple[ManagedMessage, ...]
+    contract_version: int
+    projection_fingerprint: str | None
 
 
 @dataclass(frozen=True)
 class RecoverMarked:
     """No request preparation/binding/network is needed for durable uncertainty."""
+
+
+async def validate_website_agent(session: AsyncSession, turn: AgentTurn, agent_id: UUID) -> None:
+    admission_agent = await session.scalar(select(WebsiteAdmission.agent_id).join(
+        WebsiteImmediateTurn,
+        WebsiteImmediateTurn.message_id == WebsiteAdmission.canonical_message_id,
+    ).where(WebsiteImmediateTurn.turn_id == turn.id,
+            WebsiteImmediateTurn.conversation_id == turn.conversation_id,
+            WebsiteAdmission.conversation_id == turn.conversation_id))
+    if ((admission_agent is not None and admission_agent != agent_id)
+            or (turn.managed_contract_version == 2 and (
+                admission_agent is None or turn.managed_projection_agent_id != agent_id))):
+        raise DomainError(ErrorCode.VALIDATION_ERROR)
 
 
 async def claimed_state(
@@ -95,30 +109,20 @@ async def take_snapshot(
         )
         if binding is None or settings.managed_ai_base_url is None:
             raise DomainError(ErrorCode.SERVICE_UNAVAILABLE)
-        if turn.context_last_sequence > MAX_MESSAGES:
-            raise DomainError(ErrorCode.VALIDATION_ERROR)
-        rows = (
-            await session.scalars(
-                select(Message)
-                .where(
-                    Message.conversation_id == conversation.id,
-                    Message.sequence <= turn.context_last_sequence,
-                )
-                .order_by(Message.sequence)
-                .limit(MAX_MESSAGES + 1)
-            )
-        ).all()
-        try:
-            messages = tuple(ManagedMessage.model_validate(row) for row in rows)
-        except ValidationError:
-            raise DomainError(ErrorCode.VALIDATION_ERROR) from None
-        return Snapshot(TurnRead.model_validate(turn), *scope, binding, messages)
+        await validate_website_agent(session, turn, binding.agent_id)
+        messages = await canonical_window(session, conversation.id,
+            turn.managed_context_first_sequence, turn.context_last_sequence)
+        snapshot = Snapshot(TurnRead.model_validate(turn), *scope, binding, messages,
+                            turn.managed_contract_version, turn.managed_projection_fingerprint)
+        prepare_snapshot(snapshot)
+        return snapshot
 
 
 def prepare_snapshot(snapshot: Snapshot) -> PreparedManagedRequest:
     turn = snapshot.turn
     try:
         request = ManagedTurnRequest(
+            contract_version=snapshot.contract_version,
             conversation_id=turn.conversation_id,
             turn_id=turn.id,
             owner_id=snapshot.owner_id,
@@ -137,7 +141,12 @@ def prepare_snapshot(snapshot: Snapshot) -> PreparedManagedRequest:
                 if turn.input_first_sequence <= message.sequence <= turn.input_last_sequence
             ),
         )
-        return prepare_request(request)
+        prepared = prepare_request(request)
+        if ((snapshot.projection_fingerprint is not None
+                and prepared.fingerprint != snapshot.projection_fingerprint)
+                or (snapshot.contract_version == 2 and snapshot.projection_fingerprint is None)):
+            raise ValueError("frozen projection changed")
+        return prepared
     except (ValueError, TypeError):
         raise DomainError(ErrorCode.VALIDATION_ERROR) from None
 
@@ -153,7 +162,22 @@ async def mark_dispatch(
         turn, retained = await claimed_state(session, principal, turn_id, proof)
         if retained is not None:
             return retained
-        # Same immutable Turn projection, and a newly sampled clock after final locks.
+        # Reconstruct again under the final Conversation lock. Neither a stale
+        # caller snapshot nor concurrent row/identity drift may become the marker.
+        conversation = await session.get(Conversation, turn.conversation_id)
+        if conversation is None:
+            raise DomainError(ErrorCode.NOT_FOUND)
+        await validate_website_agent(session, turn, prepared.request.agent_id)
+        messages = await canonical_window(session, conversation.id,
+            turn.managed_context_first_sequence, turn.context_last_sequence)
+        try:
+            current = projected_request(turn, conversation, prepared.request.agent_id, messages)
+        except ValueError:
+            raise DomainError(ErrorCode.VALIDATION_ERROR) from None
+        if (current.fingerprint != prepared.fingerprint or current.body != prepared.body
+                or (turn.managed_contract_version == 2
+                    and current.fingerprint != turn.managed_projection_fingerprint)):
+            raise DomainError(ErrorCode.VALIDATION_ERROR)
         turn.managed_agent_id = prepared.request.agent_id
         turn.managed_dispatch_epoch = proof.claim_epoch
         turn.managed_dispatch_started_at = await db_clock(session)
