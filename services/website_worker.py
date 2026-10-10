@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from typing import cast
 from uuid import UUID, uuid4
 
 from pydantic import SecretStr
@@ -33,66 +34,144 @@ async def select_immediate(database: Database, principal: Principal,
                        WebsiteAdmission.integration_id == b.integration_id,
                        WebsiteAdmission.agent_id == b.agent_id)
                    for b in settings.website_bindings))
-    async with database.session_factory() as session, session.begin():
-        ids = (await session.scalars(select(Conversation.id).join(
-            WebsiteAdmission, WebsiteAdmission.conversation_id == Conversation.id,
-        ).where(WebsiteAdmission.route == "MANAGED", scopes, scope_filter(principal),
-                or_(~exists(select(WebsiteImmediateTurn.message_id).where(
-                    WebsiteImmediateTurn.message_id == WebsiteAdmission.canonical_message_id)),
-                    exists(select(AgentTurn.id).where(
-                        AgentTurn.conversation_id == Conversation.id,
-                        AgentTurn.status.in_(("PENDING", "CLAIMED"))))))
-            .distinct().order_by(Conversation.id).limit(100))).all()
+    candidate_query = select(Conversation.id).join(
+        WebsiteAdmission, WebsiteAdmission.conversation_id == Conversation.id,
+    ).where(WebsiteAdmission.route == "MANAGED", scopes, scope_filter(principal),
+            or_(~exists(select(WebsiteImmediateTurn.message_id).where(
+                WebsiteImmediateTurn.message_id == WebsiteAdmission.canonical_message_id)),
+                exists(select(AgentTurn.id).where(
+                    AgentTurn.conversation_id == Conversation.id,
+                    AgentTurn.status.in_(("PENDING", "CLAIMED")))))).distinct()
+    last_candidate_id: UUID | None = None
+    while True:
+        async with database.session_factory() as session, session.begin():
+            candidate_page = candidate_query
+            if last_candidate_id is not None:
+                candidate_page = candidate_page.where(Conversation.id > last_candidate_id)
+            ids = (await session.scalars(
+                candidate_page.order_by(Conversation.id).limit(100)
+            )).all()
+        if not ids:
+            return None
+
+        # The UUID cursor is only a scan position within this poll; it resets on
+        # every poll and is not a fairness policy or durable scheduling state.
+        # Each candidate gets a short transaction so every skipped or raced
+        # recheck releases its conversation lock before the next candidate.
         for conversation_id in ids:
-            conversation = await authorized_conversation(session, principal, conversation_id,
-                                                          lock=True)
-            clock = await db_clock(session)
-            if conversation.control_mode != "AGENT":
-                continue
-            active = await session.scalar(select(AgentTurn).where(
-                AgentTurn.conversation_id == conversation_id,
-                AgentTurn.status.in_(("PENDING", "CLAIMED"))))
-            if active is not None:
-                selected = await session.scalar(select(WebsiteImmediateTurn).join(
-                    WebsiteAdmission,
-                    WebsiteAdmission.canonical_message_id == WebsiteImmediateTurn.message_id,
-                ).where(WebsiteImmediateTurn.turn_id == active.id, scopes))
-                if selected is None:
+            async with database.session_factory() as session, session.begin():
+                control_mode = await session.scalar(select(Conversation.control_mode).where(
+                    Conversation.id == conversation_id))
+                if control_mode != "AGENT":
                     continue
-                if (active.status == "CLAIMED" and active.lease_expires_at is not None
-                        and active.lease_expires_at > clock):
+
+                active_values = (await session.execute(select(
+                    AgentTurn.id, AgentTurn.status, AgentTurn.lease_expires_at,
+                ).where(AgentTurn.conversation_id == conversation_id,
+                        AgentTurn.status.in_(("PENDING", "CLAIMED"))
+                ))).first()
+                if active_values is not None:
+                    active_id, active_status, lease_expires_at = active_values
+                    selected = await session.scalar(select(WebsiteImmediateTurn.turn_id).join(
+                        WebsiteAdmission,
+                        WebsiteAdmission.canonical_message_id == WebsiteImmediateTurn.message_id,
+                    ).where(WebsiteImmediateTurn.turn_id == active_id, scopes))
+                    if selected is None:
+                        continue
+                    clock = await db_clock(session)
+                    if (active_status == "CLAIMED" and lease_expires_at is not None
+                            and lease_expires_at > clock):
+                        continue
+
+                    # Lock only after an unlocked preflight identifies work that
+                    # may be selectable; recheck all eligibility under the lock.
+                    conversation = await authorized_conversation(
+                        session, principal, conversation_id, lock=True
+                    )
+                    clock = await db_clock(session)
+                    if conversation.control_mode != "AGENT":
+                        continue
+                    active = await session.scalar(select(AgentTurn).where(
+                        AgentTurn.conversation_id == conversation_id,
+                        AgentTurn.status.in_(("PENDING", "CLAIMED"))))
+                    if active is None:
+                        continue
+                    selected = await session.scalar(select(WebsiteImmediateTurn.turn_id).join(
+                        WebsiteAdmission,
+                        WebsiteAdmission.canonical_message_id == WebsiteImmediateTurn.message_id,
+                    ).where(WebsiteImmediateTurn.turn_id == active.id, scopes))
+                    if selected is None:
+                        continue
+                    if (active.status == "CLAIMED" and active.lease_expires_at is not None
+                            and active.lease_expires_at > clock):
+                        continue
+                    return active.id
+
+                message_id: UUID | None = await session.scalar(select(Message.id).join(
+                    WebsiteAdmission, WebsiteAdmission.canonical_message_id == Message.id,
+                ).where(Message.conversation_id == conversation_id,
+                        Message.actor == "CUSTOMER", Message.direction == "INBOUND",
+                        scopes, ~exists(select(WebsiteImmediateTurn.message_id).where(
+                            WebsiteImmediateTurn.message_id == Message.id)))
+                    .order_by(Message.sequence).limit(1))
+                if message_id is None:
                     continue
-                return active.id
-            message = await session.scalar(select(Message).join(
-                WebsiteAdmission, WebsiteAdmission.canonical_message_id == Message.id,
-            ).where(Message.conversation_id == conversation_id,
-                    Message.actor == "CUSTOMER", Message.direction == "INBOUND",
-                    scopes, ~exists(select(WebsiteImmediateTurn.message_id).where(
-                        WebsiteImmediateTurn.message_id == Message.id)))
-                .order_by(Message.sequence).limit(1))
-            if message is None:
-                continue
-            fields = {"contract_version": 1, "conversation_id": str(conversation_id),
-                      "selection_key": str(message.id), "input_first_sequence": message.sequence,
-                      "input_last_sequence": message.sequence,
-                      "context_last_sequence": message.sequence,
-                      "expected_input_revision": conversation.input_revision,
-                      "expected_authority_revision": conversation.authority_revision}
-            turn = AgentTurn(
-                id=uuid4(), conversation_id=conversation_id, selection_key=message.id,
-                creation_fingerprint=fingerprint(fields), input_first_sequence=message.sequence,
-                input_last_sequence=message.sequence, context_last_sequence=message.sequence,
-                input_revision=conversation.input_revision,
-                authority_revision=conversation.authority_revision, status="PENDING", claim_epoch=0,
-                operation_refs=[], created_at=clock,
-            )
-            session.add(turn)
-            await session.flush()
-            session.add(WebsiteImmediateTurn(message_id=message.id,
-                                             conversation_id=conversation_id, turn_id=turn.id))
-            await session.flush()
-            return turn.id
-    return None
+
+                # Lock and recheck before creating the Turn. This preserves the
+                # single-active-Turn invariant against concurrent pollers.
+                conversation = await authorized_conversation(
+                    session, principal, conversation_id, lock=True
+                )
+                clock = await db_clock(session)
+                if conversation.control_mode != "AGENT":
+                    continue
+                active = await session.scalar(select(AgentTurn).where(
+                    AgentTurn.conversation_id == conversation_id,
+                    AgentTurn.status.in_(("PENDING", "CLAIMED"))))
+                if active is not None:
+                    selected = await session.scalar(select(WebsiteImmediateTurn.turn_id).join(
+                        WebsiteAdmission,
+                        WebsiteAdmission.canonical_message_id == WebsiteImmediateTurn.message_id,
+                    ).where(WebsiteImmediateTurn.turn_id == active.id, scopes))
+                    if selected is not None and not (
+                        active.status == "CLAIMED" and active.lease_expires_at is not None
+                        and active.lease_expires_at > clock
+                    ):
+                        return cast(UUID, active.id)
+                    continue
+                message = await session.scalar(select(Message).join(
+                    WebsiteAdmission, WebsiteAdmission.canonical_message_id == Message.id,
+                ).where(Message.id == message_id,
+                        Message.conversation_id == conversation_id,
+                        Message.actor == "CUSTOMER", Message.direction == "INBOUND",
+                        scopes, ~exists(select(WebsiteImmediateTurn.message_id).where(
+                            WebsiteImmediateTurn.message_id == Message.id))))
+                if message is None:
+                    continue
+                fields = {"contract_version": 1, "conversation_id": str(conversation_id),
+                          "selection_key": str(message.id),
+                          "input_first_sequence": message.sequence,
+                          "input_last_sequence": message.sequence,
+                          "context_last_sequence": message.sequence,
+                          "expected_input_revision": conversation.input_revision,
+                          "expected_authority_revision": conversation.authority_revision}
+                turn = AgentTurn(
+                    id=uuid4(), conversation_id=conversation_id, selection_key=message.id,
+                    creation_fingerprint=fingerprint(fields), input_first_sequence=message.sequence,
+                    input_last_sequence=message.sequence, context_last_sequence=message.sequence,
+                    input_revision=conversation.input_revision,
+                    authority_revision=conversation.authority_revision,
+                    status="PENDING", claim_epoch=0,
+                    operation_refs=[], created_at=clock,
+                )
+                session.add(turn)
+                await session.flush()
+                session.add(WebsiteImmediateTurn(message_id=message.id,
+                                                 conversation_id=conversation_id, turn_id=turn.id))
+                await session.flush()
+                return turn.id
+
+        last_candidate_id = ids[-1]
 
 
 class WebsiteWorker:
