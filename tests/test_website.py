@@ -7,11 +7,11 @@ from uuid import uuid4
 
 import pytest
 import pytest_asyncio
-from sqlalchemy import select, text
+from sqlalchemy import select, text, update
 
 from core.config import Settings
 from core.logging import configure_logging
-from models import AgentTurn
+from models import AgentTurn, Conversation, WebsiteAdmission
 from schemas.contracts import OperationReference, TurnClaim, TurnExecute
 from schemas.managed import ManagedTurnResult
 from schemas.website import ManagedEvidenceResult
@@ -177,6 +177,33 @@ async def test_distinct_ids_identical_text_fifo_frozen_prefix_restart(wh, sql):
     assert not await worker.run_once()
     async with sql.connect() as conn:
         assert await conn.scalar(text("SELECT count(*) FROM website_immediate_turns")) == 2
+
+
+async def test_ineligible_first_candidate_page_does_not_starve_eligible_work(wh, sql):
+    admitted = {}
+    for _ in range(101):
+        value = payload(wh)
+        await admit(wh, value)
+        admitted[value["session_id"]] = value
+
+    async with sql.begin() as conn:
+        conversation_ids = (await conn.scalars(
+            select(Conversation.id).order_by(Conversation.id)
+        )).all()
+        assert len(conversation_ids) == 101
+        await conn.execute(update(Conversation)
+                           .where(Conversation.id.in_(conversation_ids[:100]))
+                           .values(control_mode="HUMAN"))
+        eligible_id = conversation_ids[100]
+        eligible_session = await conn.scalar(
+            select(WebsiteAdmission.session_id)
+            .where(WebsiteAdmission.conversation_id == eligible_id)
+        )
+
+    assert await wh.worker.run_once()
+    assert len(wh.ai.calls) == 1
+    assert wh.ai.calls[0].request.conversation_id == eligible_id
+    assert (await query(wh, admitted[str(eligible_session)]))["state"] == "DRAFT_READY"
 
 
 async def test_namespace_scope_and_narrow_role_deny_foundation_and_openapi(wh):
