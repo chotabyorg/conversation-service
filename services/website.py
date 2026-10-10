@@ -239,7 +239,8 @@ async def complete_response(database: Database, principal: Principal,
         admission = await retained(session, request)
         if admission.conversation_id is None:
             raise DomainError(ErrorCode.NOT_FOUND)
-        await authorized_conversation(session, principal, admission.conversation_id, lock=True)
+        conversation = await authorized_conversation(
+            session, principal, admission.conversation_id, lock=True)
         attempt = await session.get(WebsiteResponseAttempt, request.response_attempt_id)
         if attempt is None or attempt.admission_id != admission.id:
             raise DomainError(ErrorCode.NOT_FOUND)
@@ -253,6 +254,23 @@ async def complete_response(database: Database, principal: Principal,
             delivery = await session.get(DeliveryAttempt, attempt.delivery_id)
             if delivery is None:
                 raise DomainError(ErrorCode.NOT_FOUND)
+            if request.outcome == "WRITE_COMPLETED":
+                turn = await session.scalar(select(AgentTurn).where(
+                    AgentTurn.id == delivery.source_turn_id,
+                    AgentTurn.conversation_id == conversation.id))
+                if turn is None or turn.status != "COMPLETED" or turn.draft_text is None:
+                    raise DomainError(ErrorCode.NO_DRAFT)
+                existing = await session.scalar(select(Message.id).where(
+                    Message.source_agent_turn_id == turn.id,
+                    Message.conversation_id == conversation.id))
+                if existing is None:
+                    conversation.last_message_sequence += 1
+                    conversation.updated_at = clock
+                    session.add(Message(
+                        id=uuid4(), conversation_id=conversation.id,
+                        sequence=conversation.last_message_sequence, actor="AGENT",
+                        direction="OUTBOUND", content_type="TEXT", text=turn.draft_text,
+                        source_agent_turn_id=turn.id, created_at=clock))
             if delivery.status == "DISPATCH_REQUESTED":
                 delivery.status = "UNKNOWN"
                 delivery.error_code = "TRANSPORT_ERROR"

@@ -1,4 +1,4 @@
-# Managed AgentTurn execution v1
+# Managed AgentTurn execution
 
 `POST /internal/v1/turns/{turn_id}/execute` accepts only existing claim_epoch and
 SecretStr claim_token. Authentication is the existing auth-before-body boundary;
@@ -48,17 +48,21 @@ and other versions are unsupported. Final native joins have no universal OS boun
 ## Request and result
 
 AI endpoint is fixed `POST /internal/v1/managed-turns/execute`. Request contains
-contract_version=1, conversation_id, turn_id, owner_id, integration_id, agent_id,
+contract_version, conversation_id, turn_id, owner_id, integration_id, agent_id,
 channel, input_revision, authority_revision, input_first_sequence,
 input_last_sequence, context_last_sequence, messages and selected_input_message_ids.
 Every Message has id, sequence, actor, direction, content_type=TEXT and exact text.
-Entire frozen prefix is strictly 1..context_last with unique IDs and <=256 Messages.
+Retained/generic v1 defaults1 and keeps the frozen prefix strictly1..context_last
+with unique IDs and <=256 Messages. New immediate Website v2 uses the same fields
+and contiguous absolute sequences from messages[0].sequence..context_last. Selected
+input resolves relative to that first sequence; results echo2. See the
+[history policy](history-projection.md) for deterministic whole-unit budgeting.
 Selected IDs equal the inclusive first/last range's IDs in canonical order;
 non-suffix/multiple/any-actor selection never duplicates or moves content. Extras
 are rejected; counters are strict bounded BIGINTs. Text retains Goal1 bounds.
 Total text<=524288 UTF8 bytes; encoded request<=1048576 bytes. Oversized full
-projection fails before dispatch. Snapshot loads at most 257 rows; Conversation
-never truncates/splits history. AI owns later model context budgeting.
+v1 projection fails before dispatch. New Website v2 drops oldest prior whole units
+before freezing. Snapshot loads at most257 rows; Conversation never splits text. AI owns later model context budgeting.
 
 Result echoes version/conversation/turn/agent and all frozen counters exactly.
 Status is DRAFT_READY/NO_RESPONSE/FAILED/UNKNOWN; draft exists only for DRAFT_READY,
@@ -79,11 +83,13 @@ application logs retain no body/token/URL/exception text.
 
 Each phase owns a short independent PostgreSQL transaction. Lock order is
 Conversation then fresh Turn; lease clock is sampled afterward. Snapshot validates
-proof and copies authorized immutable frozen DTO values. Preparation/encoding runs
-outside locks. Another transaction revalidates proof/lease and stores four fields:
+proof and copies authorized frozen DTO values. New Website v2 checks its retained
+creation hash and admission agent. Preparation can run outside locks; the final
+fence reconstructs exact canonical rows under the Conversation lock and rejects
+any body/fingerprint drift before storing the dispatch marker. Another transaction revalidates proof/lease and stores four fields:
 managed_agent_id, managed_dispatch_epoch, managed_dispatch_started_at and
 managed_request_fingerprint. All commit before the single HTTP call. Uncertain
-marker commit means no send. Fingerprint covers canonical v1 request plus namespace
+marker commit means no send. Fingerprint covers canonical versioned request plus unchanged namespace
 `main-chota.conversation.v1`, excluding tokens.
 
 Same-epoch unfinished marker returns 409 MANAGED_EXECUTION_STARTED without changing
@@ -115,9 +121,12 @@ reconciliation; read-only late-reference queries never alter terminal fingerprin
 0002_managed_execution adds nullable markers with null-safe shape, epoch/status/
 time/lowercase-digest CHECK and extends failure CHECK. 0001 stays unchanged. Goal1
 rows start with null markers and retain fingerprints/replay. Readiness requires
-exactly 0003_website_canary, including the new Website journals. Downgrade locks the table and refuses any marker/EXECUTION_UNKNOWN row
+exactly 0004_website_history, including the new Website journals. Downgrade locks the table and refuses any marker/EXECUTION_UNKNOWN row
 before removing columns. Test downgrade only on an empty explicit disposable DB.
-No production migration is applied here.
+0004_website_history adds the immutable creation freeze and unique same-Conversation
+assistant source Turn, leaving retained v1 values/evidence intact. API and worker
+require this head; downgrade refuses retained v2/history. No production migration
+is applied here.
 
 Goal1 source on 0002 preserves data but is unready and cannot parse EXECUTION_UNKNOWN.
 Use a compatible Goal2 image or forward fix; erase neither marker nor uncertainty

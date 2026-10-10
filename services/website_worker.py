@@ -25,6 +25,7 @@ from schemas.contracts import (
 )
 from services import managed_execution, turns
 from services.common import authorized_conversation, db_clock, fingerprint, scope_filter
+from services.history_projection import freeze_website_projection
 from services.managed_client import ManagedAIPort
 
 
@@ -148,6 +149,11 @@ async def select_immediate(database: Database, principal: Principal,
                             WebsiteImmediateTurn.message_id == Message.id))))
                 if message is None:
                     continue
+                admission_agent = await session.scalar(select(WebsiteAdmission.agent_id).where(
+                    WebsiteAdmission.canonical_message_id == message.id,
+                    WebsiteAdmission.conversation_id == conversation_id))
+                if admission_agent is None:
+                    raise DomainError(ErrorCode.NOT_FOUND)
                 fields = {"contract_version": 1, "conversation_id": str(conversation_id),
                           "selection_key": str(message.id),
                           "input_first_sequence": message.sequence,
@@ -164,6 +170,7 @@ async def select_immediate(database: Database, principal: Principal,
                     status="PENDING", claim_epoch=0,
                     operation_refs=[], created_at=clock,
                 )
+                await freeze_website_projection(session, conversation, turn, admission_agent)
                 session.add(turn)
                 await session.flush()
                 session.add(WebsiteImmediateTurn(message_id=message.id,

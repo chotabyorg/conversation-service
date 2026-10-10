@@ -148,8 +148,9 @@ def test_all_result_echoes_are_correlated(field):
     fields = request.model_dump(include=set(ECHO_FIELDS))
     if field == "contract_version":
         fields[field] = 2
-        with pytest.raises(ValidationError):
-            ManagedTurnResult(**fields, status="NO_RESPONSE", draft_text=None, error_code=None)
+        result = ManagedTurnResult(**fields, status="NO_RESPONSE", draft_text=None, error_code=None)
+        with pytest.raises(ValueError):
+            result.correlate(request)
         return
     fields[field] = uuid4() if field.endswith("_id") else fields[field] + 1
     result = ManagedTurnResult(**fields, status="NO_RESPONSE", draft_text=None, error_code=None)

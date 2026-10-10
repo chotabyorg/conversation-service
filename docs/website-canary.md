@@ -42,7 +42,7 @@ No internal Conversation IDs belong in the public Website error response.
 Run the same image separately with `python worker.py`. Probe port defaults8001;
 `/health` tracks owned process task liveness and `/ready` requires enabled processing,
 exact migrated schema, validated processing scope and a polling/renewal heartbeat.
-The worker waits for schema `0003_website_canary`, never migrates on startup, owns
+The worker waits for schema `0004_website_history`, never migrates on startup, owns
 and joins execution/renewal/resources at shutdown, and uses PostgreSQL exclusively
 as queue authority.
 
@@ -66,12 +66,11 @@ Unmarked recovery may dispatch once. Marked recovery never calls execute again.
 Pre-dispatch binding/projection failures terminalize the same Turn with a known
 bounded failure. A terminal Turn releases FIFO progression to the next Message.
 
-Goal4A has no grouping, debounce, supersede or outbound assistant Message creation.
-Managed v1 wire schemas and Business operation semantics are unchanged. Context is
-currently an inbound-only prefix bounded256 messages/524288 text bytes; overflow
-is an explicit known projection failure, not silent truncation. Full demo-wide
-activation needs a separate reviewed assistant-history/context-limit policy and
-stable frontend message IDs, alongside an independently approved routing gate.
+Goal4A.1 adds [canonical assistant history and frozen v2 windows](history-projection.md).
+New immediate Website Turns freeze a bounded contiguous absolute canonical suffix
+through their selected Message; retained and generic v1 Turns keep the full prefix.
+No grouping, debounce or supersede is introduced. Stable frontend message IDs and
+an independently approved routing gate remain required for activation.
 
 ## Evidence recovery and transport honesty
 
@@ -99,6 +98,11 @@ Each response outcome is immutable. Generic delivery transitions once to UNKNOWN
 with immutable reconciliation evidence; local socket completion never means browser
 acknowledgement, DELIVERED or READ. Unconfirmed intents after crash remain honest.
 Safe response replay can create fresh HTTP evidence with zero AI/business execution.
+The first newly committed WRITE_COMPLETED also appends one canonical AGENT Message
+from the retained logical draft, atomically with the outcome under the parent lock.
+It advances sequence only; input_revision retains its customer-input meaning.
+WRITE_FAILED/UNKNOWN alone never promote. A later successful attempt may promote
+once, including for a retained v1 draft; old completion replay performs no backfill.
 
 ## Release and logging
 

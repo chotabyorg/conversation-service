@@ -38,3 +38,9 @@ overlap. Scheduling tasks alone is not the concurrency evidence. Cases include
 same event ID, FIFO Messages, two workers, two sessions, unrelated integration,
 and old/new gateway policy races. Legacy routing preserves existing behavior and
 does not gain an AI execution deduplication guarantee from a route reservation.
+
+Goal4A.1 records exact projected Message IDs/order/text for three scripted dialogs,
+checks canonical AGENT provenance after response commit, and replays all retained
+results after actual API/worker/Website restarts without a second AI execution.
+The fake owns no Business/provider mutation endpoint; external sockets are denied.
+WRITE_COMPLETED remains a local socket fact and generic delivery remains UNKNOWN.

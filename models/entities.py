@@ -45,6 +45,14 @@ MANAGED_MARKER = """
   AND managed_dispatch_started_at >= started_at
   AND managed_request_fingerprint ~ '^[0-9a-f]{64}$')
 """
+MANAGED_PROJECTION = """
+ (managed_contract_version = 1 AND managed_context_first_sequence = 1
+  AND managed_projection_agent_id IS NULL AND managed_projection_fingerprint IS NULL)
+ OR (managed_contract_version = 2 AND managed_context_first_sequence >= 1
+  AND managed_context_first_sequence <= input_first_sequence
+  AND managed_projection_agent_id IS NOT NULL AND managed_projection_fingerprint IS NOT NULL
+  AND managed_projection_fingerprint ~ '^[0-9a-f]{64}$')
+"""
 TURN_LIFECYCLE = """
  (status = 'PENDING' AND claim_epoch = 0 AND claim_token_digest IS NULL
   AND worker_ref IS NULL AND lease_expires_at IS NULL AND started_at IS NULL
@@ -214,12 +222,14 @@ class Message(Base):
     )
     text: Mapped[str] = mapped_column(Text, nullable=False)
     source_inbound_event_id: Mapped[UUID | None] = mapped_column()
+    source_agent_turn_id: Mapped[UUID | None] = mapped_column()
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=sql_text("clock_timestamp()")
     )
     __table_args__ = (
         UniqueConstraint("conversation_id", "sequence", name="uq_message_sequence"),
         UniqueConstraint("source_inbound_event_id", name="uq_message_source_event"),
+        UniqueConstraint("source_agent_turn_id", name="uq_message_source_agent_turn"),
         UniqueConstraint("id", "conversation_id", name="uq_message_id_conversation"),
         ForeignKeyConstraint(
             ["conversation_id"],
@@ -234,6 +244,17 @@ class Message(Base):
             ondelete="RESTRICT",
         ),
         CheckConstraint("sequence >= 1", name="ck_message_sequence"),
+        ForeignKeyConstraint(
+            ["source_agent_turn_id", "conversation_id"],
+            ["agent_turns.id", "agent_turns.conversation_id"],
+            name="fk_message_source_agent_turn_conversation", ondelete="RESTRICT",
+            use_alter=True,
+        ),
+        CheckConstraint(
+            "source_agent_turn_id IS NULL OR (actor='AGENT' AND direction='OUTBOUND' "
+            "AND content_type='TEXT' AND source_inbound_event_id IS NULL)",
+            name="ck_message_agent_source_actor",
+        ),
         CheckConstraint("actor IN ('CUSTOMER','AGENT','HUMAN','SYSTEM')", name="ck_message_actor"),
         CheckConstraint("direction IN ('INBOUND','OUTBOUND')", name="ck_message_direction"),
         CheckConstraint("content_type = 'TEXT'", name="ck_message_content_type"),
@@ -279,6 +300,14 @@ class AgentTurn(Base):
     managed_dispatch_epoch: Mapped[int | None] = mapped_column(BigInteger)
     managed_dispatch_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     managed_request_fingerprint: Mapped[str | None] = mapped_column(CHAR(64))
+    managed_contract_version: Mapped[int] = mapped_column(
+        SmallInteger, default=1, server_default=sql_text("1")
+    )
+    managed_context_first_sequence: Mapped[int] = mapped_column(
+        BigInteger, default=1, server_default=sql_text("1")
+    )
+    managed_projection_agent_id: Mapped[UUID | None] = mapped_column()
+    managed_projection_fingerprint: Mapped[str | None] = mapped_column(CHAR(64))
     __table_args__ = (
         UniqueConstraint("conversation_id", "selection_key", name="uq_turn_selection"),
         UniqueConstraint("id", "conversation_id", name="uq_turn_id_conversation"),
@@ -332,6 +361,7 @@ class AgentTurn(Base):
         CheckConstraint(REFS_CHECK, name="ck_turn_operation_refs"),
         CheckConstraint(TURN_LIFECYCLE, name="ck_turn_lifecycle"),
         CheckConstraint(MANAGED_MARKER, name="ck_turn_managed_marker"),
+        CheckConstraint(MANAGED_PROJECTION, name="ck_turn_managed_projection"),
         Index(
             "uq_turn_one_active",
             "conversation_id",

@@ -1,4 +1,4 @@
-"""Independent v1 AI wire contract; no prompt or business policy lives here."""
+"""Independent versioned AI wire contract; no prompt or business policy lives here."""
 
 from __future__ import annotations
 
@@ -64,7 +64,7 @@ class ManagedMessage(ManagedValue):
 
 
 class ManagedTurnRequest(ManagedValue):
-    contract_version: Annotated[int, Field(strict=True, ge=1, le=1)] = 1
+    contract_version: Annotated[int, Field(strict=True, ge=1, le=2)] = 1
     conversation_id: UUID
     turn_id: UUID
     owner_id: OwnerId
@@ -86,15 +86,25 @@ class ManagedTurnRequest(ManagedValue):
             self.input_last_sequence,
             self.context_last_sequence,
         )
-        if not 1 <= first <= last <= bound or bound != len(self.messages):
+        window_first = 1 if self.contract_version == 1 else self.messages[0].sequence
+        if not window_first <= first <= last <= bound or self.messages[-1].sequence != bound:
             raise ValueError("invalid frozen boundary")
-        if tuple(m.sequence for m in self.messages) != tuple(range(1, bound + 1)):
+        if self.contract_version == 1 and bound != len(self.messages):
+            raise ValueError("invalid frozen boundary")
+        if tuple(m.sequence for m in self.messages) != tuple(
+            range(window_first, window_first + len(self.messages))
+        ):
             raise ValueError("invalid canonical ordering")
         ids = tuple(m.id for m in self.messages)
-        if len(set(ids)) != len(ids) or self.selected_input_message_ids != ids[first - 1 : last]:
+        if (len(set(ids)) != len(ids)
+                or self.selected_input_message_ids != ids[
+                    first - window_first : last - window_first + 1]):
             raise ValueError("invalid selected input")
         if sum(len(m.text.encode("utf-8")) for m in self.messages) > MAX_PROJECTED_TEXT_BYTES:
             raise ValueError("projection exceeds limit")
+        if (self.contract_version == 2
+                and len(self.model_dump_json().encode("utf-8")) > MAX_REQUEST_BYTES):
+            raise ValueError("request exceeds limit")
         return self
 
 
@@ -104,7 +114,7 @@ class ManagedOperationReference(OperationReference):
 
 
 class ManagedTurnResult(ManagedValue):
-    contract_version: Annotated[int, Field(strict=True, ge=1, le=1)] = 1
+    contract_version: Annotated[int, Field(strict=True, ge=1, le=2)] = 1
     conversation_id: UUID
     turn_id: UUID
     agent_id: UUID

@@ -27,6 +27,10 @@ MARKERS = {
     "managed_dispatch_started_at",
     "managed_request_fingerprint",
 }
+HISTORY_COLUMNS = {
+    "source_agent_turn_id", "managed_contract_version", "managed_context_first_sequence",
+    "managed_projection_agent_id", "managed_projection_fingerprint",
+}
 
 
 def migrate(database_url, command, revision, expected=0):
@@ -46,12 +50,12 @@ def migrate(database_url, command, revision, expected=0):
     return result
 
 
-async def rows(sql):
+async def rows(sql, exclude=()):
     result = {}
     async with sql.connect() as connection:
         for table in TABLES:
             result[table] = [
-                dict(row)
+                {key: value for key, value in row.items() if key not in exclude}
                 for row in (
                     await connection.execute(text(f"SELECT * FROM {table} ORDER BY id"))
                 ).mappings()
@@ -98,7 +102,8 @@ async def test_populated_goal1_upgrade_preserves_every_journal_claim_fingerprint
     original = await rows(sql)
     # Capture real complete Goal1 values, then downgrade only the emptied designated DB.
     old_rows = {
-        table: [{k: v for k, v in row.items() if k not in MARKERS} for row in values]
+        table: [{k: v for k, v in row.items() if k not in MARKERS | HISTORY_COLUMNS}
+                for row in values]
         for table, values in original.items()
     }
     await h.database.dispose()

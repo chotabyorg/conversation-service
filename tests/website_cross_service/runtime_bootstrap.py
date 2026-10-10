@@ -115,8 +115,10 @@ def fixture_app(config):
         # fake idempotency hiding duplicate calls from the actual coordinator.
         operation_id = str(uuid4())
         record("managed", {key: value[key] for key in (
-            "turn_id", "conversation_id", "input_first_sequence", "input_last_sequence",
-            "context_last_sequence", "selected_input_message_ids",
+            "contract_version", "turn_id", "conversation_id", "owner_id", "integration_id",
+            "agent_id", "input_revision", "authority_revision", "input_first_sequence",
+            "input_last_sequence", "context_last_sequence", "selected_input_message_ids",
+            "messages",
         )})
         record("effects", {"turn_id": value["turn_id"], "operation_id": operation_id})
         await asyncio.sleep(0.15)
@@ -125,7 +127,10 @@ def fixture_app(config):
             "authority_revision", "input_first_sequence", "input_last_sequence",
             "context_last_sequence",
         )}
-        return dict(echo, status="DRAFT_READY", draft_text="Managed fixture reply",
+        selected_text = next(m["text"] for m in value["messages"]
+                             if m["id"] == value["selected_input_message_ids"][-1])
+        reply = config.get("replies", {}).get(selected_text, "Managed fixture reply")
+        return dict(echo, status="DRAFT_READY", draft_text=reply,
                     error_code=None, operation_refs=[{
                         "origin": "AI_AGENT_SERVICE", "operation_id": operation_id,
                         "outcome": "SUCCEEDED",

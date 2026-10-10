@@ -14,7 +14,7 @@ public API, webhook, deploy workflow or GitOps service resources.
 | --- | --- |
 | Conversation | Stable UUID, exact owner/integration/channel/thread identity, local sequence/input counters, control mode and authority revision |
 | InboundEvent | Scoped normalized immutable provider event, deterministic server fingerprint, accepted receipt and replay/conflict proof |
-| Message | Canonical text communication in durable Conversation-local order; one Message per accepted inbound event |
+| Message | Canonical text communication in durable Conversation-local order; one Message per accepted inbound event; eligible Website drafts have a unique source Turn |
 | AgentTurn | Frozen selected input/context, one active logical slot, stable UUID, fenced lease, immutable completed draft/failure |
 | DeliveryAttempt | One journal intent per completed draft, explicit delivery evidence state, CAS revision and provider identifier references |
 | DeliveryReconciliation | Immutable update identity/fingerprint and original applied revision, preserving old-key replay/conflict evidence |
@@ -40,8 +40,8 @@ defenses independent of in-process code; no Python lock participates in safety.
 
 The immutable completed Turn draft is the foundation's future outbound-intent
 relation. Completing a Turn, creating a delivery or journaling dispatch does not
-create an outbound Message and does not mean that a provider was called. Future
-managed dispatch must add explicit input freshness/supersede and promotion policy.
+create an outbound Message and does not mean that a provider was called. Goal4A.1 adds only the explicit Website [write/history policy](history-projection.md).
+Input freshness/supersede remain outside this immediate policy.
 
 Bounded operation references identify AI-owned operations only. They carry no
 business request, receipt or reasoning. Conversation coordination **does not own
