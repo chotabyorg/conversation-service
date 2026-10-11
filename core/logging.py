@@ -6,6 +6,7 @@ import json
 import logging
 from contextvars import ContextVar
 from datetime import UTC, datetime
+from typing import get_args
 from uuid import UUID
 
 request_id_context: ContextVar[str] = ContextVar("request_id", default="")
@@ -45,8 +46,17 @@ class SafeJsonFormatter(logging.Formatter):
 
 
 from schemas.contracts import ErrorCode  # noqa: E402
+from schemas.managed import ManagedErrorCode  # noqa: E402
 
-_SAFE_CODES = {code.value for code in ErrorCode} | {"REQUEST_COMPLETED", "STARTED", "STOPPED"}
+# Exact finite membership only: untrusted strings sharing a prefix stay rejected.
+_MANAGED_DIAGNOSTIC_CODES = {
+    f"MANAGED_{status}_{code}"
+    for status in ("FAILED", "UNKNOWN")
+    for code in get_args(ManagedErrorCode)
+} | {"MANAGED_PREEXECUTION_UNAUTHENTICATED", "MANAGED_PREEXECUTION_AGENT_NOT_FOUND"}
+_SAFE_CODES = ({code.value for code in ErrorCode}
+               | {"REQUEST_COMPLETED", "STARTED", "STOPPED"}
+               | _MANAGED_DIAGNOSTIC_CODES)
 logger = logging.getLogger("conversation")
 
 
