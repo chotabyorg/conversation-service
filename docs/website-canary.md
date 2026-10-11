@@ -129,3 +129,26 @@ and does not downgrade the schema.
 Production remains gated by exact candidate independent source/release review,
 Main cluster proof, complete sealed dark overlay, deployed logging proof, actual
 widget integration binding and separately proven no-business-mutation smoke safety.
+
+### Planned worker shutdown
+
+The Website coordinator stops admitting new claims when lifespan shutdown begins.
+Selection already in progress may leave a durable PENDING Turn; it does not claim
+that Turn after stop. A claim started before stop remains owned work and follows
+its existing execution/lease/result path. Readiness becomes false immediately.
+Idle and schema-readiness polling wake without waiting for their next interval.
+
+The current owned execution retains lease renewal and may finish/persist during
+`min(MANAGED_AI_TOTAL_SECONDS + 10, 130)` seconds of graceful drain. At the current
+120-second client budget this is 130 seconds. After the deadline the existing
+cancellation path preserves UNKNOWN/dispatch evidence; it never retries AI work.
+The coordinator and its owned tasks are joined before the DB is disposed.
+
+This is a graceful-wait limit, not a guarantee that arbitrary OS/DB/network
+cleanup always finishes before SIGKILL. The production worker's 150-second grace
+leaves 20 seconds for cancellation/finalization and process exit; real-process
+verification remains required. Larger client budgets are not supported merely by
+this cap and need a coordinated grace/transport/UX review. AI and its TLS proxy
+must remain available while the worker drains; worker drain cannot compensate
+for an upstream dependency being terminated early. Goal4B and other routing
+policies are unchanged.
