@@ -10,6 +10,7 @@ from typing import Protocol
 import httpx
 
 from core.config import ManagedBinding, Settings
+from core.logging import logger
 from schemas.contracts import TurnFailureCode
 from schemas.managed import MAX_RESULT_BYTES, ManagedTurnResult, PreparedManagedRequest
 from schemas.website import ManagedEvidenceRequest, ManagedEvidenceResult
@@ -67,6 +68,11 @@ def parse_response(body: bytes, status: int, prepared: PreparedManagedRequest) -
             if known is not None:
                 code, message, failure = known
                 if value == {"detail": {"code": code, "message": message}}:
+                    if status in {401, 404}:
+                        logger.warning("", extra={
+                            "stage": "turn", "turn_id": prepared.request.turn_id,
+                            "code": f"MANAGED_PREEXECUTION_{code}", "status_code": status,
+                        })
                     raise ManagedPortFailure(failure)
             raise ManagedPortFailure()
         result = ManagedTurnResult.model_validate(value)

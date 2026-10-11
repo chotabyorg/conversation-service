@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.config import ManagedBinding, Settings
 from core.errors import DomainError
+from core.logging import logger
 from db.database import Database
 from models import AgentTurn, Conversation, WebsiteAdmission, WebsiteImmediateTurn
 from schemas.contracts import (
@@ -207,6 +208,10 @@ def terminal_request(
         OperationReference.model_validate(ref.model_dump(mode="json"))
         for ref in result.operation_refs
     ]
+    if result.status in {"FAILED", "UNKNOWN"}:
+        # Only the validated, correlated closed result crosses the logging boundary.
+        logger.warning("", extra={"stage": "turn", "turn_id": result.turn_id,
+                                  "code": f"MANAGED_{result.status}_{result.error_code}"})
     if result.status in {"DRAFT_READY", "NO_RESPONSE"}:
         return TurnComplete(
             claim_epoch=proof.claim_epoch,

@@ -162,6 +162,14 @@ without an accurate Content-Length. Errors and logs omit rejected values, text,
 token/claim proof, DSN, SQL and exception detail. Optional request IDs are bounded
 and sanitized; server access/query and SQL parameter logs are suppressed.
 
+Managed failures emit a diagnostic only after result validation and correlation:
+`MANAGED_FAILED_<error_code>` or `MANAGED_UNKNOWN_<error_code>`, using the closed
+ManagedTurn error enum and canonical Turn UUID. Exact known 401/404 envelopes emit
+`MANAGED_PREEXECUTION_UNAUTHENTICATED` / `MANAGED_PREEXECUTION_AGENT_NOT_FOUND`.
+These finite log codes do not change terminal mappings or retry behavior and do
+not contain response bodies, prompts, credentials or exception details. They
+describe observed upstream results, not proof that terminal persistence succeeded.
+
 ## Quality and disposable testing
 
 Use a separately created disposable PostgreSQL 16 database. Tests require explicit
