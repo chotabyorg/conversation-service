@@ -186,18 +186,33 @@ class WebsiteWorker:
         self.database, self.settings, self.port = database, settings, port
         self.last_poll = 0.0
         self.running = False
+        self.stop_requested = asyncio.Event()
         entry = next((p for p in settings.auth_principals
                       if p.principal_id == settings.website_worker_principal_id), None)
         self.principal = entry.principal() if entry is not None else None
 
+    def request_stop(self) -> None:
+        """Close local admission while preserving the current owned execution."""
+        self.stop_requested.set()
+
+    async def wait_for_poll(self) -> None:
+        try:
+            await asyncio.wait_for(self.stop_requested.wait(),
+                                   timeout=self.settings.website_worker_poll_seconds)
+        except TimeoutError:
+            pass
+
     async def run_once(self) -> bool:
-        if not self.settings.website_worker_enabled or self.principal is None:
+        if (self.stop_requested.is_set() or not self.settings.website_worker_enabled
+                or self.principal is None):
             self.last_poll = time.monotonic()
             return False
         turn_id = await select_immediate(self.database, self.principal, self.settings)
         self.last_poll = time.monotonic()
-        if turn_id is None:
+        if turn_id is None or self.stop_requested.is_set():
             return False
+        # A claim already started before stop remains owned. Complete it with the
+        # existing lease and execution path; never abandon a newly committed claim.
         try:
             claim = await turns.claim_turn(self.database, self.principal, turn_id, TurnClaim(
                 worker_ref=self.principal.principal_id,
@@ -264,19 +279,20 @@ class WebsiteWorker:
     async def run(self) -> None:
         self.running = True
         try:
-            while True:
+            while not self.stop_requested.is_set():
                 try:
                     worked = await self.run_once()
                 except Exception:
                     logger.warning("", extra={"stage": "turn", "code": "SERVICE_UNAVAILABLE"})
                     worked = False
                 if not worked:
-                    await asyncio.sleep(self.settings.website_worker_poll_seconds)
+                    await self.wait_for_poll()
         finally:
             self.running = False
 
     async def ready(self) -> bool:
-        return (self.settings.website_worker_enabled and self.principal is not None
+        return (not self.stop_requested.is_set()
+                and self.settings.website_worker_enabled and self.principal is not None
                 and self.running and time.monotonic() - self.last_poll <
                 max(15, self.settings.website_worker_lease_seconds)
-                and await self.database.ready())
+                and await self.database.ready() and not self.stop_requested.is_set())
