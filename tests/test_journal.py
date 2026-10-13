@@ -5,6 +5,8 @@ from uuid import uuid4
 import pytest
 from sqlalchemy import text
 
+from core.config import SettlingPolicy
+from schemas.contracts import Channel
 from tests.conftest import error
 
 
@@ -158,3 +160,28 @@ async def test_scope_rejection_never_creates_identity(h, sql):
         error(await h.call("POST", "/inbound-events", h.event(**change)), "NOT_FOUND", 404)
     async with sql.connect() as connection:
         assert await connection.scalar(text("SELECT count(*) FROM conversations")) == 0
+
+
+async def test_generic_telegram_ingress_does_not_inherit_unmanaged_binding_policy(h, sql):
+    integration = h.grants["a"]["integration_id"]
+    settings = h.settings.model_copy(update={
+        "turn_settling_policies": (SettlingPolicy(
+            version="managed-telegram-default", channel=Channel.TELEGRAM,
+            quiet_window_ms=500, max_wait_ms=2000,
+        ),),
+    })
+    h.settings = settings
+    h.client._transport.app.state.settings = settings
+    accepted = await h.ingest(provider_thread_id="generic-telegram")
+    async with sql.connect() as connection:
+        assert await connection.scalar(
+            text("SELECT settling_policy_version FROM messages WHERE id=:id"),
+            {"id": accepted["message"]["id"]},
+        ) is None
+    direct = await h.call(
+        "POST", f"/conversations/{accepted['conversation']['id']}/turns",
+        dict(selection_key=str(uuid4()), input_first_sequence=1, input_last_sequence=1,
+             expected_input_revision=1, expected_authority_revision=0),
+    )
+    assert direct.status_code == 201, direct.text
+    assert str(accepted["conversation"]["integration_id"]) == integration

@@ -75,6 +75,7 @@ class WebsiteHarness:
     processes: dict = field(default_factory=dict, repr=False)
     handles: list = field(default_factory=list, repr=False)
     replies: dict = field(default_factory=dict)
+    settling_enabled: bool = False
 
     def url(self, name):
         return f"http://127.0.0.1:{self.ports[name]}"
@@ -112,7 +113,8 @@ class WebsiteHarness:
                         "CONVERSATION_S2S_TOKEN": self.tokens["website"],
                         "CONVERSATION_RESULT_WAIT_SECONDS": "4",
                         "CONVERSATION_RESULT_POLL_SECONDS": "0.05",
-                        "CONVERSATION_REQUEST_TIMEOUT_SECONDS": "1",
+                        "CONVERSATION_REQUEST_TIMEOUT_SECONDS":
+                            "10" if self.settling_enabled else "1",
                         "MANAGED_WEBSITE_GUARDED_INTEGRATIONS": json.dumps({
                             self.ids["integration"]: self.ids["agent"]}),
                         "MANAGED_WEBSITE_COHORTS": json.dumps(policy if cohort else {}),
@@ -134,6 +136,14 @@ class WebsiteHarness:
                         "WEBSITE_WORKER_LEASE_SECONDS": "5",
                         "WEBSITE_WORKER_POLL_SECONDS": "0.1",
                         "WEBSITE_WORKER_HEALTH_PORT": str(self.ports[name]), "LOG_LEVEL": "INFO"})
+            if self.settling_enabled:
+                env["TURN_SETTLING_POLICIES"] = json.dumps([{
+                    "version": "website-process-v1",
+                    "channel": "WEBSITE_WIDGET",
+                    "integration_id": self.ids["integration"],
+                    "quiet_window_ms": 300,
+                    "max_wait_ms": 1200,
+                }])
         widgets = {self.tokens["widget"]: binding, self.tokens["other_widget"]: {
             "owner_id": self.ids["owner"], "integration_id": self.ids["other_integration"],
             "agent_id": self.ids["agent"]}}

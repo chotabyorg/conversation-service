@@ -239,6 +239,8 @@ class Message(Base):
         UniqueConstraint("source_inbound_event_id", name="uq_message_source_event"),
         UniqueConstraint("source_agent_turn_id", name="uq_message_source_agent_turn"),
         UniqueConstraint("id", "conversation_id", name="uq_message_id_conversation"),
+        UniqueConstraint("id", "conversation_id", "sequence",
+                         name="uq_message_identity_sequence"),
         ForeignKeyConstraint(
             ["conversation_id"],
             ["conversations.id"],
@@ -255,6 +257,7 @@ class Message(Base):
         CheckConstraint(
             "(settling_policy_version IS NULL AND settling_quiet_window_ms IS NULL "
             "AND settling_max_wait_ms IS NULL) OR (settling_policy_version IS NOT NULL "
+            "AND settling_quiet_window_ms IS NOT NULL AND settling_max_wait_ms IS NOT NULL "
             "AND settling_policy_version ~ '^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$' "
             "AND settling_quiet_window_ms >= 1 AND settling_max_wait_ms >= "
             "settling_quiet_window_ms)",
@@ -403,15 +406,9 @@ class TurnInputMessage(Base):
     __table_args__ = (
         UniqueConstraint("turn_id", "sequence", name="uq_turn_input_sequence"),
         ForeignKeyConstraint(
-            ["message_id", "conversation_id"],
-            ["messages.id", "messages.conversation_id"],
-            name="fk_turn_input_message_conversation",
-            ondelete="RESTRICT",
-        ),
-        ForeignKeyConstraint(
-            ["conversation_id", "sequence"],
-            ["messages.conversation_id", "messages.sequence"],
-            name="fk_turn_input_sequence_message",
+            ["message_id", "conversation_id", "sequence"],
+            ["messages.id", "messages.conversation_id", "messages.sequence"],
+            name="fk_turn_input_exact_message",
             ondelete="RESTRICT",
         ),
         ForeignKeyConstraint(
@@ -472,8 +469,9 @@ class DeliveryAttempt(Base):
         CheckConstraint("revision >= 0 AND authority_revision >= 0", name="ck_delivery_revisions"),
         CheckConstraint(
             "(expected_settling_revision IS NULL AND fenced_settling_revision IS NULL) OR "
-            "(expected_settling_revision >= 0 AND (fenced_settling_revision IS NULL OR "
-            "fenced_settling_revision >= expected_settling_revision))",
+            "(expected_settling_revision IS NOT NULL AND expected_settling_revision >= 0 "
+            "AND (fenced_settling_revision IS NULL OR (fenced_settling_revision IS NOT NULL "
+            "AND fenced_settling_revision >= expected_settling_revision)))",
             name="ck_delivery_settling_fence",
         ),
         CheckConstraint(
@@ -558,7 +556,8 @@ class DeliveryReconciliation(Base):
         ),
         CheckConstraint(
             "(expected_settling_revision IS NULL AND result_settling_revision IS NULL) OR "
-            "(expected_settling_revision >= 0 AND result_settling_revision >= "
+            "(expected_settling_revision IS NOT NULL AND result_settling_revision IS NOT NULL "
+            "AND expected_settling_revision >= 0 AND result_settling_revision >= "
             "expected_settling_revision)",
             name="ck_reconciliation_settling_fence",
         ),
@@ -630,6 +629,9 @@ class WebsiteResponseAttempt(Base):
     admission_id: Mapped[UUID] = mapped_column(nullable=False)
     delivery_id: Mapped[UUID] = mapped_column(nullable=False)
     conversation_id: Mapped[UUID] = mapped_column(nullable=False)
+    send_authorized: Mapped[bool] = mapped_column(
+        nullable=False, default=False, server_default=sql_text("false")
+    )
     outcome: Mapped[str | None] = mapped_column(String(32))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=sql_text("clock_timestamp()")
@@ -730,6 +732,9 @@ class TelegramResponseAttempt(Base):
     admission_id: Mapped[UUID] = mapped_column(nullable=False)
     delivery_id: Mapped[UUID] = mapped_column(nullable=False)
     conversation_id: Mapped[UUID] = mapped_column(nullable=False)
+    send_authorized: Mapped[bool] = mapped_column(
+        nullable=False, default=False, server_default=sql_text("false")
+    )
     outcome: Mapped[str | None] = mapped_column(String(32))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=sql_text("clock_timestamp()")

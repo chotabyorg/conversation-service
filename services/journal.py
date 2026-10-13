@@ -135,7 +135,6 @@ async def ingest_event(
                 # Every accepted customer input fences an older draft, including
                 # input admitted while settling policy is disabled.
                 conversation.settling_revision += 1
-                policy = settings.settling_policy_for(request.channel, request.integration_id)
                 conversation.updated_at = accepted_at
                 message = Message(
                     id=uuid4(),
@@ -143,9 +142,11 @@ async def ingest_event(
                     sequence=conversation.last_message_sequence,
                     input_revision=conversation.input_revision,
                     settling_revision=conversation.settling_revision,
-                    settling_policy_version=policy.version if policy is not None else None,
-                    settling_quiet_window_ms=policy.quiet_window_ms if policy is not None else None,
-                    settling_max_wait_ms=policy.max_wait_ms if policy is not None else None,
+                    # Generic journal ingress has no guaranteed managed selector.
+                    # Policy snapshots belong to channel-specific managed admission.
+                    settling_policy_version=None,
+                    settling_quiet_window_ms=None,
+                    settling_max_wait_ms=None,
                     actor="CUSTOMER",
                     direction="INBOUND",
                     content_type="TEXT",

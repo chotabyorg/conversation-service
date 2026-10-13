@@ -25,6 +25,7 @@ from models import (
     TurnInputMessage,
 )
 from schemas.contracts import Channel
+from schemas.managed import MAX_PROJECTED_TEXT_BYTES
 from services.settling import select_settled_turn
 from services.telegram import expected_response_attempt_id
 from services.telegram_worker import TelegramWorker
@@ -178,6 +179,95 @@ async def test_quiet_reset_selects_original_messages_once_as_one_turn(telegram_h
 
 
 @pytest.mark.asyncio
+async def test_telegram_delivery_work_coalesces_burst_and_fences_restarts(telegram_harness, sql):
+    h = telegram_harness
+    settings = _policy_settings(h["settings"], quiet_ms=50, max_wait_ms=500)
+    _install_settings(h, settings)
+    first = await telegram_admit(h["client"], h["gateway_headers"], message_id=7, update_id=55)
+    second = await telegram_admit(h["client"], h["gateway_headers"], message_id=8, update_id=56)
+    assert first.status_code == second.status_code == 200
+    second_admission = second.json()
+    await _age_messages(sql, {1: 500, 2: 300})
+    port = DeterministicManagedPort()
+    worker = TelegramWorker(h["database"], settings, port)
+    assert await worker.run_once()
+    turn_id = port.prepared[0].request.turn_id
+
+    async def work():
+        binding = settings.managed_ai_bindings[0]
+        response = await h["client"].post(
+            "/internal/v1/telegram/responses/work",
+            json={"owner_id": binding.owner_id,
+                  "integration_id": str(binding.integration_id),
+                  "agent_id": str(binding.agent_id)},
+            headers=h["gateway_headers"],
+        )
+        assert response.status_code == 200, response.text
+        return response.json()["items"]
+
+    items = await work()
+    assert len(items) == 1
+    item = items[0]
+    assert item["turn_id"] == str(turn_id)
+    assert item["draft_text"] == "Managed answer **bold**"
+    identity = {key: item[key] for key in (
+        "owner_id", "integration_id", "agent_id", "provider_thread_id", "provider_event_id",
+    )}
+    begin_body = {**identity, "response_attempt_id": item["response_attempt_id"]}
+    begun = await h["client"].post(
+        "/internal/v1/telegram/responses/begin", json=begin_body,
+        headers=h["gateway_headers"],
+    )
+    assert begun.status_code == 200 and begun.json()["send"] is True
+
+    second_identity = inbound(message_id=8, update_id=56)
+    second_begin_body = {
+        **{key: second_identity[key] for key in (
+            "owner_id", "integration_id", "agent_id", "provider_thread_id", "provider_event_id",
+        )},
+        "response_attempt_id": str(expected_response_attempt_id(
+            UUID(second_admission["admission_id"])
+        )),
+    }
+    suppressed = await h["client"].post(
+        "/internal/v1/telegram/responses/begin", json=second_begin_body,
+        headers=h["gateway_headers"],
+    )
+    assert suppressed.status_code == 404
+    malicious = await h["client"].post(
+        "/internal/v1/telegram/responses/complete",
+        json={**second_begin_body, "outcome": "PROVIDER_ACCEPTED",
+              "provider_message_id": "forged-second-send"},
+        headers=h["gateway_headers"],
+    )
+    assert malicious.status_code == 404
+
+    # A fresh Gateway process recovers the pending durable fence. Replaying the
+    # same attempt records uncertainty and withholds another provider write.
+    recovered = await h["client"].post(
+        "/internal/v1/telegram/responses/begin", json=begin_body,
+        headers=h["gateway_headers"],
+    )
+    assert recovered.status_code == 200
+    assert recovered.json()["send"] is False and recovered.json()["replayed"] is True
+    late = await h["client"].post(
+        "/internal/v1/telegram/responses/complete",
+        json={**begin_body, "outcome": "PROVIDER_ACCEPTED",
+              "provider_message_id": "accepted-late"},
+        headers=h["gateway_headers"],
+    )
+    assert late.status_code == 200
+    assert await work() == []
+    async with sql.connect() as connection:
+        assert await connection.scalar(text(
+            "SELECT count(*) FROM messages WHERE actor='AGENT'")) == 1
+        assert await connection.scalar(text(
+            "SELECT count(*) FROM telegram_response_attempts WHERE send_authorized")) == 1
+        assert await connection.scalar(text(
+            "SELECT count(*) FROM telegram_response_attempts WHERE NOT send_authorized")) == 0
+
+
+@pytest.mark.asyncio
 async def test_settled_inputs_outside_window_form_later_turns(telegram_harness, sql):
     h = telegram_harness
     settings = _policy_settings(h["settings"], quiet_ms=50, max_wait_ms=2000)
@@ -211,6 +301,190 @@ async def test_settled_inputs_outside_window_form_later_turns(telegram_harness, 
             TurnInputMessage.sequence))).all()
     assert [turn.input_first_sequence for turn in turns] == [1, 2]
     assert [assignment.message_id for assignment in assignments] == list(message_rows)
+
+
+@pytest.mark.asyncio
+async def test_byte_bounded_burst_splits_maximal_prefix_and_later_work_progresses(
+    telegram_harness, sql
+):
+    h = telegram_harness
+    # Admissions are real HTTP transactions; allow the full 33-message setup to
+    # finish inside max_wait so this test isolates byte splitting.
+    settings = _policy_settings(h["settings"], quiet_ms=10, max_wait_ms=10_000)
+    _install_settings(h, settings)
+    large = [await telegram_admit(
+        h["client"], h["gateway_headers"], message_id=100 + index,
+        update_id=200 + index, text_value="x" * 16_384,
+    ) for index in range(33)]
+    later = await telegram_admit(
+        h["client"], h["gateway_headers"], message_id=500, update_id=600,
+        chat_id=124, text_value="later conversation",
+    )
+    assert all(response.status_code == 200 for response in large)
+    assert later.status_code == 200
+    large_admissions = [UUID(response.json()["admission_id"]) for response in large]
+    async with h["database"].session_factory() as session, session.begin():
+        large_ids = list((await session.scalars(select(
+            TelegramAdmission.canonical_message_id).where(
+                TelegramAdmission.id.in_(large_admissions)
+            ).order_by(TelegramAdmission.update_id))).all())
+        later_id = await session.scalar(select(TelegramAdmission.canonical_message_id).where(
+            TelegramAdmission.id == UUID(later.json()["admission_id"])))
+    assert len(large_ids) == 33 and later_id is not None
+    async with sql.begin() as connection:
+        for message_id in large_ids:
+            await connection.execute(text(
+                "UPDATE messages SET created_at=clock_timestamp()-interval '5 seconds' "
+                "WHERE id=:id"), {"id": message_id})
+        await connection.execute(text(
+            "UPDATE messages SET created_at=clock_timestamp()-interval '4 seconds' "
+            "WHERE id=:id"), {"id": later_id})
+
+    port = DeterministicManagedPort()
+    worker = TelegramWorker(h["database"], settings, port)
+    assert await worker.run_once() is True
+    first = port.prepared[0].request
+    # The actual ManagedTurn v2 validator accepts 32 messages at the text byte
+    # cap; the 33rd canonical Message remains pending without changing identity.
+    assert len(first.selected_input_message_ids) == 32
+    assert first.selected_input_message_ids == tuple(large_ids[:32])
+    assert await worker.run_once() is True
+    second = port.prepared[1].request
+    assert second.selected_input_message_ids == (
+        large_ids[32],
+    )
+    # Recreate the worker to model restart between the byte-split Turns. The
+    # later due Conversation remains visible after the oversized candidate.
+    restarted = TelegramWorker(h["database"], settings, port)
+    assert await restarted.run_once() is True
+    third = port.prepared[2].request
+    assert third.selected_input_message_ids == (later_id,)
+    assert await restarted.run_once() is False
+    all_selected = [message_id for prepared in port.prepared
+                    for message_id in prepared.request.selected_input_message_ids]
+    assert len(all_selected) == 34
+    assert len(set(all_selected)) == 34
+    assert len(port.prepared) == 3
+    async with h["database"].session_factory() as session, session.begin():
+        rows = (await session.scalars(select(TurnInputMessage).order_by(
+            TurnInputMessage.sequence))).all()
+    assert len(rows) == 34
+    assert len({row.message_id for row in rows}) == 34
+
+
+@pytest.mark.asyncio
+async def test_message_count_and_byte_limits_both_bound_a_257_message_burst(
+    telegram_harness, sql
+):
+    h = telegram_harness
+    settings = _policy_settings(h["settings"], quiet_ms=10, max_wait_ms=100)
+    _install_settings(h, settings)
+    accepted = []
+    for index in range(257):
+        response = await telegram_admit(
+            h["client"], h["gateway_headers"], message_id=1000 + index,
+            update_id=2000 + index, text_value="small",
+        )
+        assert response.status_code == 200
+        accepted.append(response)
+    first_admission = UUID(accepted[0].json()["admission_id"])
+    async with h["database"].session_factory() as session, session.begin():
+        conversation_id = await session.scalar(select(
+            TelegramAdmission.conversation_id).where(TelegramAdmission.id == first_admission))
+    assert conversation_id is not None
+    async with sql.begin() as connection:
+        await connection.execute(text(
+            "UPDATE messages SET created_at=clock_timestamp()-interval '500 milliseconds' "
+            "WHERE conversation_id=:id"), {"id": conversation_id})
+    port = DeterministicManagedPort()
+    worker = TelegramWorker(h["database"], settings, port)
+    assert await worker.run_once() is True
+    assert len(port.prepared[0].request.selected_input_message_ids) == 256
+    assert await worker.run_once() is True
+    assert len(port.prepared[1].request.selected_input_message_ids) == 1
+    selected = [message_id for prepared in port.prepared
+                for message_id in prepared.request.selected_input_message_ids]
+    admission_ids = [UUID(response.json()["admission_id"]) for response in accepted]
+    async with h["database"].session_factory() as session, session.begin():
+        expected = list((await session.scalars(select(
+            TelegramAdmission.canonical_message_id).where(
+                TelegramAdmission.id.in_(admission_ids)
+            ).order_by(TelegramAdmission.update_id))).all())
+    assert selected == expected
+    async with h["database"].session_factory() as session, session.begin():
+        rows = (await session.scalars(select(TurnInputMessage).order_by(
+            TurnInputMessage.sequence))).all()
+    assert len(rows) == 257 and len({row.message_id for row in rows}) == 257
+
+
+@pytest.mark.asyncio
+async def test_projection_prunes_old_context_but_keeps_every_new_burst_input(
+    telegram_harness, sql
+):
+    h = telegram_harness
+    # Create one old no-policy input and consume it through the immediate path.
+    # It and the following SYSTEM context rows must not become new burst input.
+    old = await telegram_admit(
+        h["client"], h["gateway_headers"], message_id=7, update_id=55,
+        text_value="o" * 16_384,
+    )
+    assert old.status_code == 200
+    port = DeterministicManagedPort()
+    immediate = TelegramWorker(h["database"], h["settings"], port)
+    assert await immediate.run_once() is True
+
+    old_admission = UUID(old.json()["admission_id"])
+    async with h["database"].session_factory() as session, session.begin():
+        conversation_id = await session.scalar(select(
+            TelegramAdmission.conversation_id).where(TelegramAdmission.id == old_admission))
+    assert conversation_id is not None
+    async with sql.begin() as connection:
+        for sequence in range(2, 33):
+            await connection.execute(text(
+                "INSERT INTO messages(id,conversation_id,sequence,actor,direction,"
+                "content_type,text) VALUES(:id,:conversation,:sequence,'SYSTEM','OUTBOUND',"
+                "'TEXT',:text)"), {
+                    "id": uuid4(), "conversation": conversation_id, "sequence": sequence,
+                    "text": "c" * 16_384,
+                })
+        await connection.execute(text(
+            "UPDATE conversations SET last_message_sequence=32 WHERE id=:id"),
+            {"id": conversation_id},
+        )
+
+    settings = _policy_settings(h["settings"], quiet_ms=10, max_wait_ms=100)
+    _install_settings(h, settings)
+    burst = [await telegram_admit(
+        h["client"], h["gateway_headers"], message_id=100 + index,
+        update_id=200 + index, text_value="n" * 8_192,
+    ) for index in range(2)]
+    assert all(response.status_code == 200 for response in burst)
+    admission_ids = [UUID(response.json()["admission_id"]) for response in burst]
+    async with h["database"].session_factory() as session, session.begin():
+        input_ids = list((await session.scalars(select(
+            TelegramAdmission.canonical_message_id).where(
+                TelegramAdmission.id.in_(admission_ids)
+            ).order_by(TelegramAdmission.update_id))).all())
+    async with sql.begin() as connection:
+        for message_id in input_ids:
+            await connection.execute(text(
+                "UPDATE messages SET created_at=clock_timestamp()-interval '5 seconds' "
+                "WHERE id=:id"), {"id": message_id})
+
+    worker = TelegramWorker(h["database"], settings, port)
+    assert await worker.run_once() is True
+    request = port.prepared[-1].request
+    assert request.selected_input_message_ids == tuple(input_ids)
+    assert request.input_first_sequence == 33 and request.input_last_sequence == 34
+    assert request.messages[0].sequence > 1
+    assert sum(len(message.text.encode("utf-8")) for message in request.messages) == (
+        MAX_PROJECTED_TEXT_BYTES
+    )
+    async with h["database"].session_factory() as session, session.begin():
+        owners = (await session.scalars(select(TurnInputMessage).where(
+            TurnInputMessage.message_id.in_(input_ids)))).all()
+    assert {owner.message_id for owner in owners} == set(input_ids)
+    assert len(owners) == 2
 
 
 @pytest.mark.asyncio

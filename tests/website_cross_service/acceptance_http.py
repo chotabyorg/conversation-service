@@ -284,6 +284,103 @@ async def test_real_http_identity_replay_conflict_same_text_new_id_and_isolation
     assert len(calls["legacy"]) == 2
 
 
+@pytest.mark.asyncio
+async def test_goal5_website_process_burst_supersede_and_restart(wh):
+    h = wh
+    h.settling_enabled = True
+    h.replies.update({
+        "old user request": "STALE DRAFT MUST NOT REACH THE CLIENT",
+        "new user request": "Fresh response",
+    })
+    configured = await h.client.post(h.url("fake") + "/test/replies", json=h.replies)
+    assert configured.status_code == 200
+    await start_chain(h)
+
+    burst_one = h.body(session_id=h.ids["session"], message="burst one")
+    burst_two = h.body(session_id=h.ids["session"], message="burst two")
+    responses = await asyncio.gather(h.chat(burst_one), h.chat(burst_two))
+    assert sorted(response.status_code for response in responses) == [200, 409]
+    assert sum(response.status_code == 200 for response in responses) == 1
+    superseded = next(response for response in responses if response.status_code == 409)
+    assert superseded.json()["error"] == "response_superseded"
+    assert "reply" not in superseded.json()
+    assert len(h.observations()["managed"]) == 1
+    burst_states = [await h.state(value["message_id"]) for value in (burst_one, burst_two)]
+    assert burst_states[0]["turn_id"] == burst_states[1]["turn_id"]
+    assert len(await wait_history(h, burst_states[0]["conversation_id"], 1)) == 3
+
+    # Hold the first AI response after the Turn is claimed. A newer canonical
+    # inbound Message commits first, so the older draft must receive send=false.
+    assert (await h.client.post(h.url("fake") + "/test/managed/block")).status_code == 200
+    old = h.body(session_id=h.ids["session2"], message="old user request")
+    old_request = asyncio.create_task(h.chat(old))
+    deadline = asyncio.get_running_loop().time() + 8
+    while asyncio.get_running_loop().time() < deadline:
+        entered = await h.client.get(h.url("fake") + "/test/managed/entered")
+        if entered.json()["entered"]:
+            break
+        await asyncio.sleep(0.02)
+    else:
+        pytest.fail("Website process did not reach the held Managed AI execution")
+    new = h.body(session_id=h.ids["session2"], message="new user request")
+    new_request = asyncio.create_task(h.chat(new))
+    admission_deadline = asyncio.get_running_loop().time() + 5
+    while asyncio.get_running_loop().time() < admission_deadline:
+        count = await h.rows(
+            "SELECT id FROM website_admissions WHERE message_id IN (:old,:new)",
+            old=old["message_id"], new=new["message_id"],
+        )
+        if len(count) == 2:
+            break
+        await asyncio.sleep(0.02)
+    else:
+        pytest.fail("New Website Message was not durably admitted during the first Turn")
+    assert (await h.client.post(h.url("fake") + "/test/managed/release")).status_code == 200
+    old_response, new_response = await asyncio.gather(old_request, new_request)
+    assert old_response.status_code == 409
+    assert old_response.json() == {
+        "error": "response_superseded", "session_id": h.ids["session2"]
+    }
+    assert "STALE DRAFT MUST NOT REACH THE CLIENT" not in old_response.text
+    assert new_response.status_code == 200
+    assert new_response.json()["reply"] == "Fresh response"
+    old_state = await h.state(old["message_id"])
+    new_state = await h.state(new["message_id"])
+    assert old_state["turn_id"] != new_state["turn_id"]
+    history = await wait_history(h, old_state["conversation_id"], 1)
+    assert [row["source_agent_turn_id"] for row in history if row["actor"] == "AGENT"] == [
+        new_state["turn_id"],
+    ]
+    assert old_state["delivery_status"] == "SUPERSEDED"
+    assert len(h.observations()["managed"]) == 3
+
+    # A Gateway process restart after admission cannot orphan retained work;
+    # replaying the exact public identity retrieves the same durable Turn.
+    restart = h.body(session_id=h.ids["session"], message="restart retained result")
+    await h.client.post(h.url("fake") + "/test/managed/block")
+    pending = asyncio.create_task(h.chat(restart))
+    execute_deadline = asyncio.get_running_loop().time() + 8
+    while asyncio.get_running_loop().time() < execute_deadline:
+        if len(h.observations()["managed"]) >= 4:
+            break
+        await asyncio.sleep(0.02)
+    else:
+        pytest.fail("Goal5 Website retained execution did not reach the fake AI")
+    restart_state = await h.state(restart["message_id"])
+    assert restart_state["canonical_message_id"] is not None
+    h.kill("website")
+    await settle_request(pending)
+    await h.client.post(h.url("fake") + "/test/managed/release")
+    h.start("website")
+    await h.wait_ready("website")
+    replay = await h.eventual_chat(restart)
+    assert replay.status_code == 200
+    replay_state = await h.state(restart["message_id"])
+    assert replay_state["canonical_message_id"] == restart_state["canonical_message_id"]
+    assert replay_state["turn_id"] == restart_state["turn_id"]
+    assert len(h.observations()["managed"]) == 4
+
+
 async def test_overlapping_identical_public_requests_observe_pg_identity_lock(wh):
     h = wh
     await start_chain(h)

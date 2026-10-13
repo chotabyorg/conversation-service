@@ -82,6 +82,7 @@ class BoundaryMiddleware:
                 telegram_paths = {
                     "/internal/v1/telegram/admissions",
                     "/internal/v1/telegram/results",
+                    "/internal/v1/telegram/responses/work",
                     "/internal/v1/telegram/responses/begin",
                     "/internal/v1/telegram/responses/complete",
                 }

@@ -59,6 +59,12 @@ not prevent later eligible Conversations from being considered in the same pass.
 The Telegram worker's separate bounded keyset scan remains the Goal4B immediate
 path; Goal5 does not replace or duplicate its starvation fix.
 
+The settling pass currently materializes its candidate Conversation IDs before
+locking them. This is accepted canary-scale debt, not a durable fairness
+guarantee; replace it with bounded keyset pages before candidate volume requires
+that change. Projection-invalid bursts are isolated to their Conversation and
+later candidates still get a selection opportunity in the same pass.
+
 ## Supersede and dispatch fence
 
 Every new canonical customer inbound increments `Conversation.settling_revision`,

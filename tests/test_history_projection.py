@@ -7,7 +7,14 @@ from pydantic import SecretStr, ValidationError
 from sqlalchemy import select, text
 
 from core.errors import DomainError
-from models import AgentTurn, Conversation, Message, WebsiteAdmission, WebsiteImmediateTurn
+from models import (
+    AgentTurn,
+    Conversation,
+    Message,
+    TurnInputMessage,
+    WebsiteAdmission,
+    WebsiteImmediateTurn,
+)
 from schemas.contracts import ErrorCode, TurnClaim, TurnExecute
 from schemas.managed import MAX_REQUEST_BYTES, ManagedTurnRequest, prepare_request
 from services import managed_execution, turns
@@ -22,6 +29,7 @@ from tests.test_website import BASE, admit, identity, payload, query
 from tests.test_website import wh as website_fixture
 
 wh = website_fixture
+RESPONSE_ATTEMPT_IDS: dict[str, str] = {}
 
 
 def window(first=245, bound=500, selected_first=500, selected_last=500):
@@ -109,14 +117,18 @@ def test_exact_text_and_serialized_utf8_caps_include_control_escaping():
         ManagedTurnRequest(**escaped)
 
 
-async def complete(wh, value, outcome="WRITE_COMPLETED"):
-    attempt = dict(identity(value), response_attempt_id=str(uuid4()))
+async def complete(wh, value, outcome="WRITE_COMPLETED", *, expected_status=200):
+    # A transport retry/reconciliation reuses the one retained response attempt.
+    # A fresh attempt id must not borrow the earlier attempt's send permission.
+    message_id = str(value["message_id"])
+    response_attempt_id = RESPONSE_ATTEMPT_IDS.setdefault(message_id, str(uuid4()))
+    attempt = dict(identity(value), response_attempt_id=response_attempt_id)
     begun = await wh.call("POST", BASE + "/responses/begin", attempt)
     assert begun.status_code == 200, begun.text
     done = dict(attempt, outcome=outcome)
     response = await wh.call("POST", BASE + "/responses/complete", done)
-    assert response.status_code == 200, response.text
-    return done
+    assert response.status_code == expected_status, response.text
+    return done if expected_status == 200 else response
 
 
 async def history(sql):
@@ -174,32 +186,49 @@ async def test_negative_fact_not_promoted_late_success_does_not_retrofit_frozen_
     async with wh.database.session_factory() as session:
         frozen = await session.get(AgentTurn, selected)
         digest = frozen.managed_projection_fingerprint
-    await complete(wh, first)
+    if outcome == "WRITE_FAILED":
+        await complete(wh, first, expected_status=409)
+        assert [m["actor"] for m in await history(sql)] == ["CUSTOMER", "CUSTOMER"]
+    else:
+        # An authorized uncertain write may later be reconciled from UNKNOWN.
+        await complete(wh, first)
     await wh.worker.run_once()
     assert wh.ai.calls[-1].fingerprint == digest
     assert [m.actor for m in wh.ai.calls[-1].request.messages] == ["CUSTOMER", "CUSTOMER"]
     third = dict(first, message_id=str(uuid4()), text="later")
     await admit(wh, third)
     await wh.worker.run_once()
-    assert [m.actor for m in wh.ai.calls[-1].request.messages] == [
-        "CUSTOMER", "CUSTOMER", "AGENT", "CUSTOMER"]
+    expected = ["CUSTOMER", "CUSTOMER", "AGENT", "CUSTOMER"]
+    if outcome == "WRITE_FAILED":
+        expected = ["CUSTOMER", "CUSTOMER", "CUSTOMER"]
+    assert [m.actor for m in wh.ai.calls[-1].request.messages] == expected
 
 
-async def test_concurrent_successful_attempts_and_admission_serialize_actual_pg(wh, sql):
+@pytest.mark.parametrize("iteration", range(5))
+async def test_concurrent_successful_attempts_and_admission_serialize_actual_pg(
+    wh, sql, iteration
+):
     value = payload(wh)
     await admit(wh, value)
     await wh.worker.run_once()
     attempts = [dict(identity(value), response_attempt_id=str(uuid4())) for _ in range(2)]
-    for attempt in attempts:
-        assert (await wh.call("POST", BASE + "/responses/begin", attempt)).status_code == 200
+    begun = [await wh.call("POST", BASE + "/responses/begin", attempt)
+             for attempt in attempts]
+    assert all(response.status_code == 200 for response in begun)
+    assert begun[0].json()["send"] is True
+    assert begun[1].json()["send"] is False
     async with sql.connect() as conn:
         conversation_id = str(await conn.scalar(select(Conversation.id)))
     responses = await locked_race(sql, conversation_id, [
-        wh.call("POST", BASE + "/responses/complete", dict(a, outcome="WRITE_COMPLETED"))
-        for a in attempts
-    ] + [wh.call("POST", BASE + "/admissions", dict(value, message_id=str(uuid4())))],
-        "Goal4A.1 simultaneous assistant promotion and customer admission")
+        wh.call("POST", BASE + "/responses/complete",
+                dict(attempts[0], outcome="WRITE_COMPLETED")),
+        wh.call("POST", BASE + "/admissions", dict(value, message_id=str(uuid4()))),
+    ],
+        f"Goal4A.1 simultaneous assistant promotion and customer admission, iteration={iteration}")
     assert all(r.status_code == 200 for r in responses)
+    rejected = await wh.call("POST", BASE + "/responses/complete",
+                             dict(attempts[1], outcome="WRITE_COMPLETED"))
+    assert rejected.status_code == 409
     rows = await history(sql)
     assert [m["sequence"] for m in rows] == [1, 2, 3]
     assert len([m for m in rows if m["actor"] == "AGENT"]) == 1
@@ -348,11 +377,15 @@ async def retained_v1_turn(wh, value):
             creation_fingerprint=fingerprint({"retained-v1-fixture": str(message.id)}),
             input_first_sequence=message.sequence, input_last_sequence=message.sequence,
             context_last_sequence=message.sequence, input_revision=conversation.input_revision,
-            authority_revision=conversation.authority_revision, operation_refs=[])
+            authority_revision=conversation.authority_revision,
+            settling_revision=conversation.settling_revision, operation_refs=[])
         session.add(turn)
         await session.flush()
         session.add(WebsiteImmediateTurn(message_id=message.id,
             conversation_id=conversation.id, turn_id=turn.id))
+        session.add(TurnInputMessage(message_id=message.id,
+            conversation_id=conversation.id, turn_id=turn.id,
+            sequence=message.sequence, ordinal=0))
         await session.flush()
         return turn.id
 
@@ -368,6 +401,13 @@ async def test_retained_v1_cannot_be_converted_to_v2_even_with_coherent_freeze_f
 async def test_retained_v1_new_success_can_promote_without_rewriting_projection(wh, sql, prior):
     value = payload(wh)
     turn_id = await retained_v1_turn(wh, value)
+    # Recreate the exact 0005 representation before running the historical
+    # downgrade/upgrade compatibility check; these test rows were just created
+    # by the Goal5 API and therefore carry fresh settling revisions.
+    async with sql.begin() as conn:
+        await conn.execute(text("UPDATE conversations SET settling_revision=0"))
+        await conn.execute(text("UPDATE messages SET settling_revision=0"))
+        await conn.execute(text("UPDATE agent_turns SET settling_revision=0"))
     await wh.database.dispose()
     migrate(wh.settings.database_url.get_secret_value(), "downgrade", "0003_website_canary")
     migrate(wh.settings.database_url.get_secret_value(), "upgrade", "head")
@@ -383,6 +423,14 @@ async def test_retained_v1_new_success_can_promote_without_rewriting_projection(
     if prior:
         await complete(wh, value, prior)
     assert len(await history(sql)) == 1
+    if prior == "WRITE_FAILED":
+        await complete(wh, value, expected_status=409)
+        assert len(await history(sql)) == 1
+        assert await turns.get_turn(wh.database, wh.principal, turn_id) == retained
+        assert retained.managed_request_fingerprint == prepared.fingerprint
+        assert managed_execution.prepare_snapshot(snapshot).body == prepared.body
+        assert len(wh.ai.calls) == 1
+        return
     done = await complete(wh, value)
     assert len(await history(sql)) == 2
     assert await turns.get_turn(wh.database, wh.principal, turn_id) == retained
@@ -399,6 +447,7 @@ async def test_retained_old_success_replay_does_not_backfill_history(wh, sql):
     await managed_execution.execute_claimed_turn(wh.database, wh.principal, turn_id, proof,
                                                 wh.settings, wh.ai)
     attempt = dict(identity(value), response_attempt_id=str(uuid4()))
+    RESPONSE_ATTEMPT_IDS[str(value["message_id"])] = attempt["response_attempt_id"]
     assert (await wh.call("POST", BASE + "/responses/begin", attempt)).status_code == 200
     async with sql.begin() as conn:
         await conn.execute(text("UPDATE website_response_attempts SET outcome='WRITE_COMPLETED',"
@@ -407,7 +456,7 @@ async def test_retained_old_success_replay_does_not_backfill_history(wh, sql):
                              dict(attempt, outcome="WRITE_COMPLETED"))
     assert response.json()["replayed"] and len(await history(sql)) == 1
     await complete(wh, value)
-    assert len(await history(sql)) == 2
+    assert len(await history(sql)) == 1
 
 
 async def seed_window(wh, sql, count, content="hello", paired=True):
@@ -490,12 +539,7 @@ async def test_downgrade_refuses_retained_v2_or_history(wh, sql, database_url, r
         await wh.worker.run_once()
     await wh.database.dispose()
     result = migrate(database_url, "downgrade", "0003_website_canary", expected=1)
-    expected_guard = (
-        "Retained supersede evidence prevents downgrade."
-        if retained_version == 1
-        else "Retained Website v2/history prevents downgrade."
-    )
-    assert expected_guard in result.stderr
+    assert "Conversation settling revisions prevent downgrade." in result.stderr
     assert await wh.database.ready()
 
 

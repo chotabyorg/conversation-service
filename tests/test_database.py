@@ -57,6 +57,7 @@ async def test_migrated_catalog_constraints_indexes_utc_and_exact_collation(h, s
         "uq_inbound_event_id_conversation",
         "fk_inbound_event_conversation_scope",
         "uq_message_sequence",
+        "uq_message_identity_sequence",
         "uq_message_source_event",
         "fk_message_source_event_conversation",
         "ck_message_source_actor",
@@ -257,6 +258,56 @@ async def test_named_unique_and_composite_foreign_key_negative_writes(h, sql):
         dict(id=turn["id"]),
         "23514",
         "ck_turn_boundaries",
+    )
+
+
+async def test_turn_input_message_foreign_key_binds_exact_id_and_sequence(h, sql):
+    first = await h.ingest()
+    await h.ingest()
+    third = await h.ingest()
+    first_turn, _ = await h.select(third, input_first_sequence=1, input_last_sequence=1)
+    claim = await h.claim(first_turn)
+    assert (await h.call(
+        "POST", f"/turns/{first_turn['id']}/complete",
+        dict(h.proof(claim), outcome="NO_RESPONSE"),
+    )).status_code == 200
+    second_turn, _ = await h.select(third, input_first_sequence=2, input_last_sequence=2)
+    claim = await h.claim(second_turn)
+    assert (await h.call(
+        "POST", f"/turns/{second_turn['id']}/complete",
+        dict(h.proof(claim), outcome="NO_RESPONSE"),
+    )).status_code == 200
+    await violation(
+        sql,
+        "INSERT INTO turn_input_messages(message_id,conversation_id,turn_id,sequence,ordinal) "
+        "VALUES(:message_id,:conversation_id,:turn_id,1,1)",
+        dict(message_id=third["message"]["id"],
+             conversation_id=first["conversation"]["id"], turn_id=second_turn["id"]),
+        "23503", "fk_turn_input_exact_message",
+    )
+
+
+async def test_goal5_settling_checks_are_null_safe_for_raw_sql(h, sql):
+    accepted = await h.ingest()
+    await violation(
+        sql,
+        "UPDATE messages SET settling_policy_version='telegram-v1', "
+        "settling_quiet_window_ms=NULL,settling_max_wait_ms=1000 WHERE id=:id",
+        {"id": accepted["message"]["id"]}, "23514", "ck_message_settling_snapshot",
+    )
+    _, attempt, _ = await h.delivery()
+    await violation(
+        sql,
+        "UPDATE delivery_attempts SET expected_settling_revision=NULL, "
+        "fenced_settling_revision=0 WHERE id=:id",
+        {"id": attempt["id"]}, "23514", "ck_delivery_settling_fence",
+    )
+    await h.reconcile(attempt, "DISPATCH_REQUESTED")
+    await violation(
+        sql,
+        "UPDATE delivery_reconciliations SET expected_settling_revision=0, "
+        "result_settling_revision=NULL WHERE delivery_attempt_id=:id",
+        {"id": attempt["id"]}, "23514", "ck_reconciliation_settling_fence",
     )
 
 

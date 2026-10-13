@@ -114,6 +114,20 @@ async def create_turn(
                 )
                 if active_id is not None:
                     raise DomainError(ErrorCode.ACTIVE_TURN_EXISTS)
+                covered_by_retained_turn = await session.scalar(select(Message.id).where(
+                    Message.conversation_id == conversation.id,
+                    Message.sequence >= request.input_first_sequence,
+                    Message.sequence <= request.input_last_sequence,
+                    Message.actor == "CUSTOMER",
+                    Message.direction == "INBOUND",
+                    select(AgentTurn.id).where(
+                        AgentTurn.conversation_id == conversation.id,
+                        Message.sequence >= AgentTurn.input_first_sequence,
+                        Message.sequence <= AgentTurn.input_last_sequence,
+                    ).exists(),
+                ).limit(1))
+                if covered_by_retained_turn is not None:
+                    raise DomainError(ErrorCode.TURN_SELECTION_CONFLICT)
                 turn = AgentTurn(
                     id=uuid4(),
                     conversation_id=conversation.id,
@@ -145,12 +159,14 @@ async def create_turn(
                     await session.execute(insert(TurnInputMessage).values(
                         message_id=message_id, conversation_id=conversation.id,
                         turn_id=turn.id, sequence=sequence, ordinal=ordinal,
-                    ).on_conflict_do_nothing(index_elements=["message_id"]))
+                    ))
                 result = TurnResult(turn=TurnRead.model_validate(turn), replayed=False)
     except IntegrityError as exc:
         # session.begin has rolled back before translating a recognized durable fence.
         if unique_violation(exc, "uq_turn_one_active"):
             raise DomainError(ErrorCode.ACTIVE_TURN_EXISTS) from None
+        if unique_violation(exc, "turn_input_messages_pkey"):
+            raise DomainError(ErrorCode.TURN_SELECTION_CONFLICT) from None
         raise
     return result
 

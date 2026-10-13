@@ -3,7 +3,7 @@
 from typing import Literal
 from uuid import UUID
 
-from pydantic import model_validator
+from pydantic import Field, model_validator
 
 from schemas.contracts import (
     Contract,
@@ -90,3 +90,19 @@ class TelegramResponseCompleted(Contract):
     response_attempt_id: UUID
     outcome: Literal["PROVIDER_ACCEPTED", "FAILED", "UNKNOWN"]
     replayed: bool
+
+
+class TelegramDeliveryWorkRequest(Contract):
+    owner_id: OwnerId
+    integration_id: UUID
+    agent_id: UUID
+
+
+class TelegramDeliveryWorkItem(TelegramIdentity):
+    turn_id: UUID
+    response_attempt_id: UUID
+    draft_text: TextContent
+
+
+class TelegramDeliveryWork(Contract):
+    items: list[TelegramDeliveryWorkItem] = Field(max_length=100)

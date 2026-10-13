@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.elements import ColumnElement
 
 from core.config import ManagedBinding, Settings
+from core.errors import DomainError
 from db.database import Database
 from models import (
     AgentTurn,
@@ -21,11 +22,12 @@ from models import (
     WebsiteAdmission,
     WebsiteImmediateTurn,
 )
-from schemas.contracts import Channel, Principal
+from schemas.contracts import Channel, ErrorCode, Principal
+from schemas.managed import MAX_MESSAGES
 from services.common import db_clock, fingerprint, scope_filter
 from services.history_projection import freeze_website_projection
 
-MAX_BURST_MESSAGES = 256
+MAX_BURST_MESSAGES = MAX_MESSAGES
 _SELECTION_NAMESPACE = UUID("d05d07b0-70a5-4f27-9628-801b852bd49e")
 
 
@@ -103,12 +105,71 @@ def _burst(messages: list[Message], now: datetime) -> tuple[list[Message], datet
 async def _pending_messages(session: AsyncSession, conversation_id: UUID) -> list[Message]:
     assigned = exists(select(TurnInputMessage.message_id).where(
         TurnInputMessage.message_id == Message.id))
+    in_frozen_legacy_range = exists(select(AgentTurn.id).where(
+        AgentTurn.conversation_id == Message.conversation_id,
+        Message.sequence >= AgentTurn.input_first_sequence,
+        Message.sequence <= AgentTurn.input_last_sequence,
+    ))
     return list((await session.scalars(select(Message).where(
         Message.conversation_id == conversation_id,
         Message.actor == "CUSTOMER",
         Message.direction == "INBOUND",
         ~assigned,
+        ~in_frozen_legacy_range,
     ).order_by(Message.sequence).limit(MAX_BURST_MESSAGES + 1))).all())
+
+
+def _turn_for_selection(
+    conversation: Conversation, selected: list[Message], clock: datetime
+) -> AgentTurn:
+    first, last = selected[0], selected[-1]
+    selection_key = uuid5(_SELECTION_NAMESPACE, f"{conversation.id}:{first.id}:{last.id}")
+    boundaries = {
+        "contract_version": 1,
+        "conversation_id": str(conversation.id),
+        "selection_key": str(selection_key),
+        "input_first_sequence": first.sequence,
+        "input_last_sequence": last.sequence,
+        "context_last_sequence": last.sequence,
+        "input_revision": last.input_revision,
+        "settling_revision": conversation.settling_revision,
+        "authority_revision": conversation.authority_revision,
+        "message_ids": [str(message.id) for message in selected],
+        "policy_version": first.settling_policy_version,
+    }
+    return AgentTurn(
+        id=uuid4(), conversation_id=conversation.id, selection_key=selection_key,
+        creation_fingerprint=fingerprint(boundaries),
+        input_first_sequence=first.sequence, input_last_sequence=last.sequence,
+        context_last_sequence=last.sequence, input_revision=last.input_revision,
+        settling_revision=conversation.settling_revision,
+        authority_revision=conversation.authority_revision, status="PENDING", claim_epoch=0,
+        operation_refs=[], created_at=clock,
+    )
+
+
+async def _maximal_projectable_prefix(
+    session: AsyncSession,
+    conversation: Conversation,
+    messages: list[Message],
+    binding: ManagedBinding,
+) -> list[Message]:
+    """Use the production ManagedTurn v2 projection to find the largest valid prefix."""
+    low, high, best = 1, min(len(messages), MAX_MESSAGES), 0
+    while low <= high:
+        middle = (low + high) // 2
+        candidate = messages[:middle]
+        probe = _turn_for_selection(conversation, candidate, candidate[-1].created_at)
+        try:
+            await freeze_website_projection(session, conversation, probe, binding.agent_id)
+        except DomainError as exc:
+            if exc.code != ErrorCode.VALIDATION_ERROR:
+                raise
+            high = middle - 1
+        else:
+            best = middle
+            low = middle + 1
+    return messages[:best]
 
 
 async def _create_turn(
@@ -124,29 +185,7 @@ async def _create_turn(
         raise RuntimeError("Settled inbound Message is missing its revision snapshot")
     if any(message.sequence != first.sequence + index for index, message in enumerate(selected)):
         raise RuntimeError("Settled input is not a contiguous canonical Message range")
-    selection_key = uuid5(_SELECTION_NAMESPACE, f"{conversation.id}:{first.id}:{last.id}")
-    boundaries = {
-        "contract_version": 1,
-        "conversation_id": str(conversation.id),
-        "selection_key": str(selection_key),
-        "input_first_sequence": first.sequence,
-        "input_last_sequence": last.sequence,
-        "context_last_sequence": last.sequence,
-        "input_revision": last.input_revision,
-        "settling_revision": conversation.settling_revision,
-        "authority_revision": conversation.authority_revision,
-        "message_ids": [str(message.id) for message in selected],
-        "policy_version": first.settling_policy_version,
-    }
-    turn = AgentTurn(
-        id=uuid4(), conversation_id=conversation.id, selection_key=selection_key,
-        creation_fingerprint=fingerprint(boundaries),
-        input_first_sequence=first.sequence, input_last_sequence=last.sequence,
-        context_last_sequence=last.sequence, input_revision=last.input_revision,
-        settling_revision=conversation.settling_revision,
-        authority_revision=conversation.authority_revision, status="PENDING", claim_epoch=0,
-        operation_refs=[], created_at=clock,
-    )
+    turn = _turn_for_selection(conversation, selected, clock)
     if channel == Channel.WEBSITE_WIDGET or channel == Channel.TELEGRAM:
         await freeze_website_projection(session, conversation, turn, binding.agent_id)
     session.add(turn)
@@ -168,7 +207,11 @@ async def select_settled_turn(
     if scope is None:
         return None
     pending = ~exists(select(TurnInputMessage.message_id).where(
-        TurnInputMessage.message_id == Message.id))
+        TurnInputMessage.message_id == Message.id)) & ~exists(select(AgentTurn.id).where(
+            AgentTurn.conversation_id == Message.conversation_id,
+            Message.sequence >= AgentTurn.input_first_sequence,
+            Message.sequence <= AgentTurn.input_last_sequence,
+        ))
     async with database.session_factory() as session, session.begin():
         candidates = list((await session.scalars(
             select(Conversation.id).join(Message, Message.conversation_id == Conversation.id)
@@ -224,6 +267,13 @@ async def select_settled_turn(
             choice = _burst(rows, clock)
             if choice is None:
                 continue
-            selected, _deadline = choice
+            due_messages, _deadline = choice
+            selected = await _maximal_projectable_prefix(
+                session, conversation, due_messages, binding
+            )
+            if not selected:
+                # A candidate-specific invalid projection remains durable and
+                # cannot prevent later Conversations from making progress.
+                continue
             return await _create_turn(session, conversation, selected, binding, channel, clock)
     return None

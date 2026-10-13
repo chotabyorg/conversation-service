@@ -333,6 +333,15 @@ async def test_provider_identity_canonical_history_worker_turn_and_delivery(
     assert retained.status_code == 200
     assert retained.json()["state"] == "DRAFT_READY"
     assert retained.json()["draft_text"] == "Managed answer **bold**"
+    work_scope = h["settings"].managed_ai_bindings[0]
+    work = await h["client"].post(
+                                   "/internal/v1/telegram/responses/work",
+                                   json={"owner_id": work_scope.owner_id,
+                                         "integration_id": str(work_scope.integration_id),
+                                         "agent_id": str(work_scope.agent_id)},
+                                   headers=h["gateway_headers"])
+    assert work.status_code == 200
+    assert len(work.json()["items"]) == 2  # No-policy mode remains one Turn per Message.
 
     response_attempt_id = expected_response_attempt_id(UUID(first_body["admission_id"]))
     begin_body = {**identity, "response_attempt_id": str(response_attempt_id)}

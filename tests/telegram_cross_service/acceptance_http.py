@@ -34,7 +34,9 @@ TG_ROOT = Path(os.environ.get(
     "GOAL4B_TELEGRAM_REPO", str(CS_ROOT.parent / "telegram-gateway-service")
 )).resolve()
 TG_PYTHON = Path(os.environ.get("GOAL4B_TELEGRAM_PYTHON", str(TG_ROOT / ".venv/bin/python")))
-CS_PYTHON = CS_ROOT / ".venv/bin/python"
+CS_PYTHON = Path(os.environ.get(
+    "GOAL5_CONVERSATION_PYTHON", str(CS_ROOT / ".venv/bin/python")
+))
 EVIDENCE: list[dict[str, object]] = []
 
 
@@ -84,6 +86,7 @@ class FakePeer:
         self.updates: dict[str, deque[dict[str, object]]] = defaultdict(deque)
         self.forced_updates: dict[str, deque[dict[str, object]]] = defaultdict(deque)
         self.managed_calls: list[dict[str, object]] = []
+        self.managed_call_times: list[float] = []
         self.legacy_calls: list[dict[str, object]] = []
         self.provider_calls: list[dict[str, object]] = []
         self.accepted_messages: list[dict[str, object]] = []
@@ -198,6 +201,7 @@ class FakePeer:
                     )
                     return
                 self.managed_calls.append(payload)
+                self.managed_call_times.append(asyncio.get_running_loop().time())
                 self.managed_entered.set()
                 if self.managed_block:
                     await self.managed_release.wait()
@@ -372,6 +376,7 @@ class TelegramHarness:
     processes: dict[str, subprocess.Popen] = field(default_factory=dict, repr=False)
     log_handles: list[object] = field(default_factory=list, repr=False)
     cohort_enabled: bool = True
+    settling_enabled: bool = False
     db: asyncpg.Pool | None = field(default=None, repr=False)
 
     def url(self, name: str) -> str:
@@ -429,6 +434,14 @@ class TelegramHarness:
                 "TELEGRAM_WORKER_HEALTH_PORT": str(self.ports["worker"]),
                 "LOG_LEVEL": "INFO",
             })
+            if self.settling_enabled:
+                env["TURN_SETTLING_POLICIES"] = json.dumps([{
+                    "version": "telegram-process-v1",
+                    "channel": "TELEGRAM",
+                    "integration_id": self.ids["canary"],
+                    "quiet_window_ms": 1000,
+                    "max_wait_ms": 1200,
+                }])
         elif name == "gateway":
             telegram_bindings = [
                 {"owner_id": self.ids["owner"], "integration_id": self.ids["canary"],
@@ -1129,3 +1142,186 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config) -> None:
                 raise RuntimeError("Evidence path must be inside /private/tmp")
             target.write_text(json.dumps(EVIDENCE, indent=2, sort_keys=True, default=str))
             target.chmod(0o600)
+
+
+@pytest.mark.asyncio
+async def test_goal5_real_polling_bursts_max_wait_and_restart_recovery(th, sql) -> None:
+    h = th
+    h.settling_enabled = True
+    # The test has no retained traffic yet, so restart the actual services with
+    # the exact binding policy enabled and preserve the accepted Goal4B heads.
+    for name in ("conversation", "worker", "gateway"):
+        await h.restart(name)
+
+    token = "900001:fixture-token"
+    before_ai = len(h.peer.managed_calls)
+    before_sends = len(h.peer.accepted_messages)
+    burst = [h.update(message_id=201 + index, update_id=401 + index,
+                      text_value=f"two message burst {index}", chat_id=406001)
+             for index in range(2)]
+    burst_keys = [event_key(update) for update in burst]
+    for update in burst:
+        h.queue(update)
+    burst_states = [await wait_for_state(
+        h, key, lambda row: row["canonical_message_id"] is not None,
+        "both provider burst updates durably admitted",
+    ) for key in burst_keys]
+    await h.peer.wait_for(lambda: len(h.peer.managed_calls) == before_ai + 1,
+                          "one Managed AI execution for two admitted updates")
+    await h.peer.wait_for(lambda: len(h.peer.accepted_messages) == before_sends + 1,
+                          "one Telegram response for two admitted updates")
+    assert burst_states[0]["turn_id"] == burst_states[1]["turn_id"]
+    selected_ids = [str(row["canonical_message_id"]) for row in await h.rows(
+        "SELECT canonical_message_id FROM telegram_admissions "
+        "WHERE provider_event_id = ANY($1::text[]) ORDER BY message_id", burst_keys)]
+    request_ids = h.peer.managed_calls[-1]["selected_input_message_ids"]
+    assert request_ids == selected_ids and len(set(request_ids)) == 2
+    assert len(h.peer.managed_calls) == before_ai + 1
+    assert len(h.peer.accepted_messages) == before_sends + 1
+
+    # A three-message burst is also represented by original canonical IDs in
+    # one frozen ManagedTurn request and results in one provider write.
+    before_ai = len(h.peer.managed_calls)
+    before_sends = len(h.peer.accepted_messages)
+    three = [h.update(message_id=211 + index, update_id=411 + index,
+                       text_value=f"three message burst {index}", chat_id=406002)
+             for index in range(3)]
+    three_keys = [event_key(update) for update in three]
+    for update in three:
+        h.queue(update)
+    three_states = [await wait_for_state(
+        h, key, lambda row: row["canonical_message_id"] is not None,
+        "three provider burst updates durably admitted",
+    ) for key in three_keys]
+    await h.peer.wait_for(lambda: len(h.peer.managed_calls) == before_ai + 1,
+                          "one Managed AI execution for three admitted updates")
+    await h.peer.wait_for(lambda: len(h.peer.accepted_messages) == before_sends + 1,
+                          "one Telegram response for three admitted updates")
+    assert len({state["turn_id"] for state in three_states}) == 1
+    three_ids = [str(row["canonical_message_id"]) for row in await h.rows(
+        "SELECT canonical_message_id FROM telegram_admissions "
+        "WHERE provider_event_id = ANY($1::text[]) ORDER BY message_id", three_keys)]
+    assert h.peer.managed_calls[-1]["selected_input_message_ids"] == three_ids
+    assert len(h.peer.managed_calls) == before_ai + 1
+    assert len(h.peer.accepted_messages) == before_sends + 1
+
+    # Distinct messages beyond the quiet window stay on separate Turns/replies.
+    before_ai = len(h.peer.managed_calls)
+    before_sends = len(h.peer.accepted_messages)
+    outside_one = h.update(message_id=221, update_id=421,
+                           text_value="outside window one", chat_id=406003)
+    outside_one_key = event_key(outside_one)
+    h.queue(outside_one)
+    await wait_for_state(h, outside_one_key,
+        lambda row: row["delivery_status"] == "PROVIDER_ACCEPTED",
+        "first outside-window Telegram response")
+    await asyncio.sleep(1.1)
+    outside_two = h.update(message_id=222, update_id=422,
+                           text_value="outside window two", chat_id=406003)
+    outside_two_key = event_key(outside_two)
+    h.queue(outside_two)
+    await wait_for_state(h, outside_two_key,
+        lambda row: row["delivery_status"] == "PROVIDER_ACCEPTED",
+        "second outside-window Telegram response")
+    outside_states = [await h.state(outside_one_key), await h.state(outside_two_key)]
+    assert outside_states[0]["turn_id"] != outside_states[1]["turn_id"]
+    assert len(h.peer.managed_calls) == before_ai + 2
+    assert len(h.peer.accepted_messages) == before_sends + 2
+
+    # A continuous burst resets quiet time but cannot exceed its stored max wait.
+    before_ai = len(h.peer.managed_calls)
+    before_sends = len(h.peer.accepted_messages)
+    before_call_times = len(h.peer.managed_call_times)
+    continuous_start = asyncio.get_running_loop().time()
+    continuous = [h.update(message_id=231 + index, update_id=431 + index,
+                           text_value=f"continuous burst {index}", chat_id=406004)
+                  for index in range(3)]
+    continuous_keys = [event_key(update) for update in continuous]
+    h.queue(continuous[0])
+    await asyncio.sleep(0.3)
+    h.queue(continuous[1])
+    await asyncio.sleep(0.3)
+    last_arrival = asyncio.get_running_loop().time()
+    h.queue(continuous[2])
+    continuous_states = [await wait_for_state(
+        h, key, lambda row: row["delivery_status"] == "PROVIDER_ACCEPTED",
+        "continuous burst response bounded by max wait",
+    ) for key in continuous_keys]
+    await h.peer.wait_for(lambda: len(h.peer.managed_calls) == before_ai + 1,
+                          "one Managed AI execution for continuous burst")
+    assert len({state["turn_id"] for state in continuous_states}) == 1
+    timed_turn = await h.rows(
+        "SELECT t.created_at, max(m.created_at) AS latest_input FROM agent_turns t "
+        "JOIN telegram_immediate_turns i ON i.turn_id=t.id "
+        "JOIN messages m ON m.id=i.message_id WHERE t.id=$1 GROUP BY t.id",
+        continuous_states[0]["turn_id"],
+    )
+    assert len(timed_turn) == 1
+    wait_after_last = (timed_turn[0]["created_at"] - timed_turn[0]["latest_input"]).total_seconds()
+    assert 0 <= wait_after_last < 1.0
+    assert asyncio.get_running_loop().time() - continuous_start >= 1.0
+    # Measure dispatch itself, not the later provider response observation:
+    # delivery latency must not be counted against the scheduler's max wait.
+    assert len(h.peer.managed_call_times) == before_call_times + 1
+    assert 0 <= h.peer.managed_call_times[-1] - last_arrival < 1.0
+    assert len(h.peer.accepted_messages) == before_sends + 1
+
+    # Once Conversation has durably admitted an update, Gateway polling may
+    # acknowledge it before Managed AI finishes. Restart recovers delivery from
+    # Conversation's retained work; no in-memory Gateway task owns the draft.
+    before_ai = len(h.peer.managed_calls)
+    before_sends = len(h.peer.accepted_messages)
+    h.peer.managed_block = True
+    h.peer.managed_release.clear()
+    h.peer.managed_entered.clear()
+    recovery = h.update(message_id=241, update_id=441,
+                        text_value="restart after durable admission", chat_id=406005)
+    recovery_key = event_key(recovery)
+    h.queue(recovery)
+    admitted = await wait_for_state(h, recovery_key,
+        lambda row: row["canonical_message_id"] is not None,
+        "durable ingress before the Gateway restart")
+    await h.peer.wait_for(lambda: h.peer.offset_advanced(token, 441),
+                          "provider offset after durable Conversation admission")
+    await asyncio.wait_for(h.peer.managed_entered.wait(), timeout=12)
+    h.kill("gateway")
+    h.peer.managed_release.set()
+    await h.restart("gateway")
+    recovered = await wait_for_state(h, recovery_key,
+        lambda row: row["delivery_status"] == "PROVIDER_ACCEPTED",
+        "Gateway restart recovers retained response")
+    await h.peer.wait_for(lambda: len(h.peer.accepted_messages) == before_sends + 1,
+                          "one response after Gateway restart")
+    assert recovered["canonical_message_id"] == admitted["canonical_message_id"]
+    assert len(h.peer.managed_calls) == before_ai + 1
+
+    # A provider accepted the write but the response was held while Gateway
+    # stopped. Recovery marks the retained intent UNKNOWN and does not resend.
+    before_ai = len(h.peer.managed_calls)
+    before_sends = len(h.peer.accepted_messages)
+    h.peer.send_modes.append("hold_after_accept")
+    h.peer.send_entered.clear()
+    h.peer.send_release.clear()
+    uncertain = h.update(message_id=242, update_id=442,
+                         text_value="restart after provider acceptance", chat_id=406006)
+    uncertain_key = event_key(uncertain)
+    h.queue(uncertain)
+    await asyncio.wait_for(h.peer.send_entered.wait(), timeout=15)
+    h.kill("gateway")
+    h.peer.send_release.set()
+    await h.restart("gateway")
+    uncertain_state = await wait_for_state(h, uncertain_key,
+        lambda row: row["delivery_status"] == "UNKNOWN",
+        "UNKNOWN after provider accepted but response was lost")
+    await asyncio.sleep(0.5)
+    assert uncertain_state["canonical_message_id"] is not None
+    assert len(h.peer.accepted_messages) == before_sends + 1
+    assert len(h.peer.managed_calls) == before_ai + 1
+    EVIDENCE.append({
+        "scenario": "Goal5 real polling", "two_message_burst": "one Turn, one AI call, one send",
+        "three_message_burst": "one Turn, one AI call, one send",
+        "outside_quiet_window": "two Turns and two sends",
+        "continuous_burst": "max_wait bounded before quiet timeout",
+        "durable_admission_restart": "offset advanced; response recovered",
+        "provider_acceptance_restart": "UNKNOWN; no blind resend",
+    })

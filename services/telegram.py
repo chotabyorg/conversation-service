@@ -6,7 +6,7 @@ from datetime import datetime
 from typing import Literal, cast
 from uuid import UUID, uuid4, uuid5
 
-from sqlalchemy import and_, exists, or_, select, text
+from sqlalchemy import and_, exists, func, or_, select, text
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.elements import ColumnElement
@@ -33,6 +33,9 @@ from schemas.contracts import Channel, ErrorCode, Principal
 from schemas.telegram import (
     TELEGRAM_NAMESPACE,
     TelegramAdmissionResult,
+    TelegramDeliveryWork,
+    TelegramDeliveryWorkItem,
+    TelegramDeliveryWorkRequest,
     TelegramIdentity,
     TelegramResponseBegin,
     TelegramResponseBegun,
@@ -325,7 +328,8 @@ async def begin_response(database: Database, principal: Principal,
         if delivery.status != "GENERATED":
             session.add(TelegramResponseAttempt(
                 id=request.response_attempt_id, admission_id=admission.id,
-                delivery_id=delivery.id, conversation_id=conversation.id, created_at=clock,
+                delivery_id=delivery.id, conversation_id=conversation.id,
+                send_authorized=False, created_at=clock,
             ))
             await session.flush()
             return TelegramResponseBegun(response_attempt_id=request.response_attempt_id,
@@ -349,7 +353,8 @@ async def begin_response(database: Database, principal: Principal,
             )
         session.add(TelegramResponseAttempt(
             id=request.response_attempt_id, admission_id=admission.id,
-            delivery_id=delivery.id, conversation_id=conversation.id, created_at=clock,
+            delivery_id=delivery.id, conversation_id=conversation.id,
+            send_authorized=not stale, created_at=clock,
         ))
         await session.flush()
         return TelegramResponseBegun(response_attempt_id=request.response_attempt_id,
@@ -387,6 +392,8 @@ async def complete_response(database: Database, principal: Principal,
                 and delivery.error_code == request.error_code):
             return TelegramResponseCompleted(response_attempt_id=attempt.id,
                                              outcome=outcome, replayed=True)
+        if not attempt.send_authorized:
+            raise DomainError(ErrorCode.INVALID_DELIVERY_TRANSITION)
         if attempt.outcome not in {None, "UNKNOWN"} or (
                 attempt.outcome == "UNKNOWN" and outcome == "UNKNOWN"):
             raise DomainError(ErrorCode.DELIVERY_RECONCILIATION_CONFLICT)
@@ -426,6 +433,77 @@ async def complete_response(database: Database, principal: Principal,
         await session.flush()
         return TelegramResponseCompleted(response_attempt_id=attempt.id,
                                          outcome=outcome, replayed=False)
+
+
+async def delivery_work(database: Database, principal: Principal,
+                        request: TelegramDeliveryWorkRequest,
+                        settings: Settings) -> TelegramDeliveryWork:
+    """Read recoverable Telegram drafts directly from canonical Turn state."""
+    if principal.role not in {"FULL", "TELEGRAM"}:
+        raise DomainError(ErrorCode.NOT_FOUND)
+    binding = next((item for item in settings.managed_ai_bindings
+                    if item.owner_id == request.owner_id
+                    and item.integration_id == request.integration_id
+                    and item.agent_id == request.agent_id
+                    and item.channel == Channel.TELEGRAM), None)
+    if (binding is None or not any(
+            grant.owner_id == request.owner_id
+            and grant.integration_id == request.integration_id
+            and grant.channel == Channel.TELEGRAM
+            and grant.provider_namespace == TELEGRAM_NAMESPACE
+            for grant in principal.grants)):
+        raise DomainError(ErrorCode.NOT_FOUND)
+    eligible_delivery = or_(
+        DeliveryAttempt.id.is_(None),
+        DeliveryAttempt.status.in_(("GENERATED", "DISPATCH_REQUESTED")),
+    )
+    ranked = select(
+        AgentTurn.id.label("turn_id"),
+        AgentTurn.created_at.label("turn_created_at"),
+        TelegramAdmissionRow.owner_id.label("owner_id"),
+        TelegramAdmissionRow.integration_id.label("integration_id"),
+        TelegramAdmissionRow.agent_id.label("agent_id"),
+        TelegramAdmissionRow.provider_thread_id.label("provider_thread_id"),
+        TelegramAdmissionRow.provider_event_id.label("provider_event_id"),
+        TelegramAdmissionRow.id.label("admission_id"),
+        AgentTurn.draft_text.label("draft_text"),
+        func.row_number().over(
+            partition_by=AgentTurn.id,
+            order_by=(TurnInputMessage.sequence, TelegramAdmissionRow.id),
+        ).label("admission_rank"),
+    ).join(Conversation, Conversation.id == AgentTurn.conversation_id).join(
+        TurnInputMessage, TurnInputMessage.turn_id == AgentTurn.id,
+    ).join(TelegramAdmissionRow,
+           TelegramAdmissionRow.canonical_message_id == TurnInputMessage.message_id).outerjoin(
+        DeliveryAttempt, and_(DeliveryAttempt.source_turn_id == AgentTurn.id,
+                              DeliveryAttempt.conversation_id == Conversation.id),
+    ).where(
+        AgentTurn.status == "COMPLETED",
+        AgentTurn.outcome == "DRAFT_READY",
+        AgentTurn.draft_text.is_not(None),
+        Conversation.control_mode == "AGENT",
+        Conversation.authority_revision == AgentTurn.authority_revision,
+        TelegramAdmissionRow.route == "MANAGED",
+        eligible_delivery,
+        Conversation.owner_id == request.owner_id,
+        Conversation.integration_id == request.integration_id,
+        Conversation.channel == "TELEGRAM",
+        TelegramAdmissionRow.agent_id == request.agent_id,
+    ).subquery()
+    async with database.session_factory() as session, session.begin():
+        rows = (await session.execute(select(ranked).where(
+            ranked.c.admission_rank == 1,
+        ).order_by(ranked.c.turn_created_at, ranked.c.turn_id).limit(100))).all()
+    return TelegramDeliveryWork(items=[TelegramDeliveryWorkItem(
+        owner_id=row.owner_id,
+        integration_id=row.integration_id,
+        agent_id=row.agent_id,
+        provider_thread_id=row.provider_thread_id,
+        provider_event_id=row.provider_event_id,
+        turn_id=row.turn_id,
+        response_attempt_id=expected_response_attempt_id(row.admission_id),
+        draft_text=row.draft_text,
+    ) for row in rows])
 
 
 async def select_immediate(database: Database, principal: Principal,

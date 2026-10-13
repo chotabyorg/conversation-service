@@ -108,6 +108,15 @@ async def query(wh, value):
     return response.json()
 
 
+async def _age_messages(sql, ages_ms: dict[int, int]) -> None:
+    async with sql.begin() as connection:
+        for sequence, age in ages_ms.items():
+            await connection.execute(text(
+                "UPDATE messages SET created_at=clock_timestamp() - "
+                "(:age * interval '1 millisecond') WHERE sequence=:sequence"
+            ), {"age": age, "sequence": sequence})
+
+
 async def test_arbitration_sticky_both_policy_directions_and_no_legacy_message(wh, sql):
     value = payload(wh)
     first = await admit(wh, value)
@@ -161,11 +170,30 @@ async def test_website_settling_batches_messages_and_fences_stale_draft(wh, sql)
     begun = await wh.call("POST", "/website/responses/begin", begin_body)
     assert begun.status_code == 200, begun.text
     assert begun.json()["send"] is False
+    malicious = await wh.call("POST", "/website/responses/complete",
+                              dict(begin_body, outcome="WRITE_COMPLETED"))
+    assert malicious.status_code == 409
+    assert malicious.json()["detail"]["code"] == "INVALID_DELIVERY_TRANSITION"
+    async with sql.connect() as connection:
+        assert await connection.scalar(text(
+            "SELECT count(*) FROM messages WHERE actor='AGENT'")) == 0
+    await _age_messages(sql, {3: 300})
+    assert await wh.worker.run_once()
+    next_begin = dict(identity(third), response_attempt_id=str(uuid4()))
+    next_response = await wh.call("POST", "/website/responses/begin", next_begin)
+    assert next_response.status_code == 200 and next_response.json()["send"] is True
+    completed = await wh.call("POST", "/website/responses/complete",
+                              dict(next_begin, outcome="WRITE_COMPLETED"))
+    assert completed.status_code == 200
     async with wh.database.session_factory() as session, session.begin():
-        delivery = await session.scalar(select(DeliveryAttempt))
+        delivery = await session.scalar(select(DeliveryAttempt).where(
+            DeliveryAttempt.status == "SUPERSEDED"))
         turn = await session.get(AgentTurn, selected.turn_id)
     assert delivery is not None and delivery.status == "SUPERSEDED"
     assert turn is not None and turn.operation_refs == []
+    async with sql.connect() as connection:
+        assert await connection.scalar(text(
+            "SELECT count(*) FROM messages WHERE actor='AGENT'")) == 1
 
 
 @pytest.mark.parametrize("change", ["text", "session_id", "agent_id"])
@@ -327,31 +355,70 @@ async def test_lease_renews_during_long_execution(wh):
     assert len(wh.ai.calls) == 1
 
 
-async def test_draft_replay_response_attempts_and_socket_fact_never_delivered(wh, sql):
-    value = payload(wh)
-    await admit(wh, value)
-    assert await wh.worker.run_once()
-    first = dict(identity(value), response_attempt_id=str(uuid4()))
-    began = await wh.call("POST", BASE + "/responses/begin", first)
-    assert began.status_code == 200 and began.json()["draft_text"] == "retained reply"
-    assert (await wh.call("POST", BASE + "/responses/begin", first)).json()["replayed"]
+async def test_draft_replay_response_attempts_and_late_write_evidence(wh, sql):
     for outcome in ("WRITE_COMPLETED", "WRITE_FAILED", "UNKNOWN"):
+        value = payload(wh, session_id=str(uuid4()), message_id=str(uuid4()))
+        await admit(wh, value)
+        assert await wh.worker.run_once()
         attempt = dict(identity(value), response_attempt_id=str(uuid4()))
-        assert (await wh.call("POST", BASE + "/responses/begin", attempt)).status_code == 200
+        began = await wh.call("POST", BASE + "/responses/begin", attempt)
+        assert began.status_code == 200 and began.json()["send"] is True
+        assert began.json()["draft_text"] == "retained reply"
+        # A replay returns send=false but retains the original permission so
+        # definitive late evidence from the first write can still be recorded.
+        assert (await wh.call("POST", BASE + "/responses/begin", attempt)).json() == dict(
+            response_attempt_id=attempt["response_attempt_id"],
+            draft_text="retained reply", send=False, replayed=True,
+        )
         finished = dict(attempt, outcome=outcome)
         response = await wh.call("POST", BASE + "/responses/complete", finished)
         assert response.status_code == 200 and response.json()["outcome"] == outcome
         assert (await wh.call("POST", BASE + "/responses/complete", finished)).json()["replayed"]
         changed = "UNKNOWN" if outcome != "UNKNOWN" else "WRITE_COMPLETED"
-        assert (await wh.call("POST", BASE + "/responses/complete",
-                              dict(finished, outcome=changed))).status_code == 409
-    assert not await wh.worker.run_once() and len(wh.ai.calls) == 1
+        changed_body = dict(finished, outcome=changed)
+        changed_response = await wh.call("POST", BASE + "/responses/complete", changed_body)
+        if outcome == "UNKNOWN":
+            assert changed_response.status_code == 200
+            assert changed_response.json()["outcome"] == "WRITE_COMPLETED"
+            assert not changed_response.json()["replayed"]
+            assert (await wh.call("POST", BASE + "/responses/complete",
+                                  changed_body)).json()["replayed"]
+        else:
+            assert changed_response.status_code == 409
+    assert len(wh.ai.calls) == 3
     async with sql.connect() as conn:
-        assert await conn.scalar(text("SELECT count(*) FROM delivery_attempts")) == 1
-        row = await conn.execute(text(
-            "SELECT status,delivered_at,read_at FROM delivery_attempts"))
-        assert tuple(row.first()) == ("UNKNOWN", None, None)
-        assert await conn.scalar(text("SELECT count(*) FROM website_response_attempts")) == 4
+        assert await conn.scalar(text("SELECT count(*) FROM delivery_attempts")) == 3
+        assert await conn.scalar(text(
+            "SELECT count(*) FROM messages WHERE actor='AGENT'")) == 2
+        rows = (await conn.execute(text(
+            "SELECT status,delivered_at,read_at FROM delivery_attempts ORDER BY created_at"))
+        ).all()
+        assert rows == [("UNKNOWN", None, None)] * 3
+        assert await conn.scalar(text("SELECT count(*) FROM website_response_attempts")) == 3
+
+
+async def test_send_false_attempt_cannot_be_completed_as_a_client_write(wh, sql):
+    value = payload(wh)
+    await admit(wh, value)
+    assert await wh.worker.run_once()
+    first_attempt = dict(identity(value), response_attempt_id=str(uuid4()))
+    first = await wh.call("POST", BASE + "/responses/begin", first_attempt)
+    assert first.status_code == 200 and first.json()["send"] is True
+
+    replay_attempt = dict(identity(value), response_attempt_id=str(uuid4()))
+    replay = await wh.call("POST", BASE + "/responses/begin", replay_attempt)
+    assert replay.status_code == 200 and replay.json()["send"] is False
+    malicious = await wh.call(
+        "POST", BASE + "/responses/complete",
+        dict(replay_attempt, outcome="WRITE_COMPLETED"),
+    )
+    assert malicious.status_code == 409
+    assert malicious.json()["detail"]["code"] == "INVALID_DELIVERY_TRANSITION"
+    async with sql.connect() as conn:
+        assert await conn.scalar(text(
+            "SELECT count(*) FROM messages WHERE actor='AGENT'")) == 0
+        assert await conn.scalar(text(
+            "SELECT count(*) FROM website_response_attempts WHERE send_authorized")) == 1
 
 
 async def test_response_replay_binding_scope_and_agent_reassignment_denied(wh):

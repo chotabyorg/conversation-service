@@ -54,6 +54,21 @@ TRANSITIONS: dict[str, frozenset[str]] = {
 }
 
 
+def _reconciliation_fingerprint(delivery_attempt_id: UUID, request: DeliveryReconcile) -> str:
+    # These two fields were added in Goal5. Preserve every pre-existing optional
+    # field's historical null shape while omitting only absent Goal5 evidence.
+    payload = request.model_dump(mode="json")
+    if request.expected_settling_revision is None:
+        payload.pop("expected_settling_revision", None)
+    if request.result_settling_revision is None:
+        payload.pop("result_settling_revision", None)
+    return fingerprint({
+        "contract_version": 1,
+        "delivery_attempt_id": str(delivery_attempt_id),
+        **payload,
+    })
+
+
 async def create_delivery(
     database: Database, principal: Principal, conversation_id: UUID, request: DeliveryCreate
 ) -> DeliveryResult:
@@ -163,13 +178,7 @@ def merged_reference(current: str | None, reported: str | None) -> str | None:
 async def reconcile_delivery(
     database: Database, principal: Principal, delivery_attempt_id: UUID, request: DeliveryReconcile
 ) -> DeliveryReconcileResult:
-    digest = fingerprint(
-        {
-            "contract_version": 1,
-            "delivery_attempt_id": str(delivery_attempt_id),
-            **request.model_dump(mode="json"),
-        }
-    )
+    digest = _reconciliation_fingerprint(delivery_attempt_id, request)
     async with database.session_factory() as session, session.begin():
         conversation, attempt = await locked_delivery(session, principal, delivery_attempt_id)
         previous = await session.scalar(

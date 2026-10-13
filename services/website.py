@@ -298,7 +298,8 @@ async def begin_response(database: Database, principal: Principal, request: Webs
             send = not stale
         session.add(WebsiteResponseAttempt(id=request.response_attempt_id,
                                            admission_id=admission.id, delivery_id=delivery.id,
-                                           conversation_id=conversation.id, created_at=clock))
+                                           conversation_id=conversation.id,
+                                           send_authorized=send, created_at=clock))
         await session.flush()
         result = WebsiteResponseBegun(response_attempt_id=request.response_attempt_id,
                                       draft_text=turn.draft_text, send=send, replayed=False)
@@ -318,16 +319,33 @@ async def complete_response(database: Database, principal: Principal,
         attempt = await session.get(WebsiteResponseAttempt, request.response_attempt_id)
         if attempt is None or attempt.admission_id != admission.id:
             raise DomainError(ErrorCode.NOT_FOUND)
-        replayed = attempt.outcome is not None
-        if replayed and attempt.outcome != request.outcome:
+        previous_outcome = attempt.outcome
+        replayed = previous_outcome is not None
+        if replayed and previous_outcome == request.outcome:
+            return WebsiteResponseCompleted(response_attempt_id=attempt.id,
+                                             outcome=request.outcome, replayed=True)
+        # UNKNOWN is an unresolved authorized write. Keep its one response
+        # attempt eligible for late client evidence; definitive results remain
+        # immutable and a denied attempt can never borrow another attempt's send.
+        late_evidence = (previous_outcome == "UNKNOWN"
+                         and request.outcome in {"WRITE_COMPLETED", "WRITE_FAILED"})
+        if replayed and not late_evidence:
             raise DomainError(ErrorCode.DELIVERY_RECONCILIATION_CONFLICT)
+        if late_evidence:
+            replayed = False
         if not replayed:
-            clock = await db_clock(session)
-            attempt.outcome = request.outcome
-            attempt.finished_at = clock
             delivery = await session.get(DeliveryAttempt, attempt.delivery_id)
             if delivery is None:
                 raise DomainError(ErrorCode.NOT_FOUND)
+            # Permission is bound to this exact transport attempt. A separate
+            # attempt can share the Turn's delivery row but must not borrow its
+            # dispatch authorization. UNKNOWN remains eligible for late evidence.
+            if (not attempt.send_authorized
+                    or delivery.status not in {"DISPATCH_REQUESTED", "UNKNOWN"}):
+                raise DomainError(ErrorCode.INVALID_DELIVERY_TRANSITION)
+            clock = await db_clock(session)
+            attempt.outcome = request.outcome
+            attempt.finished_at = clock
             if request.outcome == "WRITE_COMPLETED":
                 turn = await session.scalar(select(AgentTurn).where(
                     AgentTurn.id == delivery.source_turn_id,

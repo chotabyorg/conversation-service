@@ -98,6 +98,72 @@ async def test_pending_claimed_and_expired_share_single_active_slot(h, sql):
         )
 
 
+async def test_completed_turn_owns_input_and_different_selection_is_atomic_conflict(h, sql):
+    accepted = await h.ingest()
+    turn, _ = await h.select(accepted)
+    claim = await h.claim(turn)
+    completed = await h.call(
+        "POST", f"/turns/{turn['id']}/complete",
+        dict(h.proof(claim), outcome="NO_RESPONSE"),
+    )
+    assert completed.status_code == 200
+
+    competing = dict(
+        selection_key=str(uuid4()), input_first_sequence=1, input_last_sequence=1,
+        expected_input_revision=1, expected_authority_revision=0,
+    )
+    response = await h.call(
+        "POST", f"/conversations/{turn['conversation_id']}/turns", competing
+    )
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "TURN_SELECTION_CONFLICT"
+    async with sql.connect() as connection:
+        assert await connection.scalar(text("SELECT count(*) FROM agent_turns")) == 1
+        assert await connection.scalar(text("SELECT count(*) FROM turn_input_messages")) == 1
+
+
+async def test_partially_owned_multimessage_range_rolls_back_second_turn(h, sql):
+    await h.ingest()
+    second = await h.ingest()
+    turn, _ = await h.select(second, input_first_sequence=1, input_last_sequence=1)
+    claim = await h.claim(turn)
+    assert (await h.call(
+        "POST", f"/turns/{turn['id']}/complete",
+        dict(h.proof(claim), outcome="NO_RESPONSE"),
+    )).status_code == 200
+
+    conversation = second["conversation"]
+    response = await h.call(
+        "POST", f"/conversations/{conversation['id']}/turns",
+        dict(selection_key=str(uuid4()), input_first_sequence=1, input_last_sequence=2,
+             expected_input_revision=2, expected_authority_revision=0),
+    )
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "TURN_SELECTION_CONFLICT"
+    async with sql.connect() as connection:
+        assert await connection.scalar(text("SELECT count(*) FROM agent_turns")) == 1
+        assert await connection.scalar(text(
+            "SELECT count(*) FROM turn_input_messages")) == 1
+
+
+async def test_concurrent_competing_turn_creates_keep_one_complete_mapping(h, sql):
+    import asyncio
+
+    accepted = await h.ingest()
+    conversation_id = accepted["conversation"]["id"]
+    base = dict(input_first_sequence=1, input_last_sequence=1,
+                expected_input_revision=1, expected_authority_revision=0)
+    responses = await asyncio.gather(*(
+        h.call("POST", f"/conversations/{conversation_id}/turns",
+               dict(base, selection_key=str(uuid4())))
+        for _ in range(2)
+    ))
+    assert sorted(response.status_code for response in responses) == [201, 409]
+    async with sql.connect() as connection:
+        assert await connection.scalar(text("SELECT count(*) FROM agent_turns")) == 1
+        assert await connection.scalar(text("SELECT count(*) FROM turn_input_messages")) == 1
+
+
 async def test_recovery_rotates_proof_same_identity_and_stale_owner_rejected(h, sql):
     accepted = await h.ingest()
     turn, _ = await h.select(accepted)
@@ -275,7 +341,17 @@ async def test_terminal_frees_active_slot_new_key_but_human_mode_rejects_new_sel
             "POST", f"/turns/{turn['id']}/complete", dict(h.proof(claim), outcome="NO_RESPONSE")
         )
     ).status_code == 200
-    new_turn, _ = await h.select(accepted)
+
+    error(
+        await h.call(
+            "POST",
+            f"/conversations/{turn['conversation_id']}/turns",
+            dict(payload, selection_key=str(uuid4())),
+        ),
+        "TURN_SELECTION_CONFLICT",
+    )
+    second = await h.ingest()
+    new_turn, _ = await h.select(second, input_first_sequence=2, input_last_sequence=2)
     assert new_turn["id"] != turn["id"] and new_turn["status"] == "PENDING"
     assert (
         await h.call(
@@ -284,11 +360,18 @@ async def test_terminal_frees_active_slot_new_key_but_human_mode_rejects_new_sel
             dict(expected_authority_revision=0, control_mode="HUMAN"),
         )
     ).status_code == 200
+    third = await h.ingest()
     error(
         await h.call(
             "POST",
             f"/conversations/{turn['conversation_id']}/turns",
-            dict(payload, selection_key=str(uuid4()), expected_authority_revision=1),
+            dict(
+                selection_key=str(uuid4()),
+                input_first_sequence=3,
+                input_last_sequence=3,
+                expected_input_revision=third["conversation"]["input_revision"],
+                expected_authority_revision=1,
+            ),
         ),
         "CONTROL_MODE_CONFLICT",
     )
