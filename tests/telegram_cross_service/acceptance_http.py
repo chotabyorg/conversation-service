@@ -89,6 +89,12 @@ class FakePeer:
         self.accepted_messages: list[dict[str, object]] = []
         self.get_updates_calls: dict[str, int] = defaultdict(int)
         self.send_modes: deque[str] = deque()
+        self.chat_action_modes: dict[str, str] = {}
+        self.require_admission_before_action: set[str] = set()
+        self.action_admission_counts: dict[str, int] = {}
+        self.current_updates: dict[str, dict[str, object]] = {}
+        self.db: asyncpg.Pool | None = None
+        self.raw_provider_response = "fixture-raw-telegram-response-secret"
         self.managed_block = False
         self.managed_release = asyncio.Event()
         self.managed_release.set()
@@ -113,8 +119,16 @@ class FakePeer:
     async def _reply(self, writer: asyncio.StreamWriter, value: object,
                      status: int = 200) -> None:
         body = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode()
-        reason = "OK" if status == 200 else "Unauthorized"
+        reason = {200: "OK", 401: "Unauthorized", 500: "Internal Server Error"}.get(
+            status, "Test response")
         writer.write((f"HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\n"
+                      f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n").encode()
+                     + body)
+        await writer.drain()
+
+    async def _redirect(self, writer: asyncio.StreamWriter, path: str) -> None:
+        body = b"fixture redirect body"
+        writer.write((f"HTTP/1.1 302 Found\r\nLocation: {self.base_url}{path}\r\n"
                       f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n").encode()
                      + body)
         await writer.drain()
@@ -223,11 +237,46 @@ class FakePeer:
                     forced = self.forced_updates[token]
                     updates = [forced.popleft()] if forced else list(queue)[:100]
                     self.get_updates_calls[token] += 1
+                    if updates:
+                        self.current_updates[token] = updates[0]
                     if not updates:
                         await asyncio.sleep(0.05)
                     await self._reply(writer, {"ok": True, "result": updates})
                     return
                 if method_name == "sendChatAction":
+                    update = self.current_updates.get(token)
+                    event_id = None
+                    if update is not None and isinstance(update.get("message"), dict):
+                        current_message = update["message"]
+                        current_chat = current_message.get("chat")
+                        if isinstance(current_chat, dict):
+                            event_id = (f"b{token.split(':', 1)[0]}c{current_chat['id']}"
+                                        f"m{current_message['message_id']}")
+                    if event_id in self.require_admission_before_action:
+                        assert self.db is not None
+                        self.action_admission_counts[event_id] = await self.db.fetchval(
+                            "SELECT count(*) FROM telegram_admissions "
+                            "WHERE provider_event_id=$1", event_id)
+                    mode = self.chat_action_modes.get(event_id or "", "success")
+                    if mode == "server_500":
+                        await self._reply(writer, {
+                            "ok": False,
+                            "error_code": 500,
+                            "description": self.raw_provider_response,
+                        }, status=500)
+                        return
+                    if mode == "network":
+                        writer.close()
+                        await writer.wait_closed()
+                        return
+                    if mode == "timeout":
+                        await asyncio.sleep(0.8)
+                        if not writer.is_closing():
+                            await self._reply(writer, {"ok": True, "result": True})
+                        return
+                    if mode == "redirect_loop":
+                        await self._redirect(writer, path)
+                        return
                     await self._reply(writer, {"ok": True, "result": True})
                     return
                 if method_name == "sendMessage":
@@ -293,6 +342,13 @@ class FakePeer:
         self.updates[token].append(update)
         if duplicate:
             self.updates[token].append(dict(update))
+
+    def offset_advanced(self, token: str, update_id: int) -> bool:
+        return any(
+            call.get("method") == "getUpdates" and call.get("token") == token
+            and int(call.get("payload", {}).get("offset", 0)) > update_id
+            for call in self.provider_calls
+        )
 
     async def wait_for(self, predicate, label: str, timeout: float = 12.0) -> None:
         deadline = asyncio.get_running_loop().time() + timeout
@@ -525,6 +581,7 @@ async def th(sql, database_url, telegram_runtime, process_ports, tmp_path):
     dburl = make_url(database_url)
     pgurl = dburl.set(drivername="postgresql").render_as_string(hide_password=False)
     db = await asyncpg.create_pool(pgurl, min_size=1, max_size=4)
+    peer.db = db
     harness = TelegramHarness(tmp_path, database_url, process_ports, ids, tokens,
                               peer, client, db=db)
     try:
@@ -601,6 +658,7 @@ async def test_goal4b_required_local_process_matrix(th, sql) -> None:
     # no Business operation, and no Redis dependency (16-18).
     managed = h.update(message_id=1, update_id=100, text_value="same words")
     managed_key = event_key(managed)
+    h.peer.require_admission_before_action.add(managed_key)
     h.queue(managed)
     state = await wait_for_state(h, managed_key,
         lambda row: row["status"] == "COMPLETED" and row["delivery_status"] == "PROVIDER_ACCEPTED",
@@ -623,6 +681,7 @@ async def test_goal4b_required_local_process_matrix(th, sql) -> None:
         "to_regclass('business_operations') AS business_operations"
     )
     assert tuple(counts[0]) == (1, 1, 1, 1, 1, 1, None)
+    assert h.peer.action_admission_counts[managed_key] == 1
     EVIDENCE.append({"scenario": 1, "managed_process_path": "PASS", "contract_version": 2,
                      "provider_delivery": state["delivery_status"], "message_id":
                      state["provider_message_id"], "business_operations": "none"})
@@ -919,6 +978,124 @@ async def test_goal4b_required_local_process_matrix(th, sql) -> None:
     EVIDENCE.append({"scenario": 16, "managed_html_formatter_parity": "PASS"})
     EVIDENCE.append({"scenario": 17, "no_redis_or_legacy_session_on_managed_path": "PASS"})
     EVIDENCE.append({"scenario": 18, "business_operations": "none"})
+
+    # A typing action is optional provider UX. Exercise actual aiogram polling
+    # against failures from the fake Bot API and verify Conversation committed
+    # admission before each sendChatAction request.
+    await h.restart("gateway", cohort_enabled=True)
+    typing_modes = ("server_500", "network", "timeout", "redirect_loop")
+    for index, mode in enumerate(typing_modes):
+        update_id = 200 + index
+        event = h.update(message_id=20 + index, update_id=update_id,
+                         text_value=f"typing failure {mode}", chat_id=404100 + index)
+        event_id = event_key(event)
+        h.peer.chat_action_modes[event_id] = mode
+        h.peer.require_admission_before_action.add(event_id)
+        managed_before = len(h.peer.managed_calls)
+        sends_before = len(h.peer.accepted_messages)
+        h.queue(event)
+        accepted_state = await wait_for_state(
+            h, event_id,
+            lambda row: row["route"] == "MANAGED" and row["status"] == "COMPLETED"
+            and row["delivery_status"] == "PROVIDER_ACCEPTED",
+            f"managed processing after typing {mode}",
+        )
+        assert accepted_state["canonical_message_id"] is not None
+        assert h.peer.action_admission_counts[event_id] == 1
+        await h.peer.wait_for(
+            lambda: h.peer.offset_advanced(canary_token, update_id),
+            f"poll offset advancement after typing {mode}",
+        )
+        counts = await h.rows(
+            "SELECT (SELECT count(*) FROM telegram_admissions WHERE provider_event_id=$1),"
+            "(SELECT count(*) FROM inbound_events WHERE provider_event_id=$1),"
+            "(SELECT count(*) FROM messages WHERE id=$2 AND actor='CUSTOMER'),"
+            "(SELECT count(*) FROM agent_turns WHERE id=$3),"
+            "(SELECT count(*) FROM messages WHERE source_agent_turn_id=$3 AND actor='AGENT'),"
+            "(SELECT count(*) FROM delivery_attempts WHERE source_turn_id=$3)",
+            event_id, accepted_state["canonical_message_id"], accepted_state["turn_id"],
+        )
+        assert tuple(counts[0]) == (1, 1, 1, 1, 1, 1)
+        assert len(h.peer.managed_calls) == managed_before + 1
+        assert len(h.peer.accepted_messages) == sends_before + 1
+
+        # An exact Telegram redelivery still resolves to the same durable work.
+        action_before_replay = sum(
+            call.get("method") == "sendChatAction" and call.get("token") == canary_token
+            for call in h.peer.provider_calls
+        )
+        polls_before_replay = h.peer.get_updates_calls[canary_token]
+        h.queue(h.update(message_id=20 + index, update_id=update_id,
+                         text_value=f"typing failure {mode}", chat_id=404100 + index),
+                force=True)
+        await h.peer.wait_for(lambda: sum(
+            call.get("method") == "sendChatAction" and call.get("token") == canary_token
+            for call in h.peer.provider_calls) > action_before_replay,
+            f"typing action replay for {mode}")
+        await h.peer.wait_for(
+            lambda: h.peer.get_updates_calls[canary_token] >= polls_before_replay + 2,
+            f"poll completion after typing replay for {mode}",
+        )
+        assert (await h.rows(
+            "SELECT count(*) FROM telegram_admissions WHERE provider_event_id=$1", event_id
+        ))[0][0] == 1
+        assert len(h.peer.managed_calls) == managed_before + 1
+        assert len(h.peer.accepted_messages) == sends_before + 1
+        EVIDENCE.append({"scenario": "typing_failure", "mode": mode,
+                         "admission_before_action": True, "offset_advanced": True,
+                         "one_admission_and_turn": True, "processing_continued": True})
+
+    # With a sticky binding but disabled cohort, a durable LEGACY decision also
+    # survives a typing failure and continues to the established legacy AI path.
+    await h.restart("gateway", cohort_enabled=False)
+    legacy_action = h.update(integration="legacy", message_id=30, update_id=204,
+                             text_value="legacy typing failure", chat_id=405100)
+    legacy_action_id = event_key(legacy_action)
+    h.peer.chat_action_modes[legacy_action_id] = "server_500"
+    h.peer.require_admission_before_action.add(legacy_action_id)
+    legacy_calls_before_action = len(h.peer.legacy_calls)
+    h.queue(legacy_action)
+    await h.peer.wait_for(
+        lambda: len(h.peer.legacy_calls) == legacy_calls_before_action + 1,
+        "legacy AI processing after typing failure",
+    )
+    legacy_action_state = await h.state(legacy_action_id)
+    assert legacy_action_state["route"] == "LEGACY"
+    assert legacy_action_state["canonical_message_id"] is None
+    assert h.peer.action_admission_counts[legacy_action_id] == 1
+    await h.peer.wait_for(
+        lambda: any(call.get("method") == "sendMessage"
+                    and call.get("token") == legacy_token
+                        and int(call.get("payload", {}).get("chat_id", 0)) == 405100
+                    for call in h.peer.provider_calls),
+        "legacy Telegram response after typing failure",
+    )
+    await h.peer.wait_for(
+        lambda: h.peer.offset_advanced(legacy_token, 204),
+        "legacy poll offset advancement after typing failure",
+    )
+    assert (await h.rows(
+        "SELECT count(*) FROM telegram_admissions WHERE provider_event_id=$1",
+        legacy_action_id,
+    ))[0][0] == 1
+    EVIDENCE.append({"scenario": "typing_failure", "mode": "retained_legacy_http_500",
+                     "admission_before_action": True, "legacy_ai_continued": True,
+                     "offset_advanced": True})
+
+    # Inspect every process log sink after realistic aiohttp/aiogram failures.
+    all_logs = "\n".join(path.read_text(errors="replace")
+                         for path in h.root.glob("*.log"))
+    for secret in (*h.tokens.values(), canary_token, legacy_token,
+                   h.peer.raw_provider_response):
+        assert secret not in all_logs
+    assert f"/bot{canary_token}/" not in all_logs
+    assert f"/bot{legacy_token}/" not in all_logs
+    assert "event=typing_failed" in all_logs
+    assert "operation=sendChatAction" in all_logs
+    assert "error_class=TelegramServerError" in all_logs
+    assert "error_class=TelegramNetworkError" in all_logs
+    EVIDENCE.append({"scenario": "secret_redaction", "log_sinks": "all process logs",
+                     "provider_url_token_raw_response_and_configured_secrets": "absent"})
 
     # 10/20/21: Full service and Website regressions are proven by this process
     # stack plus the repository's existing v1/v2 suite. No Redis process exists.
