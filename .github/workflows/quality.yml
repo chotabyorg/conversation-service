@@ -28,6 +28,10 @@ jobs:
       CONVERSATION_AUTH_PRINCIPALS: '[{"principal_id":"ci-worker","token":"ci-synthetic-token-00000000000000000000","grants":[{"owner_id":"ci-owner","integration_id":"00000000-0000-4000-8000-000000000001","channel":"WEBSITE_WIDGET","provider_namespace":"ci.widget"}]}]'
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The migration replay regression archives the accepted Goal4B source
+          # commit from this repository's history.
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"

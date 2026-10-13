@@ -6,7 +6,6 @@ import socket
 import subprocess
 import sys
 import tarfile
-from pathlib import Path
 from uuid import UUID, uuid4
 
 import httpx
@@ -414,11 +413,11 @@ async def test_actual_goal4b_reconciliation_replays_after_0005_to_0006(
         await connection.execute(text("UPDATE agent_turns SET settling_revision=0"))
     await h.database.dispose()
 
-    workspace_root = Path(__file__).resolve().parents[3]
-    old_repository = workspace_root / "backend" / "conversation-service"
+    # CI checks out only this repository. Fetch full history in the Quality
+    # workflow so the accepted Goal4B source remains available by exact SHA.
     archive = subprocess.run(
         ["git", "archive", GOAL4B_CONVERSATION_SHA],
-        cwd=old_repository, check=True, capture_output=True,
+        cwd=ROOT, check=True, capture_output=True,
     ).stdout
     old_source = tmp_path / "conversation-goal4b"
     old_source.mkdir()
@@ -442,7 +441,9 @@ async def test_actual_goal4b_reconciliation_replays_after_0005_to_0006(
         "PYTHONPATH": str(old_source),
         "PYTHONDONTWRITEBYTECODE": "1",
     }
-    old_python = old_repository / ".venv" / "bin" / "python"
+    # Reuse the test interpreter and dependencies; the archived source is still
+    # the application under test through cwd and PYTHONPATH.
+    old_python = sys.executable
     process = None
     downgraded = False
     old_body = {
@@ -455,7 +456,7 @@ async def test_actual_goal4b_reconciliation_replays_after_0005_to_0006(
         migrate(database_url, "downgrade", "0005_telegram_canary")
         downgraded = True
         process = subprocess.Popen(
-            [str(old_python), "-m", "uvicorn", "main:app", "--host", "127.0.0.1",
+            [old_python, "-m", "uvicorn", "main:app", "--host", "127.0.0.1",
              "--port", str(port), "--no-access-log", "--log-level", "critical"],
             cwd=old_source, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
