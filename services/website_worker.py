@@ -178,7 +178,7 @@ async def select_immediate(database: Database, principal: Principal,
                     input_last_sequence=message.sequence, context_last_sequence=message.sequence,
                     input_revision=(message.input_revision or conversation.input_revision),
                     authority_revision=conversation.authority_revision,
-                    settling_revision=message.settling_revision or 0,
+                    settling_revision=conversation.settling_revision,
                     status="PENDING", claim_epoch=0,
                     operation_refs=[], created_at=clock,
                 )

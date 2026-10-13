@@ -132,9 +132,10 @@ async def ingest_event(
             else:
                 conversation.last_message_sequence += 1
                 conversation.input_revision += 1
+                # Every accepted customer input fences an older draft, including
+                # input admitted while settling policy is disabled.
+                conversation.settling_revision += 1
                 policy = settings.settling_policy_for(request.channel, request.integration_id)
-                if policy is not None:
-                    conversation.settling_revision += 1
                 conversation.updated_at = accepted_at
                 message = Message(
                     id=uuid4(),

@@ -490,7 +490,12 @@ async def test_downgrade_refuses_retained_v2_or_history(wh, sql, database_url, r
         await wh.worker.run_once()
     await wh.database.dispose()
     result = migrate(database_url, "downgrade", "0003_website_canary", expected=1)
-    assert "Retained Website v2/history prevents downgrade." in result.stderr
+    expected_guard = (
+        "Retained supersede evidence prevents downgrade."
+        if retained_version == 1
+        else "Retained Website v2/history prevents downgrade."
+    )
+    assert expected_guard in result.stderr
     assert await wh.database.ready()
 
 

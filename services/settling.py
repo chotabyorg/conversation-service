@@ -133,7 +133,7 @@ async def _create_turn(
         "input_last_sequence": last.sequence,
         "context_last_sequence": last.sequence,
         "input_revision": last.input_revision,
-        "settling_revision": last.settling_revision or 0,
+        "settling_revision": conversation.settling_revision,
         "authority_revision": conversation.authority_revision,
         "message_ids": [str(message.id) for message in selected],
         "policy_version": first.settling_policy_version,
@@ -143,7 +143,7 @@ async def _create_turn(
         creation_fingerprint=fingerprint(boundaries),
         input_first_sequence=first.sequence, input_last_sequence=last.sequence,
         context_last_sequence=last.sequence, input_revision=last.input_revision,
-        settling_revision=last.settling_revision or 0,
+        settling_revision=conversation.settling_revision,
         authority_revision=conversation.authority_revision, status="PENDING", claim_epoch=0,
         operation_refs=[], created_at=clock,
     )

@@ -115,11 +115,11 @@ async def admit(database: Database, principal: Principal, request: AdmissionRequ
                 event_id, canonical_id = uuid4(), uuid4()
                 conversation.last_message_sequence += 1
                 conversation.input_revision += 1
+                # Input freshness fences previous drafts even in immediate mode.
+                conversation.settling_revision += 1
                 policy = settings.settling_policy_for(
                     Channel.WEBSITE_WIDGET, request.integration_id
                 )
-                if policy is not None:
-                    conversation.settling_revision += 1
                 conversation.updated_at = clock
                 event = InboundEvent(
                     id=event_id, conversation_id=conversation.id, owner_id=request.owner_id,

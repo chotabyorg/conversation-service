@@ -78,6 +78,42 @@ is STALE_CLAIM; changed status/result is TERMINAL_RESULT_CONFLICT. This acknowle
 an already committed result and gives no active work ownership. Terminal cannot
 be reclaimed. No token/digest appears in reads or finish/fail output/logging.
 
+## Durable settling and input ownership
+
+Admission samples one PostgreSQL acceptance timestamp and stores the selected
+policy version, quiet window, max wait, and monotonic settling revision on the
+canonical Message. The policy is resolved from a channel default plus an optional
+integration override; later config changes affect only new admissions. The first
+unassigned policy-bound Message anchors `max_deadline = accepted_at + max_wait`.
+Each following adjacent canonical inbound Message with the same snapshot and
+arriving strictly before the current deadline resets quiet to
+`min(accepted_at + quiet_window, max_deadline)`. The burst becomes eligible when
+the database clock reaches the deadline. Selection is capped at 256 Messages per
+Turn; messages at or beyond the cutoff remain for later selection.
+
+`turn_input_messages` durably maps every selected Message to its immutable Turn,
+sequence, and ordinal. Candidate selection takes the Conversation lock, rechecks
+the active-Turn slot, reads unassigned inbound rows in canonical order, freezes
+context through the selected last Message, and writes the Turn and all assignments
+in one transaction. Restart reconstructs deadlines from retained Message
+timestamps; there is no timer authority outside PostgreSQL. Messages with no
+policy snapshot retain immediate one-message selection. They are never silently
+folded into a policy-bound burst. The scheduler orders work by the oldest
+policy-bound Message and revalidates each Conversation under
+`FOR UPDATE SKIP LOCKED`; skipped/locked or ineligible rows do not block later
+Conversations in the same scheduler pass.
+
+Every new canonical customer inbound increments the Conversation settling
+revision, including immediate-mode inputs. Before a
+provider dispatch, the adapter locks Conversation then Turn and compares the
+revision captured when the Turn was frozen with the current revision, alongside current AGENT
+control and authority revision. The transaction commits either a single
+`DISPATCH_REQUESTED` send permission or terminal `SUPERSEDED` evidence; concurrent
+inbound takes the same Conversation lock, so both outcomes cannot win. A
+superseded draft retains its completed Turn and operation references. Its delivery
+is terminal and cannot be retried. An ambiguous already-started provider write
+remains `UNKNOWN` and is never blindly reissued.
+
 ## Control authority
 
 AGENT, HUMAN_PENDING and HUMAN are persisted skeleton states, without handoff UI
@@ -105,7 +141,8 @@ state/milestones/revision/evidence row commit atomically under locks.
 
 | From | Allowed different new states |
 | --- | --- |
-| GENERATED | DISPATCH_REQUESTED |
+| GENERATED | DISPATCH_REQUESTED, SUPERSEDED |
+| SUPERSEDED | No different target |
 | DISPATCH_REQUESTED | PROVIDER_ACCEPTED, DELIVERED, READ, FAILED, UNKNOWN, PARTIAL, INTERRUPTED |
 | PROVIDER_ACCEPTED | DELIVERED, READ, FAILED, UNKNOWN, PARTIAL, INTERRUPTED |
 | UNKNOWN | PROVIDER_ACCEPTED, DELIVERED, READ, FAILED, PARTIAL, INTERRUPTED |
@@ -132,9 +169,10 @@ omitted/null update keeps existing known reference. Positive current state clear
 safe error_code; prior negative evidence remains in reconciliation history.
 
 Website promotion follows the [explicit write policy](history-projection.md).
-Future provider adapters/retries, other outbound promotion, input freshness,
-supersede, settling and managed business safety require separate contracts. Goal 1
-retains evidence for them without implementing them.
+Goal5 settling/supersede and dispatch fencing are implemented for the existing
+managed Telegram and Website workers; other provider adapters must use the shared
+coordinator before adopting these semantics. Business-operation safety remains
+with Business Runtime.
 
 ## Managed processing uncertainty
 

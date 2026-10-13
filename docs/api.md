@@ -13,7 +13,7 @@ gateway change or provider send. The managed executor is described in
 | GET `/conversations/{id}` | UUID | ConversationRead through granted scope |
 | GET `/conversations/{id}/messages` | after_sequence integer 0..BIGINT_MAX default0; limit1..100 default50 | MessagePage, ascending sequence; next_after_sequence is last returned when another row exists, otherwise null; validates scope even for empty page |
 | GET `/messages/{id}` | UUID | MessageRead through granted parent |
-| POST `/conversations/{id}/turns` | selection_key UUID, input_first_sequence, input_last_sequence, expected_input_revision, expected_authority_revision | TurnResult; new 201, same-key exact selection replay 200 even after history/control/terminal change; changed payload TURN_SELECTION_CONFLICT |
+| POST `/conversations/{id}/turns` | selection_key UUID, input_first_sequence, input_last_sequence, expected_input_revision, expected_authority_revision | TurnResult; new 201, same-key exact selection replay 200 even after history/control/terminal change; changed payload TURN_SELECTION_CONFLICT; policy-bound inbound requires the settling coordinator (`SETTLING_REQUIRED`) |
 | GET `/turns/{id}` | UUID | TurnRead without claim secret/digest/fingerprints |
 | POST `/turns/{id}/claim` | worker_ref, lease_seconds1..300 | TurnClaimResult with raw claim_token only here; 200. Not idempotent: lost response recovers same Turn after lease expiry |
 | POST `/turns/{id}/renew` | claim_epoch, claim_token, lease_seconds | TurnRead; live winning proof extends expiry without changing epoch/token; no secret echo |
@@ -31,7 +31,7 @@ Message edit or generic outbound append exists. Website response completion adds
 canonical assistant history only under the [explicit write policy](history-projection.md).
 
 `GET /health` returns `{status:"ok",service:"conversation-service"}`.
-`GET /ready` returns ready200 only when DB query, migration `0005_telegram_canary` and
+`GET /ready` returns ready200 only when DB query, migration `0006_turn_settling` and
 required Conversation, Website and Telegram journal queries succeed; otherwise not_ready503. These are the only
 unauthenticated routes. `GET /internal/openapi.json` requires the service header.
 Default `/docs`, `/redoc`, `/openapi.json` are disabled. The fetched schema provides
@@ -61,7 +61,10 @@ otherwise the service generates UUID4 and includes X-Request-ID in the response.
 
 DRAFT_READY requires draft_text; NO_RESPONSE requires null. Input first must not
 exceed last. Reconciliation expected_authority_revision is required exactly for
-DISPATCH_REQUESTED and forbidden otherwise. error_code is allowed only for
+DISPATCH_REQUESTED and forbidden otherwise. Settling evidence is an optional
+paired `expected_settling_revision` / `result_settling_revision`; the latter cannot
+be less than the former. `SUPERSEDED` is terminal communication evidence for a
+stale draft and never authorizes a provider send. error_code is allowed only for
 FAILED/UNKNOWN/PARTIAL/INTERRUPTED. Failure codes are PROCESSING_ERROR, TIMEOUT,
 INVALID_RESULT, EXECUTION_UNKNOWN; delivery errors are PROVIDER_REJECTED, TRANSPORT_ERROR, TIMEOUT,
 INTERRUPTED, UNSPECIFIED. No arbitrary diagnostic error string is accepted.
@@ -89,7 +92,7 @@ it never includes input/context, rejected values, tokens, SQL or exception text.
 | --- | --- |
 | 401 | UNAUTHENTICATED |
 | 404 | NOT_FOUND |
-| 409 | EVENT_CONFLICT, TURN_SELECTION_CONFLICT, ACTIVE_TURN_EXISTS, INPUT_REVISION_CONFLICT, AUTHORITY_REVISION_CONFLICT, CONTROL_MODE_CONFLICT, INVALID_INPUT_BOUNDARY, TURN_TERMINAL, LEASE_HELD, LEASE_EXPIRED, STALE_CLAIM, TERMINAL_RESULT_CONFLICT, NO_DRAFT, DELIVERY_IDENTITY_CONFLICT, DELIVERY_INTENT_EXISTS, DELIVERY_RECONCILIATION_CONFLICT, DELIVERY_REVISION_CONFLICT, INVALID_DELIVERY_TRANSITION, DELIVERY_REFERENCE_CONFLICT |
+| 409 | EVENT_CONFLICT, TURN_SELECTION_CONFLICT, ACTIVE_TURN_EXISTS, INPUT_REVISION_CONFLICT, SETTLING_REQUIRED, AUTHORITY_REVISION_CONFLICT, CONTROL_MODE_CONFLICT, INVALID_INPUT_BOUNDARY, TURN_TERMINAL, LEASE_HELD, LEASE_EXPIRED, STALE_CLAIM, TERMINAL_RESULT_CONFLICT, NO_DRAFT, DELIVERY_IDENTITY_CONFLICT, DELIVERY_INTENT_EXISTS, DELIVERY_RECONCILIATION_CONFLICT, DELIVERY_REVISION_CONFLICT, INVALID_DELIVERY_TRANSITION, DELIVERY_REFERENCE_CONFLICT |
 | 413 | PAYLOAD_TOO_LARGE |
 | 422 | VALIDATION_ERROR |
 | 503 | SERVICE_UNAVAILABLE (bounded DB unavailability/timeout) |
@@ -136,3 +139,27 @@ thread is the decimal private `chat_id`, scoped by the generic tuple
 `(owner_id,integration_id,TELEGRAM,provider_thread_id)`. Group/non-text/anonymous
 messages stay on their preexisting unsupported/legacy path. See
 [Telegram canary](telegram-canary.md) for rollback and send semantics.
+
+## Goal5 durable settling and supersede
+
+`TURN_SETTLING_POLICIES` is optional private configuration. A channel-level policy
+may be overridden by an integration-specific policy. New canonical inbound
+Messages retain the selected policy version and timing values at admission; a
+later configuration change does not rewrite existing deadlines. Policy-bound
+Messages cannot be selected through the immediate create-Turn fallback.
+
+Telegram and Website workers run the shared Conversation-owned scheduler before
+their immediate compatibility path. When a policy window closes, the scheduler
+freezes the original ordered Message IDs in one Turn and retains each assignment
+in `turn_input_messages`. `POST /conversations/{id}/turns` returns
+`SETTLING_REQUIRED` if asked to bypass that selection for policy-bound input.
+
+Before a Telegram or Website provider/socket write, `responses/begin` locks the
+Conversation then the completed Turn and atomically records `DISPATCH_REQUESTED`
+or `SUPERSEDED`. The response includes `send`; false means no new write is
+authorized. Only the first admission mapped to one logical Turn can receive
+`send=true`; replay or another admission in the same selected burst receives
+false. A stale draft retains its Turn and `operation_refs`, and its delivery
+cannot be reopened. An unfinished write is recorded as `UNKNOWN` on retry and is
+never blindly repeated. See [durable turn settling](turn-settling.md) for exact
+deadline, selection, restart, fairness, and issue #18 behavior.

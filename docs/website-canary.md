@@ -69,8 +69,10 @@ bounded failure. A terminal Turn releases FIFO progression to the next Message.
 Goal4A.1 adds [canonical assistant history and frozen v2 windows](history-projection.md).
 New immediate Website Turns freeze a bounded contiguous absolute canonical suffix
 through their selected Message; retained and generic v1 Turns keep the full prefix.
-No grouping, debounce or supersede is introduced. Stable frontend message IDs and
-an independently approved routing gate remain required for activation.
+That describes the pre-Goal5 immediate path. The stacked Goal5 source can apply an
+opt-in durable policy before immediate selection and atomically fence/supersede a
+stale draft; it is not enabled by default. Stable frontend message IDs and an
+independently approved routing gate remain required for activation.
 
 ## Evidence recovery and transport honesty
 

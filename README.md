@@ -125,7 +125,7 @@ Compose binds only `127.0.0.1:55585` (HTTP) and `127.0.0.1:55595` (PostgreSQL),
 using its own internal network rather than the existing microservices network.
 The application image runs as UID 10001 and Compose uses a read-only filesystem.
 Migrations are explicit; startup never substitutes `create_all`. `/ready` succeeds
-only against migration `0005_telegram_canary` and the required table queries. `/health`
+only against migration `0006_turn_settling` and the required table queries. `/health`
 checks process liveness. Both return bounded public status only.
 
 ## Internal authentication
@@ -205,4 +205,6 @@ protected evidence reads while retaining legacy Website traffic unless exact
 configured admission selects it. Production rollout/smoke require independent
 release and runtime verification. Full demo cutover additionally requires stable
 frontend message IDs, independent review of the [history policy](docs/history-projection.md)
-and a separately approved routing gate. Goal4B Telegram and Goal5 settling are outside this change.
+and a separately approved routing gate. Goal4B Telegram and Goal5 settling remain
+unactivated until their independent review and release gates pass. See
+[durable turn settling](docs/turn-settling.md) for Goal5 policy and delivery rules.

@@ -64,26 +64,41 @@ class Database:
                     return False
                 await connection.execute(
                     text(
-                        "SELECT id, last_message_sequence, authority_revision "
+                        "SELECT id, last_message_sequence, authority_revision, settling_revision "
                         "FROM conversations LIMIT 1"
                     )
                 )
                 await connection.execute(text(
+                    "SELECT id,input_revision,settling_revision,settling_policy_version,"
+                    "settling_quiet_window_ms,settling_max_wait_ms FROM messages LIMIT 1"
+                ))
+                await connection.execute(text(
                     "SELECT a.id,t.turn_id,r.id,m.source_agent_turn_id, "
+                    "s.ordinal,v.settling_revision,d.expected_settling_revision, "
+                    "q.expected_settling_revision,q.result_settling_revision, "
                     "v.managed_contract_version,v.managed_context_first_sequence, "
                     "v.managed_projection_agent_id,v.managed_projection_fingerprint "
                     "FROM website_admissions a "
                     "LEFT JOIN website_immediate_turns t ON t.message_id=a.canonical_message_id "
+                    "LEFT JOIN turn_input_messages s ON s.message_id=a.canonical_message_id "
                     "LEFT JOIN website_response_attempts r ON r.admission_id=a.id "
                     "LEFT JOIN agent_turns v ON v.id=t.turn_id "
+                    "LEFT JOIN delivery_attempts d ON d.source_turn_id=v.id "
+                    "LEFT JOIN delivery_reconciliations q ON q.delivery_attempt_id=d.id "
                     "LEFT JOIN messages m ON m.source_agent_turn_id=v.id LIMIT 1"
                 ))
                 await connection.execute(text(
-                    "SELECT a.id,t.turn_id,r.id,m.source_inbound_event_id "
+                    "SELECT a.id,t.turn_id,r.id,m.source_inbound_event_id,s.ordinal, "
+                    "v.settling_revision,d.expected_settling_revision, "
+                    "q.expected_settling_revision,q.result_settling_revision "
                     "FROM telegram_admissions a "
                     "LEFT JOIN telegram_immediate_turns t "
                     "ON t.message_id=a.canonical_message_id "
+                    "LEFT JOIN turn_input_messages s ON s.message_id=a.canonical_message_id "
                     "LEFT JOIN telegram_response_attempts r ON r.admission_id=a.id "
+                    "LEFT JOIN agent_turns v ON v.id=t.turn_id "
+                    "LEFT JOIN delivery_attempts d ON d.source_turn_id=v.id "
+                    "LEFT JOIN delivery_reconciliations q ON q.delivery_attempt_id=d.id "
                     "LEFT JOIN messages m ON m.id=a.canonical_message_id LIMIT 1"
                 ))
                 return True

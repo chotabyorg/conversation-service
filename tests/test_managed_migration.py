@@ -31,6 +31,19 @@ HISTORY_COLUMNS = {
     "source_agent_turn_id", "managed_contract_version", "managed_context_first_sequence",
     "managed_projection_agent_id", "managed_projection_fingerprint",
 }
+SETTLING_COLUMNS = {
+    "settling_revision", "settling_policy_version",
+    "settling_quiet_window_ms", "settling_max_wait_ms",
+    "expected_settling_revision", "fenced_settling_revision", "result_settling_revision",
+}
+PRE_GOAL5_COLUMNS = {
+    table: HISTORY_COLUMNS | (SETTLING_COLUMNS if table in {
+        "conversations", "messages", "agent_turns", "delivery_attempts",
+        "delivery_reconciliations",
+    } else set())
+    for table in TABLES
+}
+PRE_GOAL5_COLUMNS["messages"] = PRE_GOAL5_COLUMNS["messages"] | {"input_revision"}
 
 
 def migrate(database_url, command, revision, expected=0):
@@ -54,8 +67,9 @@ async def rows(sql, exclude=()):
     result = {}
     async with sql.connect() as connection:
         for table in TABLES:
+            excluded = exclude.get(table, set()) if isinstance(exclude, dict) else exclude
             result[table] = [
-                {key: value for key, value in row.items() if key not in exclude}
+                {key: value for key, value in row.items() if key not in excluded}
                 for row in (
                     await connection.execute(text(f"SELECT * FROM {table} ORDER BY id"))
                 ).mappings()
@@ -99,10 +113,12 @@ async def test_populated_goal1_upgrade_preserves_every_journal_claim_fingerprint
     attempt = delivery.json()["attempt"]
     attempt, _ = await h.reconcile(attempt, "DISPATCH_REQUESTED")
     _, unknown = await h.reconcile(attempt, "UNKNOWN", error_code="TIMEOUT")
-    original = await rows(sql)
+    original = await rows(sql, exclude=PRE_GOAL5_COLUMNS)
     # Capture real complete Goal1 values, then downgrade only the emptied designated DB.
     old_rows = {
-        table: [{k: v for k, v in row.items() if k not in MARKERS | HISTORY_COLUMNS}
+        table: [{k: v for k, v in row.items()
+                 if k not in PRE_GOAL5_COLUMNS[table]
+                 and not (table == "agent_turns" and k in MARKERS)}
                 for row in values]
         for table, values in original.items()
     }
@@ -123,7 +139,7 @@ async def test_populated_goal1_upgrade_preserves_every_journal_claim_fingerprint
                     statement = statement.bindparams(bindparam("operation_refs", type_=JSONB))
                 await connection.execute(statement, row)
     migrate(database_url, "upgrade", "head")
-    assert await rows(sql) == original
+    assert await rows(sql, exclude=PRE_GOAL5_COLUMNS) == original
     assert (await h.call("GET", f"/turns/{pending['id']}")).json()["status"] == "PENDING"
     assert (await h.call("GET", f"/turns/{claimed['id']}")).json() == held["turn"]
     replay = await h.call("POST", f"/turns/{completed['id']}/complete", terminal)
