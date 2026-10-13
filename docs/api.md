@@ -31,8 +31,8 @@ Message edit or generic outbound append exists. Website response completion adds
 canonical assistant history only under the [explicit write policy](history-projection.md).
 
 `GET /health` returns `{status:"ok",service:"conversation-service"}`.
-`GET /ready` returns ready200 only when DB query, migration `0004_website_history` and
-required Conversation and Website journal queries succeed; otherwise not_ready503. These are the only
+`GET /ready` returns ready200 only when DB query, migration `0005_telegram_canary` and
+required Conversation, Website and Telegram journal queries succeed; otherwise not_ready503. These are the only
 unauthenticated routes. `GET /internal/openapi.json` requires the service header.
 Default `/docs`, `/redoc`, `/openapi.json` are disabled. The fetched schema provides
 every exact DTO/property and X-Service-Token security requirement.
@@ -112,3 +112,27 @@ FIFO coordination and socket-only evidence. New private routes are POST
 `/internal/v1/processing/turns/{turn_id}/evidence`. They use explicit WEBSITE or
 PROCESSING credentials and exact current bindings. Existing foundation routes and
 managed v1 contracts remain compatible for FULL principals.
+
+## Goal4B narrow Telegram adapter
+
+The private `/internal/v1/telegram/*` POST routes accept only exact TELEGRAM grants
+under namespace `main-chota.telegram.v1`, the configured `{owner_id,
+integration_id, agent_id}` binding, and TELEGRAM or FULL principals. The gateway's
+owner/integration/agent values come from authenticated Control Plane polling.
+Conversation has an independent new-admission integration cohort; both cohorts
+default empty. Keep sticky bindings after rollback so retained MANAGED admissions
+remain addressable.
+
+| Method/path | Request | Response and retry behavior |
+| --- | --- | --- |
+| POST `/telegram/admissions` | trusted identity, private-chat `chat_id`, positive `message_id`, `sender_id`, `bot_id`, nonnegative `update_id`, text, desired_route MANAGED/LEGACY | frozen route/admission ID; MANAGED atomically creates the generic canonical inbound Event/Message; exact replay returns same admission; conflicting immutable payload EVENT_CONFLICT |
+| POST `/telegram/results` | exact trusted and provider identity | PENDING, DRAFT_READY, NO_RESPONSE, FAILED or UNKNOWN retained Turn result; MANAGED replay never calls legacy AI |
+| POST `/telegram/responses/begin` | same identity and stable response_attempt_id | creates one durable DISPATCH_REQUESTED intent before send and returns send=true once; replay returns send=false; an unresolved previous intent becomes UNKNOWN and is never reissued |
+| POST `/telegram/responses/complete` | response_attempt_id and PROVIDER_ACCEPTED with provider_message_id, FAILED/PROVIDER_REJECTED, or UNKNOWN with transport evidence | retains truthful provider status using the existing DeliveryAttempt journal; provider acceptance appends one canonical AGENT Message; no DELIVERED/READ claim |
+
+The provider event key is `b{bot_id}c{chat_id}m{message_id}`; `update_id`,
+sender identity and text are included in the immutable fingerprint. The canonical
+thread is the decimal private `chat_id`, scoped by the generic tuple
+`(owner_id,integration_id,TELEGRAM,provider_thread_id)`. Group/non-text/anonymous
+messages stay on their preexisting unsupported/legacy path. See
+[Telegram canary](telegram-canary.md) for rollback and send semantics.

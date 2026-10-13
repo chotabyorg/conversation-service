@@ -4,7 +4,7 @@ Durable provider-neutral communication journal and processing primitives for Mai
 Chota Platform. PostgreSQL owns accepted inbound events, canonical Messages,
 Conversation identity, stable AgentTurns, delivery evidence and control authority.
 A protected managed executor calls `ai-agent-service` for a claimed Turn. The
-Goal4A Website worker consumes only explicitly admitted, authorized Website work;
+Website and Telegram workers consume only their explicitly admitted channel work;
 Conversation itself sends nothing to a messaging or business provider.
 
 Goal 1 is tracked in [issue #1](https://github.com/chotabyorg/conversation-service/issues/1),
@@ -17,6 +17,8 @@ Goal 2 is tracked in [issue #3](https://github.com/chotabyorg/conversation-servi
 See [managed execution](docs/managed-execution.md) for the independent versioned AI contract,
 one-attempt semantics and private local binding configuration. Goal4A adds the
 separate immediate Website coordinator described in [Website canary](docs/website-canary.md).
+Goal4B adds a channel-isolated Telegram admission and immediate worker described in
+[Telegram canary](docs/telegram-canary.md); its cohort defaults empty.
 
 **Source implementation; production rollout requires separate evidence.** There
 is no public KrakenD route or provider webhook. The manual publisher builds only
@@ -52,8 +54,8 @@ The Conversation row serializes its own mutations; unrelated Conversations can
 progress independently. Unique identity/event/Message indexes and the active-Turn
 partial unique index defend the invariants at PostgreSQL level. `PENDING` and
 `CLAIMED` both occupy the one active logical Turn slot. Generic ingress primitives
-do not schedule work. Goal4A explicitly admitted Website Messages use the durable
-immediate worker; debounce and supersede remain outside this policy.
+do not schedule work. Explicit Website and Telegram admissions use separate durable
+immediate workers; debounce and supersede remain outside these policies.
 
 A claim fences a stable Turn using a monotonically increasing epoch and a random
 256-bit bearer whose SHA-256 digest alone is persisted. Expired recovery rotates
@@ -96,7 +98,8 @@ DATABASE_PASSWORD is local orchestration configuration and is ignored by Setting
 The native application and migration commands below read `.env` in the current
 directory. [Goal4A Website canary](docs/website-canary.md) documents the private admission API,
 separate `python worker.py` process, narrow roles, evidence recovery and rollout
-gates. Empty Website bindings and disabled worker preserve the dark default.
+gates. [Goal4B Telegram canary](docs/telegram-canary.md) documents its exact binding,
+rollback and delivery evidence. Empty cohorts and disabled workers preserve the dark default.
 
 Migrations read only DATABASE_URL, without variable interpolation or
 loading authentication configuration. An exported DATABASE_URL takes precedence,
@@ -106,6 +109,8 @@ including an empty or invalid value, which fails validation instead of falling b
 docker compose up -d postgres
 python -m alembic upgrade head
 python -m uvicorn main:app --host 127.0.0.1 --port 55585 --no-access-log
+# In a separate process, after configuring the private Telegram binding:
+python telegram_worker.py
 ```
 
 Alternatively migrate and run the container using the same isolated database:
@@ -120,7 +125,7 @@ Compose binds only `127.0.0.1:55585` (HTTP) and `127.0.0.1:55595` (PostgreSQL),
 using its own internal network rather than the existing microservices network.
 The application image runs as UID 10001 and Compose uses a read-only filesystem.
 Migrations are explicit; startup never substitutes `create_all`. `/ready` succeeds
-only against migration `0004_website_history` and the required table queries. `/health`
+only against migration `0005_telegram_canary` and the required table queries. `/health`
 checks process liveness. Both return bounded public status only.
 
 ## Internal authentication
@@ -145,7 +150,8 @@ registration API. Future production provisioning requires separate integration
 work. Current CP does not yet implement WHATSAPP despite the reserved generic
 identity value here.
 
-Registry roles are `FULL` (existing default), `WEBSITE` and `PROCESSING`; narrow
+Registry roles are `FULL` (existing default), `WEBSITE`, `PROCESSING`, `TELEGRAM`
+and `TELEGRAM_PROCESSING`; narrow
 roles cannot call foundation/control/execution/OpenAPI routes. Every business/OpenAPI
 request requires exactly one `X-Service-Token`; malformed,
 duplicated, wrong and missing tokens return the same 401. Authentication precedes

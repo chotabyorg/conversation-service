@@ -576,3 +576,103 @@ class WebsiteResponseAttempt(Base):
                         "(outcome IN ('WRITE_COMPLETED','WRITE_FAILED','UNKNOWN') "
                         "AND finished_at IS NOT NULL)", name="ck_website_response_outcome"),
     )
+
+
+class TelegramAdmission(Base):
+    """Sticky Telegram route and atomic link to accepted canonical input."""
+    __tablename__ = "telegram_admissions"
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    owner_id: Mapped[str] = mapped_column(String(255, collation="C"), nullable=False)
+    integration_id: Mapped[UUID] = mapped_column(nullable=False)
+    agent_id: Mapped[UUID] = mapped_column(nullable=False)
+    channel: Mapped[str] = mapped_column(String(32), server_default="TELEGRAM")
+    provider_namespace: Mapped[str] = mapped_column(String(128), nullable=False)
+    provider_event_id: Mapped[str] = mapped_column(String(512, collation="C"), nullable=False)
+    provider_thread_id: Mapped[str] = mapped_column(String(512, collation="C"), nullable=False)
+    update_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    chat_id: Mapped[str] = mapped_column(String(64, collation="C"), nullable=False)
+    message_id: Mapped[str] = mapped_column(String(64, collation="C"), nullable=False)
+    sender_id: Mapped[str] = mapped_column(String(64, collation="C"), nullable=False)
+    bot_id: Mapped[str] = mapped_column(String(64, collation="C"), nullable=False)
+    fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    route: Mapped[str] = mapped_column(String(16), nullable=False)
+    conversation_id: Mapped[UUID | None] = mapped_column()
+    canonical_message_id: Mapped[UUID | None] = mapped_column()
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=sql_text("clock_timestamp()")
+    )
+    __table_args__ = (
+        UniqueConstraint("owner_id", "integration_id", "channel", "provider_namespace",
+                         "provider_event_id", name="uq_telegram_admission_identity"),
+        UniqueConstraint("canonical_message_id", name="uq_telegram_admission_message"),
+        UniqueConstraint("id", "conversation_id", name="uq_telegram_admission_parent"),
+        ForeignKeyConstraint(["conversation_id", "owner_id", "integration_id", "channel"],
+                             ["conversations.id", "conversations.owner_id",
+                              "conversations.integration_id", "conversations.channel"],
+                             ondelete="RESTRICT"),
+        ForeignKeyConstraint(["canonical_message_id", "conversation_id"],
+                             ["messages.id", "messages.conversation_id"], ondelete="RESTRICT"),
+        CheckConstraint(OWNER_BOUNDS, name="ck_telegram_admission_owner"),
+        CheckConstraint("channel='TELEGRAM' AND "
+                        "provider_namespace='main-chota.telegram.v1'",
+                        name="ck_telegram_admission_namespace"),
+        CheckConstraint(digest_check("fingerprint"), name="ck_telegram_admission_fingerprint"),
+        CheckConstraint("char_length(provider_event_id) BETWEEN 1 AND 512 AND "
+                        "octet_length(provider_event_id) <= 512",
+                        name="ck_telegram_admission_event_bounds"),
+        CheckConstraint("char_length(provider_thread_id) BETWEEN 1 AND 512 AND "
+                        "octet_length(provider_thread_id) <= 512",
+                        name="ck_telegram_admission_thread_bounds"),
+        CheckConstraint("update_id >= 0", name="ck_telegram_admission_update_id"),
+        CheckConstraint("chat_id ~ '^[1-9][0-9]{0,18}$' AND "
+                        "message_id ~ '^[1-9][0-9]{0,18}$' AND "
+                        "sender_id ~ '^[1-9][0-9]{0,18}$' AND "
+                        "bot_id ~ '^[1-9][0-9]{0,18}$'",
+                        name="ck_telegram_admission_provider_ids"),
+        CheckConstraint("(route='LEGACY' AND conversation_id IS NULL "
+                        "AND canonical_message_id IS NULL) OR (route='MANAGED' "
+                        "AND conversation_id IS NOT NULL AND canonical_message_id IS NOT NULL)",
+                        name="ck_telegram_admission_route"),
+        Index("ix_telegram_admission_processing", "conversation_id"),
+    )
+
+
+class TelegramImmediateTurn(Base):
+    __tablename__ = "telegram_immediate_turns"
+    message_id: Mapped[UUID] = mapped_column(primary_key=True)
+    conversation_id: Mapped[UUID] = mapped_column(nullable=False)
+    turn_id: Mapped[UUID] = mapped_column(nullable=False, unique=True)
+    __table_args__ = (
+        ForeignKeyConstraint(["message_id"], ["telegram_admissions.canonical_message_id"],
+                             ondelete="RESTRICT"),
+        ForeignKeyConstraint(["message_id", "conversation_id"],
+                             ["messages.id", "messages.conversation_id"], ondelete="RESTRICT"),
+        ForeignKeyConstraint(["turn_id", "conversation_id"],
+                             ["agent_turns.id", "agent_turns.conversation_id"],
+                             ondelete="RESTRICT"),
+    )
+
+
+class TelegramResponseAttempt(Base):
+    """At most one Telegram provider write per logical managed draft."""
+    __tablename__ = "telegram_response_attempts"
+    id: Mapped[UUID] = mapped_column(primary_key=True)
+    admission_id: Mapped[UUID] = mapped_column(nullable=False)
+    delivery_id: Mapped[UUID] = mapped_column(nullable=False)
+    conversation_id: Mapped[UUID] = mapped_column(nullable=False)
+    outcome: Mapped[str | None] = mapped_column(String(32))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=sql_text("clock_timestamp()")
+    )
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    __table_args__ = (
+        ForeignKeyConstraint(["admission_id", "conversation_id"],
+                             ["telegram_admissions.id", "telegram_admissions.conversation_id"],
+                             ondelete="RESTRICT"),
+        ForeignKeyConstraint(["delivery_id", "conversation_id"],
+                             ["delivery_attempts.id", "delivery_attempts.conversation_id"],
+                             ondelete="RESTRICT"),
+        CheckConstraint("(outcome IS NULL AND finished_at IS NULL) OR "
+                        "(outcome IN ('PROVIDER_ACCEPTED','FAILED','UNKNOWN') "
+                        "AND finished_at IS NOT NULL)", name="ck_telegram_response_outcome"),
+    )

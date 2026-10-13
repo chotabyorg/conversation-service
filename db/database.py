@@ -50,7 +50,7 @@ class Database:
     async def dispose(self) -> None:
         await self.engine.dispose()
 
-    async def ready(self, expected_revision: str = "0004_website_history") -> bool:
+    async def ready(self, expected_revision: str = "0005_telegram_canary") -> bool:
         try:
             async with self.engine.connect() as connection:
                 if await connection.scalar(text("SELECT 1")) != 1:
@@ -77,6 +77,14 @@ class Database:
                     "LEFT JOIN website_response_attempts r ON r.admission_id=a.id "
                     "LEFT JOIN agent_turns v ON v.id=t.turn_id "
                     "LEFT JOIN messages m ON m.source_agent_turn_id=v.id LIMIT 1"
+                ))
+                await connection.execute(text(
+                    "SELECT a.id,t.turn_id,r.id,m.source_inbound_event_id "
+                    "FROM telegram_admissions a "
+                    "LEFT JOIN telegram_immediate_turns t "
+                    "ON t.message_id=a.canonical_message_id "
+                    "LEFT JOIN telegram_response_attempts r ON r.admission_id=a.id "
+                    "LEFT JOIN messages m ON m.id=a.canonical_message_id LIMIT 1"
                 ))
                 return True
         except (SQLAlchemyError, OSError, TimeoutError):

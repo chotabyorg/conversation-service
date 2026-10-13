@@ -79,8 +79,21 @@ class BoundaryMiddleware:
                 website_paths = {"/internal/v1/website/admissions", "/internal/v1/website/results",
                                  "/internal/v1/website/responses/begin",
                                  "/internal/v1/website/responses/complete"}
+                telegram_paths = {
+                    "/internal/v1/telegram/admissions",
+                    "/internal/v1/telegram/results",
+                    "/internal/v1/telegram/responses/begin",
+                    "/internal/v1/telegram/responses/complete",
+                }
                 if principal.role == "WEBSITE" and (path not in website_paths
                                                       or scope["method"] != "POST"):
+                    await reject(ErrorCode.NOT_FOUND)
+                    return
+                if principal.role == "TELEGRAM" and (path not in telegram_paths
+                                                       or scope["method"] != "POST"):
+                    await reject(ErrorCode.NOT_FOUND)
+                    return
+                if principal.role == "TELEGRAM_PROCESSING":
                     await reject(ErrorCode.NOT_FOUND)
                     return
                 if principal.role == "PROCESSING" and (not path.startswith(
