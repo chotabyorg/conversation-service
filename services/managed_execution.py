@@ -13,7 +13,14 @@ from core.config import ManagedBinding, Settings
 from core.errors import DomainError
 from core.logging import logger
 from db.database import Database
-from models import AgentTurn, Conversation, WebsiteAdmission, WebsiteImmediateTurn
+from models import (
+    AgentTurn,
+    Conversation,
+    TelegramAdmission,
+    TelegramImmediateTurn,
+    WebsiteAdmission,
+    WebsiteImmediateTurn,
+)
 from schemas.contracts import (
     Channel,
     ErrorCode,
@@ -61,7 +68,25 @@ class RecoverMarked:
     """No request preparation/binding/network is needed for durable uncertainty."""
 
 
-async def validate_website_agent(session: AsyncSession, turn: AgentTurn, agent_id: UUID) -> None:
+async def validate_website_agent(
+    session: AsyncSession, turn: AgentTurn, agent_id: UUID, conversation_channel: str
+) -> None:
+    if conversation_channel == Channel.TELEGRAM.value:
+        # Telegram v1 turns predate the Telegram admission model. Preserve their
+        # established path while binding every new immediate v2 turn to its
+        # durable Telegram admission before dispatch and again before commit.
+        if turn.managed_contract_version != 2:
+            return
+        admission_agent = await session.scalar(select(TelegramAdmission.agent_id).join(
+            TelegramImmediateTurn,
+            TelegramImmediateTurn.message_id == TelegramAdmission.canonical_message_id,
+        ).where(TelegramImmediateTurn.turn_id == turn.id,
+                TelegramImmediateTurn.conversation_id == turn.conversation_id,
+                TelegramAdmission.conversation_id == turn.conversation_id,
+                TelegramAdmission.route == "MANAGED"))
+        if (admission_agent != agent_id or turn.managed_projection_agent_id != agent_id):
+            raise DomainError(ErrorCode.VALIDATION_ERROR)
+        return
     admission_agent = await session.scalar(select(WebsiteAdmission.agent_id).join(
         WebsiteImmediateTurn,
         WebsiteImmediateTurn.message_id == WebsiteAdmission.canonical_message_id,
@@ -110,7 +135,7 @@ async def take_snapshot(
         )
         if binding is None or settings.managed_ai_base_url is None:
             raise DomainError(ErrorCode.SERVICE_UNAVAILABLE)
-        await validate_website_agent(session, turn, binding.agent_id)
+        await validate_website_agent(session, turn, binding.agent_id, conversation.channel)
         messages = await canonical_window(session, conversation.id,
             turn.managed_context_first_sequence, turn.context_last_sequence)
         snapshot = Snapshot(TurnRead.model_validate(turn), *scope, binding, messages,
@@ -168,7 +193,9 @@ async def mark_dispatch(
         conversation = await session.get(Conversation, turn.conversation_id)
         if conversation is None:
             raise DomainError(ErrorCode.NOT_FOUND)
-        await validate_website_agent(session, turn, prepared.request.agent_id)
+        await validate_website_agent(
+            session, turn, prepared.request.agent_id, conversation.channel
+        )
         messages = await canonical_window(session, conversation.id,
             turn.managed_context_first_sequence, turn.context_last_sequence)
         try:

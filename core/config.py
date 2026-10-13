@@ -36,7 +36,7 @@ ServiceToken = Annotated[SecretStr, BeforeValidator(validate_service_token)]
 class AuthPrincipal(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
     principal_id: WorkerRef
-    role: Literal["FULL", "WEBSITE", "PROCESSING"] = "FULL"
+    role: Literal["FULL", "WEBSITE", "PROCESSING", "TELEGRAM", "TELEGRAM_PROCESSING"] = "FULL"
     token: ServiceToken = Field(repr=False)
     grants: tuple[ScopeGrant, ...] = Field(min_length=1, max_length=64, repr=False)
 
@@ -153,6 +153,38 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("WEBSITE_WORKER_HEALTH_PORT", "website_worker_health_port"),
     )
 
+    telegram_cohort_integration_ids: Annotated[tuple[UUID, ...], NoDecode] = Field(
+        default=(), alias="TELEGRAM_CANARY_INTEGRATION_IDS",
+        validation_alias=AliasChoices("TELEGRAM_CANARY_INTEGRATION_IDS",
+                                     "telegram_cohort_integration_ids"),
+        max_length=64,
+    )
+    telegram_worker_enabled: bool = Field(
+        default=False, alias="TELEGRAM_WORKER_ENABLED",
+        validation_alias=AliasChoices("TELEGRAM_WORKER_ENABLED", "telegram_worker_enabled"),
+    )
+    telegram_worker_principal_id: WorkerRef | None = Field(
+        default=None, alias="TELEGRAM_WORKER_PRINCIPAL_ID",
+        validation_alias=AliasChoices("TELEGRAM_WORKER_PRINCIPAL_ID",
+                                     "telegram_worker_principal_id"),
+    )
+    telegram_worker_lease_seconds: int = Field(
+        default=30, ge=5, le=300, alias="TELEGRAM_WORKER_LEASE_SECONDS",
+        validation_alias=AliasChoices("TELEGRAM_WORKER_LEASE_SECONDS",
+                                     "telegram_worker_lease_seconds"),
+    )
+    telegram_worker_poll_seconds: float = Field(
+        default=1.0, ge=0.1, le=10, allow_inf_nan=False,
+        alias="TELEGRAM_WORKER_POLL_SECONDS",
+        validation_alias=AliasChoices("TELEGRAM_WORKER_POLL_SECONDS",
+                                     "telegram_worker_poll_seconds"),
+    )
+    telegram_worker_health_port: int = Field(
+        default=8002, ge=1, le=65535, alias="TELEGRAM_WORKER_HEALTH_PORT",
+        validation_alias=AliasChoices("TELEGRAM_WORKER_HEALTH_PORT",
+                                     "telegram_worker_health_port"),
+    )
+
     @field_validator(
         "managed_ai_connect_seconds", "managed_ai_write_seconds", "managed_ai_read_seconds",
         "managed_ai_pool_seconds", "managed_ai_total_seconds", mode="before",
@@ -198,6 +230,18 @@ class Settings(BaseSettings):
                 raise ValueError("invalid managed AI configuration") from None
         return value
 
+    @field_validator("telegram_cohort_integration_ids", mode="before")
+    @classmethod
+    def parse_telegram_cohort(cls, value: object) -> object:
+        if isinstance(value, str):
+            if len(value) > 65536:
+                raise ValueError("invalid Telegram configuration")
+            try:
+                return json.loads(value)
+            except (ValueError, TypeError):
+                raise ValueError("invalid Telegram configuration") from None
+        return value
+
     @field_validator("database_url")
     @classmethod
     def database_is_postgres(cls, value: SecretStr) -> SecretStr:
@@ -233,6 +277,27 @@ class Settings(BaseSettings):
         if any(entry.service_token.get_secret_value() in tokens
                for entry in self.managed_ai_bindings):
             raise ValueError("invalid managed AI configuration")
+        telegram_bindings = [b for b in self.managed_ai_bindings
+                             if b.channel == Channel.TELEGRAM]
+        telegram_ids = [str(b.integration_id) for b in telegram_bindings]
+        cohort_ids = [str(i) for i in self.telegram_cohort_integration_ids]
+        if (len(set(cohort_ids)) != len(cohort_ids)
+                or any(i not in telegram_ids for i in cohort_ids)):
+            raise ValueError("invalid Telegram configuration")
+        if self.telegram_worker_enabled:
+            principal = next((entry for entry in self.auth_principals
+                              if entry.principal_id == self.telegram_worker_principal_id), None)
+            if (principal is None or principal.role not in
+                    {"FULL", "PROCESSING", "TELEGRAM_PROCESSING"}
+                    or not telegram_bindings or self.managed_ai_base_url is None):
+                raise ValueError("invalid Telegram worker configuration")
+            for binding in telegram_bindings:
+                if not any(g.owner_id == binding.owner_id
+                           and g.integration_id == binding.integration_id
+                           and g.channel == Channel.TELEGRAM
+                           and g.provider_namespace == "main-chota.telegram.v1"
+                           for g in principal.grants):
+                    raise ValueError("invalid Telegram worker configuration")
         identities = [(entry.owner_id, entry.integration_id) for entry in self.website_bindings]
         if len(set(identities)) != len(identities):
             raise ValueError("invalid website configuration")

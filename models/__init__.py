@@ -5,6 +5,9 @@ from models.entities import (
     DeliveryReconciliation,
     InboundEvent,
     Message,
+    TelegramAdmission,
+    TelegramImmediateTurn,
+    TelegramResponseAttempt,
     WebsiteAdmission,
     WebsiteImmediateTurn,
     WebsiteResponseAttempt,
@@ -20,4 +23,7 @@ __all__ = [
     "WebsiteAdmission",
     "WebsiteImmediateTurn",
     "WebsiteResponseAttempt",
+    "TelegramAdmission",
+    "TelegramImmediateTurn",
+    "TelegramResponseAttempt",
 ]

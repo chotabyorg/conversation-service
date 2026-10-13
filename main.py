@@ -9,6 +9,7 @@ from api.handlers import install_error_handlers
 from api.health import router as health_router
 from api.internal import router as internal_router
 from api.middleware import BoundaryMiddleware
+from api.telegram import router as telegram_router
 from api.website import operations as processing_router
 from api.website import router as website_router
 from core.config import Settings, load_settings
@@ -58,6 +59,7 @@ def create_app(
     install_error_handlers(application)
     application.include_router(health_router)
     application.include_router(internal_router)
+    application.include_router(telegram_router)
     application.include_router(website_router)
     application.include_router(processing_router)
     return application
