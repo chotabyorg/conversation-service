@@ -402,79 +402,100 @@ async def select_immediate(database: Database, principal: Principal,
                 exists(select(AgentTurn.id).where(
                     AgentTurn.conversation_id == Conversation.id,
                     AgentTurn.status.in_(("PENDING", "CLAIMED")))))).distinct()
-    ids = (await _candidate_ids(database, candidate, principal))
-    for conversation_id in ids:
-        async with database.session_factory() as session, session.begin():
-            conversation = await authorized_conversation(session, principal, conversation_id,
-                                                         lock=True)
-            if conversation.control_mode != "AGENT":
-                continue
-            clock = await db_clock(session)
-            active = await session.scalar(select(AgentTurn).where(
-                AgentTurn.conversation_id == conversation_id,
-                AgentTurn.status.in_(("PENDING", "CLAIMED")),
-            ).with_for_update())
-            if active is not None:
-                is_telegram = await session.scalar(select(TelegramImmediateTurn.turn_id).where(
-                    TelegramImmediateTurn.turn_id == active.id))
-                if is_telegram is None:
-                    continue
-                if active.status == "CLAIMED" and active.lease_expires_at is not None \
-                        and active.lease_expires_at > clock:
-                    continue
-                return active.id
-            message = await session.scalar(select(Message).join(
-                TelegramAdmissionRow,
-                TelegramAdmissionRow.canonical_message_id == Message.id,
-            ).where(Message.conversation_id == conversation_id,
-                    TelegramAdmissionRow.route == "MANAGED", scopes,
-                    Message.actor == "CUSTOMER", Message.direction == "INBOUND",
-                    ~exists(select(TelegramImmediateTurn.message_id).where(
-                        TelegramImmediateTurn.message_id == Message.id)))
-                .order_by(Message.sequence).limit(1).with_for_update())
-            if message is None:
-                continue
-            agent_id = await session.scalar(select(TelegramAdmissionRow.agent_id).where(
-                TelegramAdmissionRow.canonical_message_id == message.id,
-                TelegramAdmissionRow.conversation_id == conversation_id,
-            ))
-            if agent_id is None:
-                raise DomainError(ErrorCode.NOT_FOUND)
-            turn = AgentTurn(
-                id=uuid4(), conversation_id=conversation_id, selection_key=message.id,
-                creation_fingerprint=fingerprint({
-                    "contract_version": 1, "conversation_id": str(conversation_id),
-                    "selection_key": str(message.id),
-                    "input_first_sequence": message.sequence,
-                    "input_last_sequence": message.sequence,
-                    "context_last_sequence": message.sequence,
-                    "expected_input_revision": conversation.input_revision,
-                    "expected_authority_revision": conversation.authority_revision,
-                }),
-                input_first_sequence=message.sequence, input_last_sequence=message.sequence,
-                context_last_sequence=message.sequence,
-                input_revision=conversation.input_revision,
-                authority_revision=conversation.authority_revision,
-                status="PENDING", claim_epoch=0, operation_refs=[], created_at=clock,
-            )
-            # This is the same bounded, immutable v2 projection used by the
-            # existing immediate Website coordinator; Telegram adds no scheduler.
-            from services.history_projection import freeze_website_projection
-            await freeze_website_projection(session, conversation, turn, agent_id)
-            session.add(turn)
-            await session.flush()
-            session.add(TelegramImmediateTurn(message_id=message.id,
-                                               conversation_id=conversation_id, turn_id=turn.id))
-            await session.flush()
-            return turn.id
-    return None
+    last_candidate_id: UUID | None = None
+    while True:
+        ids = await _candidate_ids(database, candidate, principal, last_candidate_id)
+        if not ids:
+            return None
+        for conversation_id in ids:
+            turn_id = await _select_candidate(database, principal, conversation_id, scopes)
+            if turn_id is not None:
+                return turn_id
+        # Scan position is local to this poll. It advances past skipped rows and
+        # resets on the next poll; it is not persistent fairness or scheduling state.
+        last_candidate_id = ids[-1]
+
+
+async def _select_candidate(database: Database, principal: Principal,
+                            conversation_id: UUID,
+                            scopes: ColumnElement[bool]) -> UUID | None:
+    async with database.session_factory() as session, session.begin():
+        # Candidate membership is only a hint. Revalidate every decision after
+        # acquiring the Conversation lock.
+        conversation = await authorized_conversation(session, principal, conversation_id,
+                                                     lock=True)
+        if conversation.control_mode != "AGENT":
+            return None
+        clock = await db_clock(session)
+        active = await session.scalar(select(AgentTurn).where(
+            AgentTurn.conversation_id == conversation_id,
+            AgentTurn.status.in_(("PENDING", "CLAIMED")),
+        ).with_for_update())
+        if active is not None:
+            is_telegram = await session.scalar(select(TelegramImmediateTurn.turn_id).where(
+                TelegramImmediateTurn.turn_id == active.id))
+            if is_telegram is None:
+                return None
+            if (active.status == "CLAIMED" and active.lease_expires_at is not None
+                    and active.lease_expires_at > clock):
+                return None
+            return active.id
+        message = await session.scalar(select(Message).join(
+            TelegramAdmissionRow,
+            TelegramAdmissionRow.canonical_message_id == Message.id,
+        ).where(Message.conversation_id == conversation_id,
+                TelegramAdmissionRow.route == "MANAGED", scopes,
+                Message.actor == "CUSTOMER", Message.direction == "INBOUND",
+                ~exists(select(TelegramImmediateTurn.message_id).where(
+                    TelegramImmediateTurn.message_id == Message.id)))
+            .order_by(Message.sequence).limit(1).with_for_update())
+        if message is None:
+            return None
+        agent_id = await session.scalar(select(TelegramAdmissionRow.agent_id).where(
+            TelegramAdmissionRow.canonical_message_id == message.id,
+            TelegramAdmissionRow.conversation_id == conversation_id,
+        ))
+        if agent_id is None:
+            raise DomainError(ErrorCode.NOT_FOUND)
+        turn = AgentTurn(
+            id=uuid4(), conversation_id=conversation_id, selection_key=message.id,
+            creation_fingerprint=fingerprint({
+                "contract_version": 1, "conversation_id": str(conversation_id),
+                "selection_key": str(message.id),
+                "input_first_sequence": message.sequence,
+                "input_last_sequence": message.sequence,
+                "context_last_sequence": message.sequence,
+                "expected_input_revision": conversation.input_revision,
+                "expected_authority_revision": conversation.authority_revision,
+            }),
+            input_first_sequence=message.sequence, input_last_sequence=message.sequence,
+            context_last_sequence=message.sequence,
+            input_revision=conversation.input_revision,
+            authority_revision=conversation.authority_revision,
+            status="PENDING", claim_epoch=0, operation_refs=[], created_at=clock,
+        )
+        # This is the same bounded, immutable v2 projection used by the
+        # existing immediate Website coordinator; Telegram adds no scheduler.
+        from services.history_projection import freeze_website_projection
+        await freeze_website_projection(session, conversation, turn, agent_id)
+        session.add(turn)
+        await session.flush()
+        session.add(TelegramImmediateTurn(message_id=message.id,
+                                           conversation_id=conversation_id, turn_id=turn.id))
+        await session.flush()
+        return turn.id
 
 
 async def _candidate_ids(database: Database, candidate: Select[tuple[UUID]],
-                         principal: Principal) -> list[UUID]:
-    # Candidate rows are only a short scan; every mutation/selection is repeated
-    # under the Conversation lock by select_immediate.
+                         principal: Principal,
+                         after_id: UUID | None = None) -> list[UUID]:
+    # UUID cursor is bounded scan progress for one poll only. The row lock in
+    # _select_candidate remains the authority for every selection and mutation.
     from services.common import scope_filter
+    page = candidate.where(scope_filter(principal))
+    if after_id is not None:
+        page = page.where(Conversation.id > after_id)
     async with database.session_factory() as session, session.begin():
-        return list((await session.scalars(candidate.where(scope_filter(principal))
-                                           .order_by(Conversation.id).limit(100))).all())
+        return list((await session.scalars(
+            page.order_by(Conversation.id).limit(100)
+        )).all())

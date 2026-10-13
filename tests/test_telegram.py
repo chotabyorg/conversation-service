@@ -3,16 +3,21 @@
 from __future__ import annotations
 
 import secrets
+from datetime import timedelta
+from hashlib import sha256
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import httpx
 import pytest
 import pytest_asyncio
 from asgi_lifespan import LifespanManager
-from sqlalchemy import text
+from sqlalchemy import func, select, text
 
+import services.telegram as telegram_service
+from models import AgentTurn, Conversation, TelegramAdmission, TelegramImmediateTurn
 from schemas.managed import ManagedTurnResult, PreparedManagedRequest
+from services.common import fingerprint
 from services.managed_client import ManagedAIPort
 from services.telegram import expected_response_attempt_id
 
@@ -95,17 +100,17 @@ async def telegram_harness(database_url: str):
 
 
 def inbound(*, message_id: int = 7, text_value: str = "hello", update_id: int = 55,
-            desired_route: str = "MANAGED") -> dict[str, object]:
+            desired_route: str = "MANAGED", chat_id: int = 123) -> dict[str, object]:
     return {
         "owner_id": OWNER,
         "integration_id": str(INTEGRATION),
         "agent_id": str(AGENT),
-        "provider_thread_id": "123",
-        "provider_event_id": f"b999c123m{message_id}",
+        "provider_thread_id": str(chat_id),
+        "provider_event_id": f"b999c{chat_id}m{message_id}",
         "update_id": update_id,
-        "chat_id": 123,
+        "chat_id": chat_id,
         "message_id": message_id,
-        "sender_id": 123,
+        "sender_id": chat_id,
         "bot_id": 999,
         "text": text_value,
         "desired_route": desired_route,
@@ -116,6 +121,173 @@ async def admit(client: httpx.AsyncClient, headers: dict[str, str], **changes: A
     response = await client.post("/internal/v1/telegram/admissions",
                                  json=inbound(**changes), headers=headers)
     return response
+
+
+async def _admit_distinct_private_chats(h: dict[str, Any], count: int, *, base: int):
+    admission_ids = []
+    for index in range(count):
+        response = await admit(
+            h["client"], h["gateway_headers"], message_id=1_000 + base + index,
+            update_id=2_000 + base + index, chat_id=10_000 + base + index,
+        )
+        assert response.status_code == 200, response.text
+        admission_ids.append(response.json()["admission_id"])
+
+    async with h["database"].session_factory() as session:
+        rows = (await session.execute(
+            select(Conversation.id, TelegramAdmission.canonical_message_id)
+            .join(TelegramAdmission,
+                  TelegramAdmission.conversation_id == Conversation.id)
+            .where(TelegramAdmission.id.in_(admission_ids))
+            .order_by(Conversation.id)
+        )).all()
+    assert len(rows) == count
+    return [(row.id, row.canonical_message_id) for row in rows]
+
+
+async def _seed_active_telegram_leases(h: dict[str, Any], rows) -> None:
+    async with h["database"].session_factory() as session, session.begin():
+        now = await session.scalar(select(func.clock_timestamp()))
+        assert now is not None
+        for index, (conversation_id, message_id) in enumerate(rows):
+            turn_id = uuid4()
+            session.add(AgentTurn(
+                id=turn_id,
+                conversation_id=conversation_id,
+                selection_key=message_id,
+                creation_fingerprint=fingerprint({"fixture_turn": str(turn_id)}),
+                input_first_sequence=1,
+                input_last_sequence=1,
+                context_last_sequence=1,
+                input_revision=1,
+                authority_revision=0,
+                status="CLAIMED",
+                claim_epoch=1,
+                claim_token_digest=sha256(f"active-lease-{index}".encode()).hexdigest(),
+                worker_ref="active-test-worker",
+                lease_expires_at=now + timedelta(hours=1),
+                started_at=now,
+                operation_refs=[],
+            ))
+            session.add(TelegramImmediateTurn(
+                message_id=message_id,
+                conversation_id=conversation_id,
+                turn_id=turn_id,
+            ))
+
+
+def _record_locked_candidates(monkeypatch):
+    locked_ids = []
+    original = telegram_service.authorized_conversation
+
+    async def record(session, principal, conversation_id, *, lock=False):
+        assert lock, "Telegram candidate must be revalidated under the Conversation lock"
+        locked_ids.append(conversation_id)
+        return await original(session, principal, conversation_id, lock=lock)
+
+    monkeypatch.setattr(telegram_service, "authorized_conversation", record)
+    return locked_ids
+
+
+def _telegram_worker_principal(h: dict[str, Any]):
+    return next(
+        entry.principal() for entry in h["settings"].auth_principals
+        if entry.principal_id == "telegram-worker"
+    )
+
+
+@pytest.mark.asyncio
+async def test_candidate_keyset_scan_skips_130_active_leases_and_selects_later_work(
+    telegram_harness, monkeypatch, sql
+) -> None:
+    h = telegram_harness
+    rows = await _admit_distinct_private_chats(h, 131, base=0)
+    blocked_rows, eligible_row = rows[:130], rows[130]
+    await _seed_active_telegram_leases(h, blocked_rows)
+
+    locked_ids = _record_locked_candidates(monkeypatch)
+    principal = _telegram_worker_principal(h)
+    selected = await telegram_service.select_immediate(
+        h["database"], principal, h["settings"]
+    )
+    assert selected is not None
+
+    async with h["database"].session_factory() as session:
+        selected_turn = await session.scalar(
+            select(AgentTurn).where(AgentTurn.id == selected)
+        )
+        assert selected_turn is not None
+        assert selected_turn.conversation_id == eligible_row[0]
+        assert selected_turn.selection_key == eligible_row[1]
+
+        leased_before_repeat = (await session.execute(
+            select(
+                AgentTurn.id,
+                AgentTurn.status,
+                AgentTurn.claim_epoch,
+                AgentTurn.claim_token_digest,
+                AgentTurn.worker_ref,
+                AgentTurn.lease_expires_at,
+            ).where(AgentTurn.conversation_id.in_([row[0] for row in blocked_rows]))
+             .order_by(AgentTurn.id)
+        )).all()
+
+    # The next poll starts at the first UUID again, skips the same active leases,
+    # and returns the existing selected turn instead of creating a duplicate.
+    selected_again = await telegram_service.select_immediate(
+        h["database"], principal, h["settings"]
+    )
+    assert selected_again == selected
+    expected_locked = [row[0] for row in rows]
+    assert locked_ids == expected_locked + expected_locked
+
+    async with h["database"].session_factory() as session:
+        leased_after_repeat = (await session.execute(
+            select(
+                AgentTurn.id,
+                AgentTurn.status,
+                AgentTurn.claim_epoch,
+                AgentTurn.claim_token_digest,
+                AgentTurn.worker_ref,
+                AgentTurn.lease_expires_at,
+            ).where(AgentTurn.conversation_id.in_([row[0] for row in blocked_rows]))
+             .order_by(AgentTurn.id)
+        )).all()
+        turn_count = await session.scalar(
+            select(func.count()).select_from(AgentTurn)
+            .where(AgentTurn.conversation_id == eligible_row[0])
+        )
+        mapping_count = await session.scalar(
+            select(func.count()).select_from(TelegramImmediateTurn)
+            .where(TelegramImmediateTurn.conversation_id == eligible_row[0])
+        )
+
+    assert leased_after_repeat == leased_before_repeat
+    assert turn_count == 1
+    assert mapping_count == 1
+
+
+@pytest.mark.asyncio
+async def test_candidate_keyset_scan_selects_eligible_row_in_mixed_first_page(
+    telegram_harness, monkeypatch, sql
+) -> None:
+    h = telegram_harness
+    rows = await _admit_distinct_private_chats(h, 101, base=10_000)
+    skipped_rows, eligible_row = rows[:60], rows[60]
+    await _seed_active_telegram_leases(h, skipped_rows)
+
+    locked_ids = _record_locked_candidates(monkeypatch)
+    selected = await telegram_service.select_immediate(
+        h["database"], _telegram_worker_principal(h), h["settings"]
+    )
+
+    assert selected is not None
+    assert locked_ids == [row[0] for row in rows[:61]]
+    async with h["database"].session_factory() as session:
+        selected_conversation = await session.scalar(
+            select(AgentTurn.conversation_id).where(AgentTurn.id == selected)
+        )
+        assert selected_conversation == eligible_row[0]
 
 
 @pytest.mark.asyncio
