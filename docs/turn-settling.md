@@ -82,7 +82,10 @@ provider/socket dispatch, the managed adapter acquires locks in this order:
 Within one transaction it checks completed draft identity, current AGENT control,
 unchanged authority revision, and whether any newer policy-bound input advanced
 the settling revision. It writes either `DISPATCH_REQUESTED` and returns
-`send=true`, or terminal `SUPERSEDED` evidence and returns `send=false`. Inbound
+`send=true`, or terminal `SUPERSEDED` evidence and returns `send=false` with the
+`SUPERSEDED` denial reason. Website retries of an existing attempt report
+`DELIVERY_NOT_RETRYABLE` for unresolved/failed transport evidence and may replay
+only a known completed write while the same Turn remains current. Inbound
 admission uses the same Conversation lock, so it serializes on one side of this
 decision. No gateway-local debounce or send permit exists.
 
@@ -114,3 +117,9 @@ Existing worker adapters currently invoke the shared selector for managed
 Telegram and Website. Other channels can adopt it when their Conversation-owned
 worker and managed binding are introduced; no behavior is enabled by this
 checkpoint alone.
+
+Candidate Conversations are enumerated in keyset pages of 100, ordered by the
+oldest pending Message timestamp and Conversation ID. Each candidate is then
+rechecked under its own short transaction. A not-yet-due or invalid candidate
+does not prevent the worker from checking the next page, and the worker keeps
+only one bounded page in memory at a time.

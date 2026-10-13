@@ -170,6 +170,7 @@ async def test_website_settling_batches_messages_and_fences_stale_draft(wh, sql)
     begun = await wh.call("POST", "/website/responses/begin", begin_body)
     assert begun.status_code == 200, begun.text
     assert begun.json()["send"] is False
+    assert begun.json()["denial_reason"] == "SUPERSEDED"
     malicious = await wh.call("POST", "/website/responses/complete",
                               dict(begin_body, outcome="WRITE_COMPLETED"))
     assert malicious.status_code == 409
@@ -369,6 +370,7 @@ async def test_draft_replay_response_attempts_and_late_write_evidence(wh, sql):
         assert (await wh.call("POST", BASE + "/responses/begin", attempt)).json() == dict(
             response_attempt_id=attempt["response_attempt_id"],
             draft_text="retained reply", send=False, replayed=True,
+            denial_reason="DELIVERY_NOT_RETRYABLE",
         )
         finished = dict(attempt, outcome=outcome)
         response = await wh.call("POST", BASE + "/responses/complete", finished)
@@ -385,6 +387,16 @@ async def test_draft_replay_response_attempts_and_late_write_evidence(wh, sql):
                                   changed_body)).json()["replayed"]
         else:
             assert changed_response.status_code == 409
+        retried_begin = await wh.call("POST", BASE + "/responses/begin", attempt)
+        assert retried_begin.status_code == 200
+        assert retried_begin.json() == dict(
+            response_attempt_id=attempt["response_attempt_id"],
+            draft_text="retained reply",
+            send=outcome in {"WRITE_COMPLETED", "UNKNOWN"},
+            replayed=True,
+            denial_reason=(None if outcome in {"WRITE_COMPLETED", "UNKNOWN"}
+                           else "DELIVERY_NOT_RETRYABLE"),
+        )
     assert len(wh.ai.calls) == 3
     async with sql.connect() as conn:
         assert await conn.scalar(text("SELECT count(*) FROM delivery_attempts")) == 3
@@ -395,6 +407,25 @@ async def test_draft_replay_response_attempts_and_late_write_evidence(wh, sql):
         ).all()
         assert rows == [("UNKNOWN", None, None)] * 3
         assert await conn.scalar(text("SELECT count(*) FROM website_response_attempts")) == 3
+
+
+@pytest.mark.asyncio
+async def test_known_success_response_replay_is_fenced_by_later_inbound(wh):
+    value = payload(wh)
+    await admit(wh, value)
+    assert await wh.worker.run_once()
+    attempt = dict(identity(value), response_attempt_id=str(uuid4()))
+    assert (await wh.call("POST", BASE + "/responses/begin", attempt)).json()["send"]
+    assert (await wh.call(
+        "POST", BASE + "/responses/complete", dict(attempt, outcome="WRITE_COMPLETED")
+    )).status_code == 200
+
+    newer = payload(wh, session_id=value["session_id"])
+    await admit(wh, newer)
+    replay = await wh.call("POST", BASE + "/responses/begin", attempt)
+    assert replay.status_code == 200 and replay.json()["send"] is False
+    assert replay.json()["replayed"] is True
+    assert replay.json()["denial_reason"] == "SUPERSEDED"
 
 
 async def test_send_false_attempt_cannot_be_completed_as_a_client_write(wh, sql):
@@ -408,6 +439,7 @@ async def test_send_false_attempt_cannot_be_completed_as_a_client_write(wh, sql)
     replay_attempt = dict(identity(value), response_attempt_id=str(uuid4()))
     replay = await wh.call("POST", BASE + "/responses/begin", replay_attempt)
     assert replay.status_code == 200 and replay.json()["send"] is False
+    assert replay.json()["denial_reason"] == "DELIVERY_NOT_RETRYABLE"
     malicious = await wh.call(
         "POST", BASE + "/responses/complete",
         dict(replay_attempt, outcome="WRITE_COMPLETED"),

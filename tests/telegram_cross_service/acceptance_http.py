@@ -792,6 +792,7 @@ async def test_goal4b_required_local_process_matrix(th, sql) -> None:
     h.peer.managed_entered.clear()
     restart_event = h.update(message_id=3, update_id=102, text_value="gateway restart")
     restart_key = event_key(restart_event)
+    accepted_before_gateway_restart = len(h.peer.accepted_messages)
     h.queue(restart_event)
     await asyncio.wait_for(h.peer.managed_entered.wait(), 12)
     durable = await wait_for_state(h, restart_key,
@@ -801,11 +802,12 @@ async def test_goal4b_required_local_process_matrix(th, sql) -> None:
     h.kill("gateway")
     h.peer.managed_release.set()
     await h.restart("gateway", cohort_enabled=True)
-    await h.peer.wait_for(lambda: len(h.peer.accepted_messages) == 3,
-                          "managed response after Gateway restart")
     restarted_state = await wait_for_state(h, restart_key,
         lambda row: row["delivery_status"] == "PROVIDER_ACCEPTED",
         "retained result after Gateway restart")
+    assert len(h.peer.accepted_messages) > accepted_before_gateway_restart
+    assert any(item.get("provider_message_id") == int(restarted_state["provider_message_id"])
+               for item in h.peer.accepted_messages)
     assert restarted_state["canonical_message_id"] == durable["canonical_message_id"]
     assert restarted_state["turn_id"] == durable["turn_id"]
     EVIDENCE.append({"scenario": 6, "gateway_restart_after_admission": "PASS",

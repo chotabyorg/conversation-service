@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from uuid import UUID, uuid4, uuid5
 
-from sqlalchemy import and_, exists, func, or_, select
+from sqlalchemy import and_, exists, func, literal, or_, select, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.elements import ColumnElement
 
@@ -28,6 +28,7 @@ from services.common import db_clock, fingerprint, scope_filter
 from services.history_projection import freeze_website_projection
 
 MAX_BURST_MESSAGES = MAX_MESSAGES
+CANDIDATE_PAGE_SIZE = 100
 _SELECTION_NAMESPACE = UUID("d05d07b0-70a5-4f27-9628-801b852bd49e")
 
 
@@ -201,7 +202,7 @@ async def select_settled_turn(
     settings: Settings,
     channels: tuple[Channel, ...] = (Channel.TELEGRAM, Channel.WEBSITE_WIDGET),
 ) -> UUID | None:
-    """Select oldest due work; scan all candidates so skipped rows cannot starve later work."""
+    """Select oldest due work through bounded keyset pages."""
     bindings = tuple(binding for channel in channels for binding in _bindings(settings, channel))
     scope = _binding_clause(bindings)
     if scope is None:
@@ -212,68 +213,90 @@ async def select_settled_turn(
             Message.sequence >= AgentTurn.input_first_sequence,
             Message.sequence <= AgentTurn.input_last_sequence,
         ))
-    async with database.session_factory() as session, session.begin():
-        candidates = list((await session.scalars(
-            select(Conversation.id).join(Message, Message.conversation_id == Conversation.id)
-            .where(Message.actor == "CUSTOMER", Message.direction == "INBOUND",
-                   Message.settling_policy_version.is_not(None), pending,
-                   scope_filter(principal), scope)
-            .group_by(Conversation.id)
-            .order_by(func.min(Message.created_at), Conversation.id)
-        )).all())
-
-    for conversation_id in candidates:
+    candidate_rows = select(
+        Conversation.id.label("conversation_id"),
+        func.min(Message.created_at).label("oldest_created_at"),
+    ).join(Message, Message.conversation_id == Conversation.id).where(
+        Message.actor == "CUSTOMER", Message.direction == "INBOUND",
+        Message.settling_policy_version.is_not(None), pending,
+        scope_filter(principal), scope,
+    ).group_by(Conversation.id).subquery()
+    cursor: tuple[datetime, UUID] | None = None
+    while True:
         async with database.session_factory() as session, session.begin():
-            conversation = await session.scalar(select(Conversation).where(
-                Conversation.id == conversation_id, scope_filter(principal)
-            ).with_for_update(skip_locked=True).execution_options(populate_existing=True))
-            if conversation is None or conversation.control_mode != "AGENT":
-                continue
-            active = await session.scalar(select(AgentTurn).where(
-                AgentTurn.conversation_id == conversation.id,
-                AgentTurn.status.in_(("PENDING", "CLAIMED")),
-            ).with_for_update())
-            if active is not None:
-                continue
-            rows = await _pending_messages(session, conversation.id)
-            if not rows or rows[0].settling_policy_version is None:
-                continue
-            channel = Channel(conversation.channel)
-            channel_bindings = _bindings(settings, channel)
-            binding = next((candidate for candidate in channel_bindings
-                            if candidate.owner_id == conversation.owner_id
-                            and candidate.integration_id == conversation.integration_id), None)
-            if binding is None:
-                continue
-            if channel == Channel.TELEGRAM:
-                admission = await session.scalar(select(TelegramAdmission).where(
-                    TelegramAdmission.canonical_message_id == rows[0].id,
-                    TelegramAdmission.conversation_id == conversation.id,
-                    TelegramAdmission.route == "MANAGED",
-                ))
-                if admission is None or admission.agent_id != binding.agent_id:
-                    continue
-            elif channel == Channel.WEBSITE_WIDGET:
-                admission = await session.scalar(select(WebsiteAdmission).where(
-                    WebsiteAdmission.canonical_message_id == rows[0].id,
-                    WebsiteAdmission.conversation_id == conversation.id,
-                    WebsiteAdmission.route == "MANAGED",
-                ))
-                if admission is None or admission.agent_id != binding.agent_id:
-                    continue
-            else:
-                continue
-            clock = await db_clock(session)
-            choice = _burst(rows, clock)
-            if choice is None:
-                continue
-            due_messages, _deadline = choice
-            selected = await _maximal_projectable_prefix(
-                session, conversation, due_messages, binding
+            page_query = select(
+                candidate_rows.c.conversation_id,
+                candidate_rows.c.oldest_created_at,
             )
-            if not selected:
-                # A candidate-specific invalid projection remains durable and
-                # cannot prevent later Conversations from making progress.
-                continue
-            return await _create_turn(session, conversation, selected, binding, channel, clock)
-    return None
+            if cursor is not None:
+                page_query = page_query.where(tuple_(
+                    candidate_rows.c.oldest_created_at,
+                    candidate_rows.c.conversation_id,
+                ) > tuple_(literal(cursor[0]), literal(cursor[1])))
+            page = list((await session.execute(
+                page_query.order_by(candidate_rows.c.oldest_created_at,
+                                    candidate_rows.c.conversation_id)
+                .limit(CANDIDATE_PAGE_SIZE)
+            )).all())
+        if not page:
+            return None
+
+        for conversation_id, _oldest_created_at in page:
+            async with database.session_factory() as session, session.begin():
+                conversation = await session.scalar(select(Conversation).where(
+                    Conversation.id == conversation_id, scope_filter(principal)
+                ).with_for_update(skip_locked=True).execution_options(populate_existing=True))
+                if conversation is None or conversation.control_mode != "AGENT":
+                    continue
+                active = await session.scalar(select(AgentTurn).where(
+                    AgentTurn.conversation_id == conversation.id,
+                    AgentTurn.status.in_(("PENDING", "CLAIMED")),
+                ).with_for_update())
+                if active is not None:
+                    continue
+                rows = await _pending_messages(session, conversation.id)
+                if not rows or rows[0].settling_policy_version is None:
+                    continue
+                channel = Channel(conversation.channel)
+                channel_bindings = _bindings(settings, channel)
+                binding = next((candidate for candidate in channel_bindings
+                                if candidate.owner_id == conversation.owner_id
+                                and candidate.integration_id == conversation.integration_id), None)
+                if binding is None:
+                    continue
+                if channel == Channel.TELEGRAM:
+                    admission = await session.scalar(select(TelegramAdmission).where(
+                        TelegramAdmission.canonical_message_id == rows[0].id,
+                        TelegramAdmission.conversation_id == conversation.id,
+                        TelegramAdmission.route == "MANAGED",
+                    ))
+                    if admission is None or admission.agent_id != binding.agent_id:
+                        continue
+                elif channel == Channel.WEBSITE_WIDGET:
+                    admission = await session.scalar(select(WebsiteAdmission).where(
+                        WebsiteAdmission.canonical_message_id == rows[0].id,
+                        WebsiteAdmission.conversation_id == conversation.id,
+                        WebsiteAdmission.route == "MANAGED",
+                    ))
+                    if admission is None or admission.agent_id != binding.agent_id:
+                        continue
+                else:
+                    continue
+                clock = await db_clock(session)
+                choice = _burst(rows, clock)
+                if choice is None:
+                    continue
+                due_messages, _deadline = choice
+                selected = await _maximal_projectable_prefix(
+                    session, conversation, due_messages, binding
+                )
+                if not selected:
+                    # A candidate-specific invalid projection remains durable and
+                    # cannot prevent later Conversations from making progress.
+                    continue
+                return await _create_turn(session, conversation, selected, binding, channel, clock)
+
+        if len(page) < CANDIDATE_PAGE_SIZE:
+            return None
+        last_conversation_id, last_created_at = page[-1]
+        cursor = (last_created_at, last_conversation_id)

@@ -1,4 +1,5 @@
 """Atomic sticky routing and honest retained HTTP reply evidence."""
+from typing import Literal
 from uuid import uuid4
 
 from sqlalchemy import select
@@ -242,8 +243,27 @@ async def begin_response(database: Database, principal: Principal, request: Webs
                     status="UNKNOWN", error_code="INTERRUPTED", accepted_at=clock,
                 ))
                 await session.flush()
+            # Replaying a widget request is safe only when the same transport
+            # attempt already has definitive write-success evidence and no
+            # later input or authority change has fenced its Turn.
+            replay_send = (
+                attempt.send_authorized
+                and attempt.outcome == "WRITE_COMPLETED"
+                and conversation.settling_revision == turn.settling_revision
+                and delivery.expected_settling_revision == turn.settling_revision
+                and delivery.fenced_settling_revision == conversation.settling_revision
+            )
+            replay_superseded = (
+                conversation.settling_revision != turn.settling_revision
+                or delivery.expected_settling_revision != turn.settling_revision
+                or delivery.fenced_settling_revision != conversation.settling_revision
+            )
             return WebsiteResponseBegun(response_attempt_id=attempt.id,
-                                        draft_text=turn.draft_text, send=False, replayed=True)
+                                        draft_text=turn.draft_text, send=replay_send,
+                                        replayed=True,
+                                        denial_reason=(None if replay_send else
+                                            "SUPERSEDED" if replay_superseded else
+                                            "DELIVERY_NOT_RETRYABLE"))
         clock = await db_clock(session)
         delivery = await session.scalar(select(DeliveryAttempt).where(
             DeliveryAttempt.source_turn_id == turn.id,
@@ -265,9 +285,13 @@ async def begin_response(database: Database, principal: Principal, request: Webs
             await session.flush()
         if delivery.authority_revision != conversation.authority_revision:
             raise DomainError(ErrorCode.AUTHORITY_REVISION_CONFLICT)
+        turn_superseded = conversation.settling_revision > turn.settling_revision
         send = False
+        denial_reason: Literal["SUPERSEDED", "DELIVERY_NOT_RETRYABLE"] | None = (
+            "SUPERSEDED" if turn_superseded else "DELIVERY_NOT_RETRYABLE"
+        )
         if delivery.status == "GENERATED":
-            stale = conversation.settling_revision > turn.settling_revision
+            stale = turn_superseded
             status = DeliveryStatus.SUPERSEDED if stale else DeliveryStatus.DISPATCH_REQUESTED
             delivery.expected_settling_revision = turn.settling_revision
             delivery.fenced_settling_revision = conversation.settling_revision
@@ -296,13 +320,15 @@ async def begin_response(database: Database, principal: Principal, request: Webs
                 accepted_at=clock,
             ))
             send = not stale
+            denial_reason = "SUPERSEDED" if stale else None
         session.add(WebsiteResponseAttempt(id=request.response_attempt_id,
                                            admission_id=admission.id, delivery_id=delivery.id,
                                            conversation_id=conversation.id,
                                            send_authorized=send, created_at=clock))
         await session.flush()
         result = WebsiteResponseBegun(response_attempt_id=request.response_attempt_id,
-                                      draft_text=turn.draft_text, send=send, replayed=False)
+                                      draft_text=turn.draft_text, send=send, replayed=False,
+                                      denial_reason=denial_reason)
     return result
 
 

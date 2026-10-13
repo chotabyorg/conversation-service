@@ -13,7 +13,7 @@ import httpx
 import pytest
 import pytest_asyncio
 from asgi_lifespan import LifespanManager
-from sqlalchemy import func, select, text
+from sqlalchemy import func, select, text, update
 
 from core.config import Settings, SettlingPolicy
 from models import (
@@ -26,7 +26,7 @@ from models import (
 )
 from schemas.contracts import Channel
 from schemas.managed import MAX_PROJECTED_TEXT_BYTES
-from services.settling import select_settled_turn
+from services.settling import CANDIDATE_PAGE_SIZE, select_settled_turn
 from services.telegram import expected_response_attempt_id
 from services.telegram_worker import TelegramWorker
 from tests.test_telegram import DeterministicManagedPort, inbound
@@ -699,6 +699,63 @@ async def test_large_unsettled_prefix_does_not_hide_later_due_conversation(
         conversation = await session.get(Conversation, selected.conversation_id)
     assert selected is not None and conversation is not None
     assert conversation.provider_thread_id == "124"
+
+
+@pytest.mark.asyncio
+async def test_candidate_scan_uses_bounded_keyset_pages(telegram_harness, sql):
+    h = telegram_harness
+    settings = _policy_settings(h["settings"], quiet_ms=10, max_wait_ms=100)
+    _install_settings(h, settings)
+    candidate_count = CANDIDATE_PAGE_SIZE + 1
+    chat_ids = [6000 + index for index in range(candidate_count + 1)]
+
+    for batch_start in range(0, len(chat_ids), 20):
+        responses = await asyncio.gather(*(
+            h["client"].post(
+                "/internal/v1/telegram/admissions",
+                json=inbound(message_id=10_000 + index, update_id=20_000 + index,
+                             chat_id=chat_id),
+                headers=h["gateway_headers"],
+            )
+            for index, chat_id in enumerate(chat_ids[batch_start:batch_start + 20],
+                                             start=batch_start)
+        ))
+        assert all(response.status_code == 200 for response in responses)
+
+    old_chat_ids = chat_ids[:candidate_count]
+    due_chat_id = chat_ids[-1]
+    async with h["database"].session_factory() as session, session.begin():
+        old_conversation_ids = (await session.scalars(select(Conversation.id).where(
+            Conversation.provider_thread_id.in_(list(map(str, old_chat_ids)))
+        ))).all()
+        due_conversation_id = await session.scalar(select(Conversation.id).where(
+            Conversation.provider_thread_id == str(due_chat_id)
+        ))
+        assert len(old_conversation_ids) == candidate_count
+        assert due_conversation_id is not None
+        await session.execute(update(Message).where(
+            Message.conversation_id.in_(old_conversation_ids)
+        ).values(
+            settling_quiet_window_ms=100_000,
+            settling_max_wait_ms=200_000,
+            created_at=text("clock_timestamp() - interval '5 seconds'"),
+        ))
+        await session.execute(update(Message).where(
+            Message.conversation_id == due_conversation_id
+        ).values(created_at=text("clock_timestamp() - interval '500 milliseconds'")))
+
+    principal = next(item for item in settings.auth_principals
+                     if item.principal_id == settings.telegram_worker_principal_id).principal()
+    selected_id = await select_settled_turn(
+        h["database"], principal, settings, (Channel.TELEGRAM,)
+    )
+    assert selected_id is not None
+    async with h["database"].session_factory() as session, session.begin():
+        selected = await session.get(AgentTurn, selected_id)
+        assert selected is not None
+        conversation = await session.get(Conversation, selected.conversation_id)
+    assert selected is not None and conversation is not None
+    assert conversation.provider_thread_id == str(due_chat_id)
 
 
 @pytest.mark.asyncio

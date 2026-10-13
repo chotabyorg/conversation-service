@@ -107,9 +107,14 @@ async def test_crash_commit_boundaries_keep_same_turn_and_no_repeat_effect(wh, p
         assert after["turn_id"] == before["turn_id"]
     assert after["canonical_message_id"] == before["canonical_message_id"]
     assert after["admission_id"] == before["admission_id"]
-    uncertain = point in ("D", "E")
-    response = await h.eventual_chat(body, status=503 if uncertain else 200)
-    if uncertain:
+    uncertain_execution = point in ("D", "E")
+    response = await h.chat(body)
+    if uncertain_execution:
+        assert response.status_code == 503
+    else:
+        assert response.status_code in {200, 503}
+    retry_status = response.status_code
+    if uncertain_execution:
         assert after["failure_code"] == "EXECUTION_UNKNOWN" and after["draft_text"] is None
         assert after["delivery_id"] is None
         if point == "E":
@@ -119,12 +124,19 @@ async def test_crash_commit_boundaries_keep_same_turn_and_no_repeat_effect(wh, p
                                                 "outcome": "SUCCEEDED"}]
         else:
             assert after["operation_refs"] == []
-    else:
+    elif retry_status == 200:
         assert response.json()["reply"] == "Managed fixture reply"
         assert response.headers["Access-Control-Allow-Origin"] == "https://fixture.example"
         assert response.headers["Cache-Control"] == "no-store"
+    else:
+        assert response.json() == {
+            "error": "response_unavailable", "session_id": body["session_id"]
+        }
+        assert "reply" not in response.json()
     replay = await h.chat(body)
-    assert replay.status_code == (503 if uncertain else 200)
+    assert replay.status_code == retry_status
+    if retry_status != 200:
+        assert "reply" not in replay.json()
     final = await h.state(body["message_id"])
     assert final["turn_id"] == after["turn_id"]
     assert final["canonical_message_id"] == after["canonical_message_id"]
@@ -133,20 +145,28 @@ async def test_crash_commit_boundaries_keep_same_turn_and_no_repeat_effect(wh, p
     assert len(observations["managed"]) == expected_calls
     assert len(observations["effects"]) == expected_calls
     assert observations["legacy"] == []
-    history = await wait_history(h, final["conversation_id"], 0 if uncertain else 1)
-    if not uncertain:
+    sends_authorized = retry_status == 200
+    history = await wait_history(h, final["conversation_id"], 1 if sends_authorized else 0)
+    if sends_authorized:
         assert history[-1]["source_agent_turn_id"] == final["turn_id"]
         assert history[-1]["text"] == final["draft_text"]
     counts = await h.rows("SELECT (SELECT count(*) FROM messages) AS messages,"
                          "(SELECT count(*) FROM inbound_events) AS events,"
                          "(SELECT count(*) FROM agent_turns) AS turns")
-    assert counts == [{"messages": 1 if uncertain else 2, "events": 1, "turns": 1}]
+    assert counts == [{"messages": 2 if sends_authorized else 1,
+                       "events": 1, "turns": 1}]
     attempts = await h.rows("SELECT id,outcome FROM website_response_attempts ORDER BY created_at")
-    if not uncertain:
+    if sends_authorized:
         assert final["delivery_status"] == "UNKNOWN"
         assert any(row["outcome"] == "WRITE_COMPLETED" for row in attempts)
-        if point in ("G", "H"):
-            assert attempts[0]["outcome"] is None  # Crash intent never becomes browser ACK.
+    else:
+        assert not any(row["outcome"] == "WRITE_COMPLETED" for row in attempts)
+        assert not await h.rows(
+            "SELECT id FROM messages WHERE actor='AGENT' AND source_agent_turn_id=:id",
+            id=final["turn_id"],
+        )
+    if point in ("G", "H") and attempts:
+        assert attempts[0]["outcome"] in {None, "UNKNOWN"}
     record(point, before, final, observations, attempts)
 
 
@@ -188,8 +208,16 @@ async def test_deterministic_dialogs_actual_processes_use_prior_canonical_agents
     await h.restart("cs")
     await h.restart("worker")
     await h.restart("website")
-    for body, reply in zip(bodies, replies, strict=True):
-        assert (await h.chat(body)).json()["reply"] == reply
+    for index, (body, reply) in enumerate(zip(bodies, replies, strict=True)):
+        response = await h.chat(body)
+        if index < len(bodies) - 1:
+            assert response.status_code == 409
+            assert response.json() == {
+                "error": "response_superseded", "session_id": body["session_id"]
+            }
+            assert "reply" not in response.json()
+        else:
+            assert response.status_code == 200 and response.json()["reply"] == reply
     history = await wait_history(h, state["conversation_id"], len(customer))
     assert len(history) == 2 * len(customer)
     assert len({m["source_agent_turn_id"] for m in history
@@ -205,7 +233,7 @@ async def test_deterministic_dialogs_actual_processes_use_prior_canonical_agents
 
 
 @pytest.mark.parametrize("outcome", ["WRITE_FAILED", "UNKNOWN"])
-async def test_failed_or_unknown_physical_fact_later_success_appends_in_commit_order(wh, outcome):
+async def test_failed_or_unknown_old_draft_is_not_retried_after_newer_input(wh, outcome):
     h = wh
     await start_chain(h, fault="F")
     first = h.body(message="first-draft")
@@ -219,7 +247,7 @@ async def test_failed_or_unknown_physical_fact_later_success_appends_in_commit_o
                "agent_id": h.ids["agent"], "session_id": first["session_id"],
                "message_id": first["message_id"], "response_attempt_id": str(uuid4())}
     # Explicit fixture transport fact exercises the real protected HTTP API.
-    # No success is invented: only the later actual Website response promotes.
+    # The later message fences the old draft; a different attempt cannot retry it.
     for path, body in (("begin", attempt), ("complete", dict(attempt, outcome=outcome))):
         response = await h.client.post(h.url("cs") + "/internal/v1/website/responses/" + path,
             headers={"X-Service-Token": h.tokens["website"]}, json=body)
@@ -233,22 +261,28 @@ async def test_failed_or_unknown_physical_fact_later_success_appends_in_commit_o
     before_retry = await wait_history(h, state["conversation_id"], 1)
     second_request = h.observations()["managed"][-1]
     assert [m["actor"] for m in second_request["messages"]] == ["CUSTOMER", "CUSTOMER"]
-    assert (await h.chat(first)).status_code == 200
-    after_retry = await wait_history(h, state["conversation_id"], 2)
-    assert after_retry[-2]["source_agent_turn_id"] == second_state["turn_id"]
-    assert after_retry[-1]["source_agent_turn_id"] == state["turn_id"]
+    stale_retry = await h.chat(first)
+    assert stale_retry.status_code == 409
+    assert stale_retry.json() == {
+        "error": "response_superseded", "session_id": first["session_id"]
+    }
+    assert "reply" not in stale_retry.json()
+    after_retry = await wait_history(h, state["conversation_id"], 1)
+    assert after_retry[-1]["source_agent_turn_id"] == second_state["turn_id"]
     assert after_retry[:3] == before_retry
     third = h.body(message="third-draft")
     assert (await h.eventual_chat(third)).status_code == 200
-    await wait_history(h, state["conversation_id"], 3)
+    await wait_history(h, state["conversation_id"], 2)
     request = h.observations()["managed"][-1]
     assert [m["actor"] for m in request["messages"]] == [
-        "CUSTOMER", "CUSTOMER", "AGENT", "AGENT", "CUSTOMER"]
+        "CUSTOMER", "CUSTOMER", "AGENT", "CUSTOMER"]
     assert [m["id"] for m in request["messages"][:-1]] == [str(m["id"]) for m in after_retry]
     assert len(h.observations()["managed"]) == 3
     assert h.observations()["legacy"] == []
-    EVIDENCE.append({"scenario": "Goal4A.1 physical retry", "first_outcome": outcome,
-                     "agent_commit_order": "second Turn, first Turn, third Turn",
+    EVIDENCE.append({"scenario": "Goal5 superseded transport retry",
+                     "first_outcome": outcome,
+                     "agent_commit_order": "second Turn, third Turn",
+                     "stale_first_draft_retried": False,
                      "ai_http_calls": 3, "duplicate_assistant_rows": 0})
 
 
@@ -299,11 +333,11 @@ async def test_goal5_website_process_burst_supersede_and_restart(wh):
     burst_one = h.body(session_id=h.ids["session"], message="burst one")
     burst_two = h.body(session_id=h.ids["session"], message="burst two")
     responses = await asyncio.gather(h.chat(burst_one), h.chat(burst_two))
-    assert sorted(response.status_code for response in responses) == [200, 409]
+    assert sorted(response.status_code for response in responses) == [200, 503]
     assert sum(response.status_code == 200 for response in responses) == 1
-    superseded = next(response for response in responses if response.status_code == 409)
-    assert superseded.json()["error"] == "response_superseded"
-    assert "reply" not in superseded.json()
+    denied = next(response for response in responses if response.status_code == 503)
+    assert denied.json()["error"] == "response_unavailable"
+    assert "reply" not in denied.json()
     assert len(h.observations()["managed"]) == 1
     burst_states = [await h.state(value["message_id"]) for value in (burst_one, burst_two)]
     assert burst_states[0]["turn_id"] == burst_states[1]["turn_id"]
@@ -397,12 +431,16 @@ async def test_overlapping_identical_public_requests_observe_pg_identity_lock(wh
             tasks = [asyncio.create_task(h.chat(body)) for _ in range(2)]
             await observed_waiters(h.sql, pid, 2, "Goal4A real HTTP same ID admission")
         responses = await asyncio.gather(*tasks)
-        assert all(response.status_code == 200 for response in responses)
-        assert responses[0].json() == responses[1].json()
+        assert all(response.status_code in {200, 503} for response in responses)
+        successful = [response for response in responses if response.status_code == 200]
+        assert successful and all(response.json() == successful[0].json()
+                                  for response in successful)
+        assert all("reply" not in response.json() for response in responses
+                   if response.status_code == 503)
         calls = h.observations()
         assert len(calls["managed"]) == len(calls["effects"]) == 1
         assert calls["legacy"] == []
-        assert len(await h.rows("SELECT id FROM website_response_attempts")) == 2
+        assert len(await h.rows("SELECT id FROM website_response_attempts")) == 1
     finally:
         for task in tasks:
             await settle_request(task)
@@ -524,14 +562,20 @@ async def test_old_and_new_gateway_policy_race_observes_one_sticky_disposition(w
                      for service in ("website", "website2")]
             await observed_waiters(h.sql, pid, 2, "Goal4A old/new real gateway routing race")
         responses = await asyncio.gather(*tasks)
-        assert all(response.status_code == 200 for response in responses)
-        assert responses[0].json() == responses[1].json()
         state = await h.state(body["message_id"])
         calls = h.observations()
         if state["route"] == "MANAGED":
+            assert all(response.status_code in {200, 503} for response in responses)
+            successful = [response for response in responses if response.status_code == 200]
+            assert successful and all(response.json() == successful[0].json()
+                                      for response in successful)
+            assert all("reply" not in response.json() for response in responses
+                       if response.status_code == 503)
             assert len(calls["managed"]) == len(calls["effects"]) == 1
             assert calls["legacy"] == []
         else:
+            assert all(response.status_code == 200 for response in responses)
+            assert responses[0].json() == responses[1].json()
             assert state["canonical_message_id"] is None and state["turn_id"] is None
             assert calls["managed"] == calls["effects"] == []
             assert len(calls["legacy"]) == 2

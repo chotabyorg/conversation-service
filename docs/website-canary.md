@@ -88,15 +88,19 @@ reads late refs for a scoped terminal marked Website Turn. It does not enrich or
 rewrite immutable terminal fingerprints. API needs its distinct processing
 credential and read-only AI binding/egress when this operational query is enabled.
 
-`/responses/begin` accepts result identity plus a fresh `response_attempt_id` UUID
-per physical HTTP response. It returns `{response_attempt_id,draft_text,replayed}`
-after committing retained draft authority check, one generic Generated→Dispatch
-Requested delivery journal and per-response intent. Replay uses one immutable draft
-and one generic delivery; it never resets UNKNOWN to Dispatch Requested.
+`/responses/begin` accepts result identity plus a stable `response_attempt_id` UUID
+derived from the canonical `message_id`, so exact client retries retain the same
+transport identity across Gateway restarts. It returns the retained draft, `send`,
+`replayed`, and a denial reason when send is false. It commits the retained draft
+authority check, one generic Generated→Dispatch Requested delivery journal and
+per-response intent. A replay may resend only after definitive `WRITE_COMPLETED`
+evidence while that Turn remains current. Failed, unknown, and superseded attempts
+never become sendable again; UNKNOWN is never reset to Dispatch Requested.
 
 `/responses/complete` accepts the same fields plus local outcome
 `WRITE_COMPLETED|WRITE_FAILED|UNKNOWN`, returns `{response_attempt_id,outcome,replayed}`.
-Each response outcome is immutable. Generic delivery transitions once to UNKNOWN
+Each response outcome is immutable except authorized late evidence may resolve
+UNKNOWN. Generic delivery transitions once to UNKNOWN
 with immutable reconciliation evidence; local socket completion never means browser
 acknowledgement, DELIVERED or READ. Unconfirmed intents after crash remain honest.
 Safe response replay can create fresh HTTP evidence with zero AI/business execution.

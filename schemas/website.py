@@ -42,6 +42,7 @@ class WebsiteResponseBegun(Contract):
     draft_text: TextContent
     send: bool
     replayed: bool
+    denial_reason: Literal["SUPERSEDED", "DELIVERY_NOT_RETRYABLE"] | None = None
 
 
 class WebsiteResponseComplete(WebsiteResponseBegin):

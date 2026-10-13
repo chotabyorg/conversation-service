@@ -157,7 +157,10 @@ in `turn_input_messages`. `POST /conversations/{id}/turns` returns
 Before a Telegram or Website provider/socket write, `responses/begin` locks the
 Conversation then the completed Turn and atomically records `DISPATCH_REQUESTED`
 or `SUPERSEDED`. The response includes `send`; false means no new write is
-authorized. Only the first admission mapped to one logical Turn can receive
+authorized. Website responses also return `denial_reason` as `SUPERSEDED` or
+`DELIVERY_NOT_RETRYABLE`; exact widget retries use a stable attempt ID derived
+from the canonical `message_id`. Only a confirmed completed write may be replayed,
+and only while its Turn remains current. Only the first admission mapped to one logical Turn can receive
 `send=true`; replay or another admission in the same selected burst receives
 false. A stale draft retains its Turn and `operation_refs`, and its delivery
 cannot be reopened. An unfinished write is recorded as `UNKNOWN` on retry and is
