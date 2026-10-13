@@ -13,8 +13,16 @@ from core.config import Settings
 from core.errors import DomainError
 from core.logging import logger
 from db.database import Database
-from models import AgentTurn, Conversation, Message, WebsiteAdmission, WebsiteImmediateTurn
+from models import (
+    AgentTurn,
+    Conversation,
+    Message,
+    TurnInputMessage,
+    WebsiteAdmission,
+    WebsiteImmediateTurn,
+)
 from schemas.contracts import (
+    Channel,
     ErrorCode,
     Principal,
     TurnClaim,
@@ -27,6 +35,7 @@ from services import managed_execution, turns
 from services.common import authorized_conversation, db_clock, fingerprint, scope_filter
 from services.history_projection import freeze_website_projection
 from services.managed_client import ManagedAIPort
+from services.settling import select_settled_turn
 
 
 async def select_immediate(database: Database, principal: Principal,
@@ -149,6 +158,8 @@ async def select_immediate(database: Database, principal: Principal,
                             WebsiteImmediateTurn.message_id == Message.id))))
                 if message is None:
                     continue
+                if message.settling_policy_version is not None:
+                    continue
                 admission_agent = await session.scalar(select(WebsiteAdmission.agent_id).where(
                     WebsiteAdmission.canonical_message_id == message.id,
                     WebsiteAdmission.conversation_id == conversation_id))
@@ -165,8 +176,9 @@ async def select_immediate(database: Database, principal: Principal,
                     id=uuid4(), conversation_id=conversation_id, selection_key=message.id,
                     creation_fingerprint=fingerprint(fields), input_first_sequence=message.sequence,
                     input_last_sequence=message.sequence, context_last_sequence=message.sequence,
-                    input_revision=conversation.input_revision,
+                    input_revision=(message.input_revision or conversation.input_revision),
                     authority_revision=conversation.authority_revision,
+                    settling_revision=message.settling_revision or 0,
                     status="PENDING", claim_epoch=0,
                     operation_refs=[], created_at=clock,
                 )
@@ -175,6 +187,9 @@ async def select_immediate(database: Database, principal: Principal,
                 await session.flush()
                 session.add(WebsiteImmediateTurn(message_id=message.id,
                                                  conversation_id=conversation_id, turn_id=turn.id))
+                session.add(TurnInputMessage(message_id=message.id,
+                                             conversation_id=conversation_id, turn_id=turn.id,
+                                             sequence=message.sequence, ordinal=0))
                 await session.flush()
                 return turn.id
 
@@ -207,7 +222,11 @@ class WebsiteWorker:
                 or self.principal is None):
             self.last_poll = time.monotonic()
             return False
-        turn_id = await select_immediate(self.database, self.principal, self.settings)
+        turn_id = await select_settled_turn(
+            self.database, self.principal, self.settings, (Channel.WEBSITE_WIDGET,)
+        )
+        if turn_id is None:
+            turn_id = await select_immediate(self.database, self.principal, self.settings)
         self.last_poll = time.monotonic()
         if turn_id is None or self.stop_requested.is_set():
             return False

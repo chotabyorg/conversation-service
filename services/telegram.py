@@ -24,6 +24,7 @@ from models import (
     Message,
     TelegramImmediateTurn,
     TelegramResponseAttempt,
+    TurnInputMessage,
 )
 from models import (
     TelegramAdmission as TelegramAdmissionRow,
@@ -139,6 +140,9 @@ async def admit(database: Database, principal: Principal, request: AdmissionRequ
                 event_id, canonical_message_id = uuid4(), uuid4()
                 conversation.last_message_sequence += 1
                 conversation.input_revision += 1
+                policy = settings.settling_policy_for(Channel.TELEGRAM, request.integration_id)
+                if policy is not None:
+                    conversation.settling_revision += 1
                 conversation.updated_at = clock
                 session.add(InboundEvent(
                     id=event_id, conversation_id=conversation.id, owner_id=request.owner_id,
@@ -150,7 +154,13 @@ async def admit(database: Database, principal: Principal, request: AdmissionRequ
                 await session.flush()
                 session.add(Message(
                     id=canonical_message_id, conversation_id=conversation.id,
-                    sequence=conversation.last_message_sequence, actor="CUSTOMER",
+                    sequence=conversation.last_message_sequence,
+                    input_revision=conversation.input_revision,
+                    settling_revision=conversation.settling_revision,
+                    settling_policy_version=policy.version if policy is not None else None,
+                    settling_quiet_window_ms=policy.quiet_window_ms if policy is not None else None,
+                    settling_max_wait_ms=policy.max_wait_ms if policy is not None else None,
+                    actor="CUSTOMER",
                     direction="INBOUND", content_type="TEXT", text=request.text,
                     source_inbound_event_id=event_id, created_at=clock,
                 ))
@@ -217,18 +227,25 @@ def _record_reconciliation(session: AsyncSession, delivery: DeliveryAttempt, con
                            status: str, *, provider_message_id: str | None = None,
                            error_code: str | None = None, key: UUID,
                            expected_revision: int, authority_revision: int | None = None,
+                           expected_settling_revision: int | None = None,
+                           result_settling_revision: int | None = None,
                            clock: datetime) -> None:
     delivery.status = status
     delivery.revision += 1
     delivery.updated_at = clock
     delivery.provider_message_id = provider_message_id or delivery.provider_message_id
     delivery.error_code = error_code
-    if status == "DISPATCH_REQUESTED" and delivery.dispatch_requested_at is None:
+    if status in {"DISPATCH_REQUESTED", "SUPERSEDED"} and delivery.dispatch_requested_at is None:
         delivery.dispatch_requested_at = clock
     if status == "PROVIDER_ACCEPTED" and delivery.provider_accepted_at is None:
         delivery.provider_accepted_at = clock
+    if expected_settling_revision is not None:
+        delivery.expected_settling_revision = expected_settling_revision
+        delivery.fenced_settling_revision = result_settling_revision
     payload = {"status": status, "provider_message_id": provider_message_id,
-               "error_code": error_code, "expected_authority_revision": authority_revision}
+               "error_code": error_code, "expected_authority_revision": authority_revision,
+               "expected_settling_revision": expected_settling_revision,
+               "result_settling_revision": result_settling_revision}
     session.add(DeliveryReconciliation(
         id=uuid4(), conversation_id=conversation_id, delivery_attempt_id=delivery.id,
         reconciliation_key=key,
@@ -236,7 +253,9 @@ def _record_reconciliation(session: AsyncSession, delivery: DeliveryAttempt, con
                                  **payload}),
         expected_revision=expected_revision, result_revision=delivery.revision,
         status=status, provider_message_id=provider_message_id, error_code=error_code,
-        expected_authority_revision=authority_revision, accepted_at=clock,
+        expected_authority_revision=authority_revision,
+        expected_settling_revision=expected_settling_revision,
+        result_settling_revision=result_settling_revision, accepted_at=clock,
     ))
 
 
@@ -252,7 +271,13 @@ async def begin_response(database: Database, principal: Principal,
             raise DomainError(ErrorCode.DELIVERY_IDENTITY_CONFLICT)
         conversation = await authorized_conversation(
             session, principal, admission.conversation_id, lock=True)
-        turn = await admission_turn(session, admission)
+        retained_turn = await admission_turn(session, admission)
+        turn = await session.scalar(select(AgentTurn).where(
+            AgentTurn.id == retained_turn.id,
+            AgentTurn.conversation_id == conversation.id,
+        ).with_for_update().execution_options(populate_existing=True))
+        if turn is None:
+            raise DomainError(ErrorCode.NOT_FOUND)
         if turn.status != "COMPLETED" or turn.draft_text is None:
             raise DomainError(ErrorCode.NO_DRAFT)
         if (conversation.control_mode != "AGENT"
@@ -283,34 +308,52 @@ async def begin_response(database: Database, principal: Principal,
             DeliveryAttempt.source_turn_id == turn.id,
             DeliveryAttempt.conversation_id == conversation.id,
         ).with_for_update())
-        if delivery is not None:
-            # A second identity cannot acquire another provider-send permission.
-            raise DomainError(ErrorCode.DELIVERY_INTENT_EXISTS)
-        delivery_id = uuid4()
-        delivery = DeliveryAttempt(
-            id=delivery_id, conversation_id=conversation.id, delivery_key=turn.id,
-            source_turn_id=turn.id,
-            creation_fingerprint=fingerprint({"contract_version": 1,
-                "conversation_id": str(conversation.id), "delivery_key": str(turn.id),
-                "source_turn_id": str(turn.id),
-                "expected_authority_revision": conversation.authority_revision}),
-            authority_revision=conversation.authority_revision, status="GENERATED", revision=0,
-            created_at=clock, updated_at=clock,
-        )
-        session.add(delivery)
-        await session.flush()
-        _record_reconciliation(
-            session, delivery, conversation.id, "DISPATCH_REQUESTED",
-            key=turn.id, expected_revision=0,
-            authority_revision=conversation.authority_revision, clock=clock,
-        )
+        if delivery is None:
+            delivery = DeliveryAttempt(
+                id=uuid4(), conversation_id=conversation.id, delivery_key=turn.id,
+                source_turn_id=turn.id,
+                creation_fingerprint=fingerprint({"contract_version": 1,
+                    "conversation_id": str(conversation.id), "delivery_key": str(turn.id),
+                    "source_turn_id": str(turn.id),
+                    "expected_authority_revision": conversation.authority_revision}),
+                authority_revision=conversation.authority_revision, status="GENERATED", revision=0,
+                created_at=clock, updated_at=clock,
+            )
+            session.add(delivery)
+            await session.flush()
+
+        if delivery.status != "GENERATED":
+            session.add(TelegramResponseAttempt(
+                id=request.response_attempt_id, admission_id=admission.id,
+                delivery_id=delivery.id, conversation_id=conversation.id, created_at=clock,
+            ))
+            await session.flush()
+            return TelegramResponseBegun(response_attempt_id=request.response_attempt_id,
+                                         draft_text=turn.draft_text, send=False, replayed=False)
+
+        stale = conversation.settling_revision > turn.settling_revision
+        if stale:
+            _record_reconciliation(
+                session, delivery, conversation.id, "SUPERSEDED", key=turn.id,
+                expected_revision=delivery.revision,
+                expected_settling_revision=turn.settling_revision,
+                result_settling_revision=conversation.settling_revision, clock=clock,
+            )
+        else:
+            _record_reconciliation(
+                session, delivery, conversation.id, "DISPATCH_REQUESTED",
+                key=turn.id, expected_revision=delivery.revision,
+                authority_revision=conversation.authority_revision,
+                expected_settling_revision=turn.settling_revision,
+                result_settling_revision=conversation.settling_revision, clock=clock,
+            )
         session.add(TelegramResponseAttempt(
             id=request.response_attempt_id, admission_id=admission.id,
             delivery_id=delivery.id, conversation_id=conversation.id, created_at=clock,
         ))
         await session.flush()
         return TelegramResponseBegun(response_attempt_id=request.response_attempt_id,
-                                     draft_text=turn.draft_text, send=True, replayed=False)
+                                     draft_text=turn.draft_text, send=not stale, replayed=False)
 
 
 async def complete_response(database: Database, principal: Principal,
@@ -451,6 +494,10 @@ async def _select_candidate(database: Database, principal: Principal,
             .order_by(Message.sequence).limit(1).with_for_update())
         if message is None:
             return None
+        # Policy-bound inputs belong to the durable settling coordinator. The
+        # immediate fallback must never bypass its quiet/max-wait deadline.
+        if message.settling_policy_version is not None:
+            return None
         agent_id = await session.scalar(select(TelegramAdmissionRow.agent_id).where(
             TelegramAdmissionRow.canonical_message_id == message.id,
             TelegramAdmissionRow.conversation_id == conversation_id,
@@ -472,6 +519,7 @@ async def _select_candidate(database: Database, principal: Principal,
             context_last_sequence=message.sequence,
             input_revision=conversation.input_revision,
             authority_revision=conversation.authority_revision,
+            settling_revision=conversation.settling_revision,
             status="PENDING", claim_epoch=0, operation_refs=[], created_at=clock,
         )
         # This is the same bounded, immutable v2 projection used by the
@@ -482,6 +530,9 @@ async def _select_candidate(database: Database, principal: Principal,
         await session.flush()
         session.add(TelegramImmediateTurn(message_id=message.id,
                                            conversation_id=conversation_id, turn_id=turn.id))
+        session.add(TurnInputMessage(message_id=message.id,
+                                     conversation_id=conversation_id, turn_id=turn.id,
+                                     sequence=message.sequence, ordinal=0))
         await session.flush()
         return turn.id
 

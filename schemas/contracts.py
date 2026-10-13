@@ -89,6 +89,7 @@ class OperationOutcome(str, Enum):
 class DeliveryStatus(str, Enum):
     GENERATED = "GENERATED"
     DISPATCH_REQUESTED = "DISPATCH_REQUESTED"
+    SUPERSEDED = "SUPERSEDED"
     PROVIDER_ACCEPTED = "PROVIDER_ACCEPTED"
     DELIVERED = "DELIVERED"
     READ = "READ"
@@ -113,6 +114,7 @@ class ErrorCode(str, Enum):
     TURN_SELECTION_CONFLICT = "TURN_SELECTION_CONFLICT"
     ACTIVE_TURN_EXISTS = "ACTIVE_TURN_EXISTS"
     INPUT_REVISION_CONFLICT = "INPUT_REVISION_CONFLICT"
+    SETTLING_REQUIRED = "SETTLING_REQUIRED"
     AUTHORITY_REVISION_CONFLICT = "AUTHORITY_REVISION_CONFLICT"
     CONTROL_MODE_CONFLICT = "CONTROL_MODE_CONFLICT"
     INVALID_INPUT_BOUNDARY = "INVALID_INPUT_BOUNDARY"
@@ -462,6 +464,8 @@ class DeliveryReconcile(Contract):
     provider_occurred_at: ProviderTimestamp | None = None
     error_code: DeliveryErrorCode | None = None
     expected_authority_revision: Counter | None = None
+    expected_settling_revision: Counter | None = None
+    result_settling_revision: Counter | None = None
 
     @model_validator(mode="after")
     def validate_evidence(self) -> DeliveryReconcile:
@@ -471,6 +475,12 @@ class DeliveryReconcile(Contract):
             self.expected_authority_revision is not None
         ):
             raise ValueError("invalid authority evidence")
+        if (self.expected_settling_revision is None) != (self.result_settling_revision is None):
+            raise ValueError("invalid settling evidence")
+        if (self.expected_settling_revision is not None
+                and self.result_settling_revision is not None
+                and self.result_settling_revision < self.expected_settling_revision):
+            raise ValueError("invalid settling evidence")
         if self.error_code is not None and self.status not in {
             DeliveryStatus.FAILED,
             DeliveryStatus.UNKNOWN,
@@ -487,6 +497,8 @@ class DeliveryAttemptRead(Contract):
     delivery_key: UUID
     source_turn_id: UUID
     authority_revision: Counter
+    expected_settling_revision: Counter | None
+    fenced_settling_revision: Counter | None
     status: DeliveryStatus
     revision: Counter
     provider_operation_id: ProviderReference | None

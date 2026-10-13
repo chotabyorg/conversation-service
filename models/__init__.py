@@ -8,6 +8,7 @@ from models.entities import (
     TelegramAdmission,
     TelegramImmediateTurn,
     TelegramResponseAttempt,
+    TurnInputMessage,
     WebsiteAdmission,
     WebsiteImmediateTurn,
     WebsiteResponseAttempt,
@@ -26,4 +27,5 @@ __all__ = [
     "TelegramAdmission",
     "TelegramImmediateTurn",
     "TelegramResponseAttempt",
+    "TurnInputMessage",
 ]

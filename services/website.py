@@ -21,6 +21,7 @@ from models import (
     WebsiteResponseAttempt,
 )
 from schemas.contracts import (
+    Channel,
     DeliveryCreate,
     DeliveryErrorCode,
     DeliveryReconcile,
@@ -114,6 +115,11 @@ async def admit(database: Database, principal: Principal, request: AdmissionRequ
                 event_id, canonical_id = uuid4(), uuid4()
                 conversation.last_message_sequence += 1
                 conversation.input_revision += 1
+                policy = settings.settling_policy_for(
+                    Channel.WEBSITE_WIDGET, request.integration_id
+                )
+                if policy is not None:
+                    conversation.settling_revision += 1
                 conversation.updated_at = clock
                 event = InboundEvent(
                     id=event_id, conversation_id=conversation.id, owner_id=request.owner_id,
@@ -124,7 +130,19 @@ async def admit(database: Database, principal: Principal, request: AdmissionRequ
                 session.add(event)
                 await session.flush()
                 session.add(Message(id=canonical_id, conversation_id=conversation.id,
-                                    sequence=conversation.last_message_sequence, actor="CUSTOMER",
+                                    sequence=conversation.last_message_sequence,
+                                    input_revision=conversation.input_revision,
+                                    settling_revision=conversation.settling_revision,
+                                    settling_policy_version=(
+                                        policy.version if policy is not None else None
+                                    ),
+                                    settling_quiet_window_ms=(
+                                        policy.quiet_window_ms if policy is not None else None
+                                    ),
+                                    settling_max_wait_ms=(
+                                        policy.max_wait_ms if policy is not None else None
+                                    ),
+                                    actor="CUSTOMER",
                                     direction="INBOUND", content_type="TEXT", text=request.text,
                                     source_inbound_event_id=event_id, created_at=clock))
                 await session.flush()
@@ -178,7 +196,13 @@ async def begin_response(database: Database, principal: Principal, request: Webs
             raise DomainError(ErrorCode.NOT_FOUND)
         conversation = await authorized_conversation(session, principal,
                                                       admission.conversation_id, lock=True)
-        turn = await admission_turn(session, admission)
+        retained_turn = await admission_turn(session, admission)
+        if retained_turn is None:
+            raise DomainError(ErrorCode.NOT_FOUND)
+        turn = await session.scalar(select(AgentTurn).where(
+            AgentTurn.id == retained_turn.id,
+            AgentTurn.conversation_id == conversation.id,
+        ).with_for_update().execution_options(populate_existing=True))
         if turn is None or turn.status != "COMPLETED" or turn.draft_text is None:
             raise DomainError(ErrorCode.NO_DRAFT)
         if conversation.control_mode != "AGENT":
@@ -189,11 +213,42 @@ async def begin_response(database: Database, principal: Principal, request: Webs
         if attempt is not None:
             if attempt.admission_id != admission.id:
                 raise DomainError(ErrorCode.DELIVERY_IDENTITY_CONFLICT)
+            delivery = await session.scalar(select(DeliveryAttempt).where(
+                DeliveryAttempt.id == attempt.delivery_id,
+                DeliveryAttempt.conversation_id == conversation.id,
+            ).with_for_update())
+            if delivery is None:
+                raise DomainError(ErrorCode.NOT_FOUND)
+            if delivery.status == "DISPATCH_REQUESTED":
+                clock = await db_clock(session)
+                expected_revision = delivery.revision
+                delivery.status = "UNKNOWN"
+                delivery.error_code = "INTERRUPTED"
+                delivery.revision += 1
+                delivery.updated_at = clock
+                evidence = DeliveryReconcile(
+                    reconciliation_key=request.response_attempt_id,
+                    expected_revision=expected_revision,
+                    status=DeliveryStatus.UNKNOWN,
+                    error_code=DeliveryErrorCode.INTERRUPTED,
+                )
+                session.add(DeliveryReconciliation(
+                    id=uuid4(), conversation_id=conversation.id, delivery_attempt_id=delivery.id,
+                    reconciliation_key=request.response_attempt_id,
+                    fingerprint=fingerprint({"contract_version": 1,
+                        "delivery_attempt_id": str(delivery.id),
+                        **evidence.model_dump(mode="json")}),
+                    expected_revision=expected_revision, result_revision=delivery.revision,
+                    status="UNKNOWN", error_code="INTERRUPTED", accepted_at=clock,
+                ))
+                await session.flush()
             return WebsiteResponseBegun(response_attempt_id=attempt.id,
-                                        draft_text=turn.draft_text, replayed=True)
+                                        draft_text=turn.draft_text, send=False, replayed=True)
         clock = await db_clock(session)
         delivery = await session.scalar(select(DeliveryAttempt).where(
-            DeliveryAttempt.source_turn_id == turn.id))
+            DeliveryAttempt.source_turn_id == turn.id,
+            DeliveryAttempt.conversation_id == conversation.id,
+        ).with_for_update())
         if delivery is None:
             creation = DeliveryCreate(delivery_key=turn.id, source_turn_id=turn.id,
                                       expected_authority_revision=conversation.authority_revision)
@@ -203,31 +258,50 @@ async def begin_response(database: Database, principal: Principal, request: Webs
                     "contract_version": 1, "conversation_id": str(conversation.id),
                     **creation.model_dump(mode="json")}),
                 authority_revision=conversation.authority_revision,
+                expected_settling_revision=turn.settling_revision,
                 status="GENERATED", revision=0, created_at=clock, updated_at=clock,
             )
             session.add(delivery)
             await session.flush()
-            reconcile = DeliveryReconcile(reconciliation_key=turn.id, expected_revision=0,
-                                           status=DeliveryStatus.DISPATCH_REQUESTED,
-                                           expected_authority_revision=turn.authority_revision)
-            delivery.status, delivery.revision = "DISPATCH_REQUESTED", 1
+        if delivery.authority_revision != conversation.authority_revision:
+            raise DomainError(ErrorCode.AUTHORITY_REVISION_CONFLICT)
+        send = False
+        if delivery.status == "GENERATED":
+            stale = conversation.settling_revision > turn.settling_revision
+            status = DeliveryStatus.SUPERSEDED if stale else DeliveryStatus.DISPATCH_REQUESTED
+            delivery.expected_settling_revision = turn.settling_revision
+            delivery.fenced_settling_revision = conversation.settling_revision
+            evidence = DeliveryReconcile(
+                reconciliation_key=turn.id, expected_revision=delivery.revision,
+                status=status,
+                expected_authority_revision=(None if stale else conversation.authority_revision),
+                expected_settling_revision=turn.settling_revision,
+                result_settling_revision=conversation.settling_revision,
+            )
+            expected_revision = delivery.revision
+            delivery.status = status.value
+            delivery.revision += 1
             delivery.dispatch_requested_at = clock
+            delivery.updated_at = clock
             session.add(DeliveryReconciliation(
                 id=uuid4(), conversation_id=conversation.id, delivery_attempt_id=delivery.id,
                 reconciliation_key=turn.id, fingerprint=fingerprint({
                     "contract_version": 1, "delivery_attempt_id": str(delivery.id),
-                    **reconcile.model_dump(mode="json")}), expected_revision=0, result_revision=1,
-                status="DISPATCH_REQUESTED", expected_authority_revision=turn.authority_revision,
-                accepted_at=clock))
-            await session.flush()
-        if delivery.authority_revision != conversation.authority_revision:
-            raise DomainError(ErrorCode.AUTHORITY_REVISION_CONFLICT)
+                    **evidence.model_dump(mode="json")}),
+                expected_revision=expected_revision, result_revision=delivery.revision,
+                status=status.value,
+                expected_authority_revision=evidence.expected_authority_revision,
+                expected_settling_revision=turn.settling_revision,
+                result_settling_revision=conversation.settling_revision,
+                accepted_at=clock,
+            ))
+            send = not stale
         session.add(WebsiteResponseAttempt(id=request.response_attempt_id,
                                            admission_id=admission.id, delivery_id=delivery.id,
                                            conversation_id=conversation.id, created_at=clock))
         await session.flush()
         result = WebsiteResponseBegun(response_attempt_id=request.response_attempt_id,
-                                      draft_text=turn.draft_text, replayed=False)
+                                      draft_text=turn.draft_text, send=send, replayed=False)
     return result
 
 

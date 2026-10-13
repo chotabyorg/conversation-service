@@ -69,6 +69,24 @@ class ManagedBinding(BaseModel):
         return self.owner_id, self.integration_id, self.channel
 
 
+class SettlingPolicy(BaseModel):
+    """Immutable per-channel policy snapshot source; no implicit timing default."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    version: Annotated[str, Field(min_length=1, max_length=64,
+                                  pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$")]
+    channel: Channel
+    integration_id: UUID | None = None
+    quiet_window_ms: Annotated[int, Field(strict=True, ge=1, le=86_400_000)]
+    max_wait_ms: Annotated[int, Field(strict=True, ge=1, le=604_800_000)]
+
+    @model_validator(mode="after")
+    def bounded_window(self) -> SettlingPolicy:
+        if self.max_wait_ms < self.quiet_window_ms:
+            raise ValueError("invalid settling policy")
+        return self
+
+
 TimeoutSeconds = Annotated[float, Field(strict=True, gt=0, le=240, allow_inf_nan=False)]
 
 
@@ -124,6 +142,12 @@ class Settings(BaseSettings):
     managed_ai_total_seconds: TimeoutSeconds = Field(
         default=120.0, alias="MANAGED_AI_TOTAL_SECONDS",
         validation_alias=AliasChoices("MANAGED_AI_TOTAL_SECONDS", "managed_ai_total_seconds"),
+    )
+
+    turn_settling_policies: Annotated[tuple[SettlingPolicy, ...], NoDecode] = Field(
+        default=(), alias="TURN_SETTLING_POLICIES",
+        validation_alias=AliasChoices("TURN_SETTLING_POLICIES", "turn_settling_policies"),
+        max_length=64, repr=False,
     )
 
     website_bindings: Annotated[tuple[WebsiteBinding, ...], NoDecode] = Field(
@@ -242,6 +266,18 @@ class Settings(BaseSettings):
                 raise ValueError("invalid Telegram configuration") from None
         return value
 
+    @field_validator("turn_settling_policies", mode="before")
+    @classmethod
+    def parse_settling_policies(cls, value: object) -> object:
+        if isinstance(value, str):
+            if len(value) > 65536:
+                raise ValueError("invalid settling configuration")
+            try:
+                return json.loads(value)
+            except (ValueError, TypeError):
+                raise ValueError("invalid settling configuration") from None
+        return value
+
     @field_validator("database_url")
     @classmethod
     def database_is_postgres(cls, value: SecretStr) -> SecretStr:
@@ -277,6 +313,16 @@ class Settings(BaseSettings):
         if any(entry.service_token.get_secret_value() in tokens
                for entry in self.managed_ai_bindings):
             raise ValueError("invalid managed AI configuration")
+        policy_scopes = [(entry.channel, entry.integration_id)
+                         for entry in self.turn_settling_policies]
+        if len(set(policy_scopes)) != len(policy_scopes):
+            raise ValueError("invalid settling configuration")
+        if any(not any(binding.channel == policy.channel and
+                       (policy.integration_id is None or
+                        binding.integration_id == policy.integration_id)
+                       for binding in self.managed_ai_bindings)
+               for policy in self.turn_settling_policies):
+            raise ValueError("invalid settling configuration")
         telegram_bindings = [b for b in self.managed_ai_bindings
                              if b.channel == Channel.TELEGRAM]
         telegram_ids = [str(b.integration_id) for b in telegram_bindings]
@@ -318,6 +364,16 @@ class Settings(BaseSettings):
                            for b in self.managed_ai_bindings):
                     raise ValueError("invalid website worker configuration")
         return self
+
+    def settling_policy_for(self, channel: Channel, integration_id: UUID) -> SettlingPolicy | None:
+        exact = next((
+            policy for policy in self.turn_settling_policies
+            if policy.channel == channel and policy.integration_id == integration_id
+        ), None)
+        if exact is not None:
+            return exact
+        return next((policy for policy in self.turn_settling_policies
+                     if policy.channel == channel and policy.integration_id is None), None)
 
 
 def load_settings() -> Settings:

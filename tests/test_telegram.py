@@ -30,10 +30,13 @@ NAMESPACE = "main-chota.telegram.v1"
 class DeterministicManagedPort(ManagedAIPort):
     def __init__(self) -> None:
         self.calls = 0
+        self.prepared: list[PreparedManagedRequest] = []
+        self.operation_refs: list[dict[str, str | None]] = []
 
     async def execute(self, prepared: PreparedManagedRequest, binding: Any,
                       request_id: str = "") -> ManagedTurnResult:
         self.calls += 1
+        self.prepared.append(prepared)
         request = prepared.request
         return ManagedTurnResult(
             contract_version=request.contract_version,
@@ -48,7 +51,7 @@ class DeterministicManagedPort(ManagedAIPort):
             status="DRAFT_READY",
             draft_text="Managed answer **bold**",
             error_code=None,
-            operation_refs=[],
+            operation_refs=self.operation_refs,
         )
 
     async def evidence(self, request: Any, binding: Any) -> Any:

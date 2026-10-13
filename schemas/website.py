@@ -40,6 +40,7 @@ class WebsiteResponseBegin(WebsiteIdentity):
 class WebsiteResponseBegun(Contract):
     response_attempt_id: UUID
     draft_text: TextContent
+    send: bool
     replayed: bool
 
 

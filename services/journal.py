@@ -7,6 +7,7 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.elements import ColumnElement
 
+from core.config import Settings
 from core.errors import DomainError
 from db.database import Database
 from models import Conversation, InboundEvent, Message
@@ -56,7 +57,7 @@ async def replay_result(
 
 
 async def ingest_event(
-    database: Database, principal: Principal, request: InboundEventCreate
+    database: Database, principal: Principal, request: InboundEventCreate, settings: Settings
 ) -> InboundEventResult:
     if not any(
         grant.owner_id == request.owner_id
@@ -131,11 +132,19 @@ async def ingest_event(
             else:
                 conversation.last_message_sequence += 1
                 conversation.input_revision += 1
+                policy = settings.settling_policy_for(request.channel, request.integration_id)
+                if policy is not None:
+                    conversation.settling_revision += 1
                 conversation.updated_at = accepted_at
                 message = Message(
                     id=uuid4(),
                     conversation_id=conversation.id,
                     sequence=conversation.last_message_sequence,
+                    input_revision=conversation.input_revision,
+                    settling_revision=conversation.settling_revision,
+                    settling_policy_version=policy.version if policy is not None else None,
+                    settling_quiet_window_ms=policy.quiet_window_ms if policy is not None else None,
+                    settling_max_wait_ms=policy.max_wait_ms if policy is not None else None,
                     actor="CUSTOMER",
                     direction="INBOUND",
                     content_type="TEXT",

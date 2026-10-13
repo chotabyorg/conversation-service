@@ -9,10 +9,10 @@ import pytest
 import pytest_asyncio
 from sqlalchemy import select, text, update
 
-from core.config import Settings
+from core.config import Settings, SettlingPolicy
 from core.logging import configure_logging
-from models import AgentTurn, Conversation, WebsiteAdmission
-from schemas.contracts import OperationReference, TurnClaim, TurnExecute
+from models import AgentTurn, Conversation, DeliveryAttempt, WebsiteAdmission
+from schemas.contracts import Channel, OperationReference, TurnClaim, TurnExecute
 from schemas.managed import ManagedTurnResult
 from schemas.website import ManagedEvidenceResult
 from services import managed_execution, turns
@@ -122,6 +122,50 @@ async def test_arbitration_sticky_both_policy_directions_and_no_legacy_message(w
         assert await conn.scalar(text("SELECT count(*) FROM messages")) == 1
         assert await conn.scalar(text("SELECT count(*) FROM website_admissions")) == 2
     assert (await wh.call("POST", BASE + "/results", identity(legacy))).status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_website_settling_batches_messages_and_fences_stale_draft(wh, sql):
+    policy = SettlingPolicy(version="website-test-v1", channel=Channel.WEBSITE_WIDGET,
+                            quiet_window_ms=250, max_wait_ms=1200)
+    settings = wh.settings.model_copy(update={"turn_settling_policies": (policy,)})
+    wh.settings = settings
+    wh.client._transport.app.state.settings = settings
+    wh.worker = WebsiteWorker(wh.database, settings, wh.ai)
+    session_id = str(uuid4())
+    first = payload(wh, session_id=session_id, message_id=str(uuid4()))
+    second = payload(wh, session_id=session_id, message_id=str(uuid4()))
+    assert (await admit(wh, first))["route"] == "MANAGED"
+    assert (await admit(wh, second))["route"] == "MANAGED"
+    async with sql.begin() as connection:
+        await connection.execute(text(
+            "UPDATE messages SET created_at=clock_timestamp() - "
+            "(:age * interval '1 millisecond') WHERE sequence=:sequence"
+        ), {"age": 300, "sequence": 1})
+        await connection.execute(text(
+            "UPDATE messages SET created_at=clock_timestamp() - "
+            "(:age * interval '1 millisecond') WHERE sequence=:sequence"
+        ), {"age": 80, "sequence": 2})
+    assert await wh.worker.run_once() is False
+    await asyncio.sleep(0.20)
+    assert await wh.worker.run_once() is True
+    assert len(wh.ai.calls) == 1
+    selected = wh.ai.calls[0].request
+    assert selected.input_first_sequence == 1
+    assert selected.input_last_sequence == selected.context_last_sequence == 2
+    assert len(selected.selected_input_message_ids) == 2
+
+    third = payload(wh, session_id=session_id, message_id=str(uuid4()))
+    assert (await admit(wh, third))["route"] == "MANAGED"
+    begin_body = {**identity(first), "response_attempt_id": str(uuid4())}
+    begun = await wh.call("POST", "/website/responses/begin", begin_body)
+    assert begun.status_code == 200, begun.text
+    assert begun.json()["send"] is False
+    async with wh.database.session_factory() as session, session.begin():
+        delivery = await session.scalar(select(DeliveryAttempt))
+        turn = await session.get(AgentTurn, selected.turn_id)
+    assert delivery is not None and delivery.status == "SUPERSEDED"
+    assert turn is not None and turn.operation_refs == []
 
 
 @pytest.mark.parametrize("change", ["text", "session_id", "agent_id"])
