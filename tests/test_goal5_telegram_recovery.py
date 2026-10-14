@@ -19,18 +19,25 @@ from uuid import UUID, uuid4
 
 import httpx
 import pytest
+from pydantic import SecretStr
 from sqlalchemy import func, select, text
 
+from core.config import SettlingPolicy
+from core.errors import DomainError
 from models import (
     AgentTurn,
     Conversation,
     DeliveryAttempt,
     DeliveryReconciliation,
+    Message,
     TelegramAdmission,
     TelegramImmediateTurn,
     TelegramProviderAccount,
     TelegramResponseAttempt,
+    TurnInputMessage,
 )
+from schemas.contracts import Channel, TurnClaim, TurnExecute
+from services import managed_execution, turns
 from services.common import fingerprint
 from services.telegram import expected_response_attempt_id, select_immediate
 from tests.conftest import ROOT
@@ -94,6 +101,7 @@ class Accepted0005TelegramRuntime:
         network_allowlist.add(("127.0.0.1", self.port))
         self.token = h["gateway_headers"]["X-Service-Token"]
         self.ai_token = secrets.token_urlsafe(32)
+        self.worker_token = secrets.token_urlsafe(32)
         self.database_url = database_url
         self.log_path = tmp_path / "accepted-0005-telegram.log"
         self.log = None
@@ -112,6 +120,11 @@ class Accepted0005TelegramRuntime:
             "role": "TELEGRAM",
             "token": self.token,
             "grants": grant,
+        }, {
+            "principal_id": "old-telegram-worker",
+            "role": "TELEGRAM_PROCESSING",
+            "token": self.worker_token,
+            "grants": grant,
         }]
         env = {
             **os.environ,
@@ -125,10 +138,12 @@ class Accepted0005TelegramRuntime:
                 "agent_id": str(AGENT),
                 "service_token": self.ai_token,
             }]),
+            "MANAGED_AI_BASE_URL": "http://127.0.0.1:1",
             "PYTHONPATH": str(self.source),
             "PYTHONDONTWRITEBYTECODE": "1",
             "LOG_LEVEL": "INFO",
         }
+        self.environment = env
         self.log = self.log_path.open("ab")
         self.process = subprocess.Popen(
             [sys.executable, "-m", "uvicorn", "main:app", "--host", "127.0.0.1",
@@ -162,6 +177,47 @@ class Accepted0005TelegramRuntime:
             self.url + "/internal/v1/telegram" + path, json=body,
             headers={"X-Service-Token": self.token},
         )
+
+    async def select_mark_then_select(self) -> tuple[UUID, UUID]:
+        """Use the exact archived 0005 selector and marker path, without AI I/O."""
+        script = self.source / "goal5_select_marked_turn.py"
+        script.write_text("""
+import asyncio
+import json
+from pydantic import SecretStr
+from core.config import load_settings
+from db.database import Database
+from schemas.contracts import TurnClaim, TurnExecute
+from services import managed_execution, telegram, turns
+
+async def main():
+    settings = load_settings()
+    principal = next(entry.principal() for entry in settings.auth_principals
+                     if entry.principal_id == 'old-telegram-worker')
+    database = Database(settings.database_url.get_secret_value())
+    first = await telegram.select_immediate(database, principal, settings)
+    assert first is not None
+    claim = await turns.claim_turn(database, principal, first, TurnClaim(
+        worker_ref='old-telegram-worker', lease_seconds=30))
+    proof = TurnExecute(claim_epoch=claim.turn.claim_epoch,
+                        claim_token=SecretStr(claim.claim_token))
+    snapshot = await managed_execution.take_snapshot(
+        database, principal, first, proof, settings)
+    prepared = managed_execution.prepare_snapshot(snapshot)
+    await managed_execution.mark_dispatch(database, principal, first, proof, prepared)
+    second = await telegram.select_immediate(database, principal, settings)
+    assert second is not None and second != first
+    print(json.dumps({'marked_turn_id': str(first), 'unmarked_turn_id': str(second)}))
+    await database.dispose()
+
+asyncio.run(main())
+""", encoding="utf-8")
+        result = subprocess.run(
+            [sys.executable, str(script)], cwd=self.source, env=self.environment,
+            capture_output=True, text=True, timeout=30, check=True,
+        )
+        selected = json.loads(result.stdout.strip().splitlines()[-1])
+        return UUID(selected["marked_turn_id"]), UUID(selected["unmarked_turn_id"])
 
     async def close(self) -> None:
         if self.process is not None:
@@ -285,6 +341,14 @@ async def test_first_managed_bot_writer_pins_account_and_same_bot_can_rotate(
         headers=h["gateway_headers"],
     )
     assert wrong.status_code == 404
+    # A token rotation that keeps the immutable provider bot can still dispatch
+    # new generic v2 work through the BOUND-account guard.
+    await _run_immediate(h, 2)
+    async with h["database"].session_factory() as session:
+        completed = await session.scalar(select(func.count()).select_from(AgentTurn).where(
+            AgentTurn.status == "COMPLETED",
+        ))
+        assert completed == 2
 
 
 @pytest.mark.asyncio
@@ -908,3 +972,322 @@ async def test_historical_0005_conflict_keeps_only_exact_response_and_marked_ai_
         if not upgraded:
             migrate(database_url, "upgrade", "head")
             await h["database"].ready()
+
+
+@pytest.mark.asyncio
+async def test_historical_conflict_blocks_generic_unmarked_telegram_execution(
+    telegram_harness, sql, database_url, tmp_path, network_allowlist,
+) -> None:
+    """Old selector-created v2 work must meet the account fence at generic execute."""
+    from core.config import AuthPrincipal
+
+    h = telegram_harness
+    await h["database"].dispose()
+    await sql.dispose()
+    migrate(database_url, "downgrade", "0005_telegram_canary")
+    runtime = Accepted0005TelegramRuntime(h, database_url, tmp_path, network_allowlist)
+    upgraded = False
+    try:
+        await runtime.start()
+        first = _payload(message_id=701, update_id=801, chat_id=37_701, bot_id=999)
+        second = _payload(message_id=702, update_id=802, chat_id=37_702, bot_id=1_000)
+        accepted = []
+        for payload in (first, second):
+            response = await runtime.post("/admissions", payload)
+            assert response.status_code == 200, response.text
+            accepted.append(response.json())
+
+        marked_turn_id, unmarked_turn_id = await runtime.select_mark_then_select()
+        async with sql.connect() as connection:
+            before_upgrade = (await connection.execute(text(
+                "SELECT id::text AS id, managed_contract_version, managed_dispatch_epoch, "
+                "managed_dispatch_started_at, managed_request_fingerprint "
+                "FROM agent_turns WHERE id IN (:marked,:unmarked) ORDER BY id"
+            ), {"marked": marked_turn_id, "unmarked": unmarked_turn_id})).mappings().all()
+            assert {row["id"] for row in before_upgrade} == {
+                str(marked_turn_id), str(unmarked_turn_id),
+            }
+            assert all(row["managed_contract_version"] == 2 for row in before_upgrade)
+            assert next(row for row in before_upgrade if row["id"] == str(marked_turn_id))[
+                "managed_dispatch_epoch"] == 1
+            assert next(row for row in before_upgrade if row["id"] == str(unmarked_turn_id))[
+                "managed_dispatch_epoch"] is None
+
+        await runtime.close()
+        migrate(database_url, "upgrade", "head")
+        upgraded = True
+        assert await h["database"].ready()
+        async with h["database"].session_factory() as session:
+            account = await session.get(TelegramProviderAccount, (OWNER, INTEGRATION))
+            assert account is not None and account.state == "CONFLICT"
+            marked = await session.get(AgentTurn, marked_turn_id)
+            unmarked = await session.get(AgentTurn, unmarked_turn_id)
+            assert marked is not None and marked.managed_dispatch_epoch == 1
+            assert unmarked is not None and unmarked.managed_dispatch_epoch is None
+
+        full_token = secrets.token_urlsafe(32)
+        full = AuthPrincipal(
+            principal_id="r4-generic-full",
+            role="FULL",
+            token=full_token,
+            grants=h["settings"].auth_principals[0].grants,
+        )
+        h["settings"] = h["settings"].model_copy(update={
+            "auth_principals": (*h["settings"].auth_principals, full),
+        })
+        h["app"].state.settings = h["settings"]
+        port = DeterministicManagedPort()
+        h["app"].state.managed_port = port
+        full_headers = {"X-Service-Token": full_token}
+        claimed = await h["client"].post(
+            f"/internal/v1/turns/{unmarked_turn_id}/claim",
+            json={"worker_ref": "generic-full-r4", "lease_seconds": 30},
+            headers=full_headers,
+        )
+        assert claimed.status_code == 200, claimed.text
+        claim = claimed.json()
+        denied = await h["client"].post(
+            f"/internal/v1/turns/{unmarked_turn_id}/execute",
+            json={"claim_epoch": claim["turn"]["claim_epoch"],
+                  "claim_token": claim["claim_token"]},
+            headers=full_headers,
+        )
+        assert denied.status_code == 422, denied.text
+        assert denied.json()["detail"]["code"] == "VALIDATION_ERROR"
+        assert port.calls == 0
+        async with sql.connect() as connection:
+            blocked = (await connection.execute(text(
+                "SELECT status,managed_dispatch_epoch,managed_dispatch_started_at "
+                "FROM agent_turns WHERE id=:id"
+            ), {"id": unmarked_turn_id})).mappings().one()
+            assert blocked["status"] == "CLAIMED"
+            assert blocked["managed_dispatch_epoch"] is None
+            assert blocked["managed_dispatch_started_at"] is None
+
+        async with sql.begin() as connection:
+            await connection.execute(text(
+                "UPDATE agent_turns SET lease_expires_at=clock_timestamp()-interval '1 second' "
+                "WHERE id=:id"
+            ), {"id": marked_turn_id})
+        from services.telegram_worker import TelegramWorker
+
+        worker = TelegramWorker(h["database"], h["settings"], port)
+        assert await worker.run_once()
+        assert port.calls == 0
+        async with h["database"].session_factory() as session:
+            recovered = await session.get(AgentTurn, marked_turn_id)
+            assert recovered is not None
+            assert recovered.status == "FAILED"
+            assert recovered.failure_code == "EXECUTION_UNKNOWN"
+            assert recovered.managed_dispatch_epoch == 1
+            assert recovered.operation_refs == []
+        async with h["database"].session_factory() as session:
+            marked_admission = await session.scalar(select(TelegramAdmission).join(
+                TelegramImmediateTurn,
+                TelegramImmediateTurn.message_id == TelegramAdmission.canonical_message_id,
+            ).where(TelegramImmediateTurn.turn_id == marked_turn_id))
+            assert marked_admission is not None
+            marked_identity = {
+                "owner_id": marked_admission.owner_id,
+                "integration_id": str(marked_admission.integration_id),
+                "agent_id": str(marked_admission.agent_id),
+                "provider_thread_id": marked_admission.provider_thread_id,
+                "provider_event_id": marked_admission.provider_event_id,
+                "bot_id": int(marked_admission.bot_id),
+            }
+        marked_result = await h["client"].post(
+            "/internal/v1/telegram/results", json=marked_identity,
+            headers=h["gateway_headers"],
+        )
+        assert marked_result.status_code == 200
+        assert marked_result.json()["turn_id"] == str(marked_turn_id)
+        assert marked_result.json()["progress_disposition"] == "TERMINAL"
+    finally:
+        await runtime.close()
+        if not upgraded:
+            migrate(database_url, "upgrade", "head")
+            await h["database"].ready()
+
+
+@pytest.mark.asyncio
+async def test_generic_telegram_execution_rechecks_complete_members_at_both_boundaries(
+    sql, telegram_harness, test_database_clock,
+) -> None:
+    h = telegram_harness
+    settings = h["settings"].model_copy(update={
+        "turn_settling_policies": (SettlingPolicy(
+            version="r4-member-range", channel=Channel.TELEGRAM,
+            quiet_window_ms=10, max_wait_ms=100,
+        ),),
+    })
+    h["settings"] = settings
+    h["app"].state.settings = settings
+    values = [
+        _payload(message_id=901 + index, update_id=1_001 + index,
+                 chat_id=39_901, bot_id=999)
+        for index in range(3)
+    ]
+    admissions = []
+    for value in values:
+        response = await h["client"].post(
+            "/internal/v1/telegram/admissions", json=value,
+            headers=h["gateway_headers"],
+        )
+        assert response.status_code == 200, response.text
+        admissions.append(response.json())
+
+    async with sql.connect() as connection:
+        deadline = await connection.scalar(text(
+            "SELECT max(b.ready_at) FROM settling_bursts b "
+            "JOIN telegram_admissions a ON a.conversation_id=b.conversation_id "
+            "WHERE a.id IN (:first,:second,:third)"
+        ), {"first": admissions[0]["admission_id"],
+            "second": admissions[1]["admission_id"],
+            "third": admissions[2]["admission_id"]})
+    assert deadline is not None
+    test_database_clock.advance_to(deadline)
+    principal = next(entry.principal() for entry in h["settings"].auth_principals
+                     if entry.principal_id == "telegram-worker")
+    from services.settling import select_settled_turn
+
+    turn_id = await select_settled_turn(
+        h["database"], principal, settings, (Channel.TELEGRAM,)
+    )
+    assert turn_id is not None
+    claim = await turns.claim_turn(
+        h["database"], principal, turn_id,
+        TurnClaim(worker_ref="r4-membership-check", lease_seconds=30),
+    )
+    proof = TurnExecute(
+        claim_epoch=claim.turn.claim_epoch,
+        claim_token=SecretStr(claim.claim_token),
+    )
+    turn_read = claim.turn
+    conversation_id = turn_read.conversation_id
+    async with h["database"].session_factory() as session:
+        original_members = (await session.execute(select(
+            TelegramAdmission.canonical_message_id, Message.sequence,
+        ).join(Message, Message.id == TelegramAdmission.canonical_message_id)
+         .where(TelegramAdmission.id.in_([
+             UUID(item["admission_id"]) for item in admissions
+         ])).order_by(Message.sequence))).all()
+    assert len(original_members) == 3
+    missing_message_id = original_members[1].canonical_message_id
+
+    # The first-range snapshot has endpoints 1 and 3 but deliberately omits
+    # canonical sequence 2; endpoint-only validation would accept this shape.
+    async with h["database"].session_factory() as session, session.begin():
+        missing_map = await session.get(TurnInputMessage, missing_message_id)
+        missing_link = await session.get(TelegramImmediateTurn, missing_message_id)
+        assert missing_map is not None and missing_link is not None
+        await session.delete(missing_map)
+        await session.delete(missing_link)
+
+    with pytest.raises(DomainError) as missing_middle:
+        await managed_execution.take_snapshot(
+            h["database"], principal, turn_id, proof, h["settings"]
+        )
+    assert missing_middle.value.code.value == "VALIDATION_ERROR"
+    async with h["database"].session_factory() as session:
+        persisted = await session.get(AgentTurn, turn_id)
+        assert persisted is not None and persisted.managed_dispatch_epoch is None
+
+    # Restore the valid complete snapshot, then remove the middle member
+    # after take_snapshot to prove mark_dispatch repeats the full membership check.
+    async with h["database"].session_factory() as session, session.begin():
+        session.add(TelegramImmediateTurn(
+            message_id=missing_message_id, conversation_id=conversation_id, turn_id=turn_id,
+        ))
+        session.add(TurnInputMessage(
+            message_id=missing_message_id, conversation_id=conversation_id,
+            turn_id=turn_id, sequence=original_members[1].sequence, ordinal=1,
+        ))
+    snapshot = await managed_execution.take_snapshot(
+        h["database"], principal, turn_id, proof, h["settings"]
+    )
+    prepared = managed_execution.prepare_snapshot(snapshot)
+    async with h["database"].session_factory() as session, session.begin():
+        missing_map = await session.get(TurnInputMessage, missing_message_id)
+        missing_link = await session.get(TelegramImmediateTurn, missing_message_id)
+        assert missing_map is not None and missing_link is not None
+        await session.delete(missing_map)
+        await session.delete(missing_link)
+    with pytest.raises(DomainError) as changed_members:
+        await managed_execution.mark_dispatch(
+            h["database"], principal, turn_id, proof, prepared
+        )
+    assert changed_members.value.code.value == "VALIDATION_ERROR"
+    async with h["database"].session_factory() as session:
+        persisted = await session.get(AgentTurn, turn_id)
+        assert persisted is not None and persisted.managed_dispatch_epoch is None
+    async with h["database"].session_factory() as session, session.begin():
+        session.add(TelegramImmediateTurn(
+            message_id=missing_message_id, conversation_id=conversation_id, turn_id=turn_id,
+        ))
+        session.add(TurnInputMessage(
+            message_id=missing_message_id, conversation_id=conversation_id, turn_id=turn_id,
+            sequence=original_members[1].sequence, ordinal=1,
+        ))
+
+
+@pytest.mark.parametrize("bad_member", ["agent", "bot", "thread"])
+async def test_generic_telegram_snapshot_rejects_wrong_member_identity(
+    sql, telegram_harness, bad_member: str,
+) -> None:
+    h = telegram_harness
+    value = _payload(message_id=1_101, update_id=1_201, chat_id=40_101, bot_id=999)
+    accepted = await h["client"].post(
+        "/internal/v1/telegram/admissions", json=value,
+        headers=h["gateway_headers"],
+    )
+    assert accepted.status_code == 200, accepted.text
+    principal = next(entry.principal() for entry in h["settings"].auth_principals
+                     if entry.principal_id == "telegram-worker")
+    turn_id = await select_immediate(h["database"], principal, h["settings"])
+    assert turn_id is not None
+    claim = await turns.claim_turn(
+        h["database"], principal, turn_id,
+        TurnClaim(worker_ref="r4-identity-check", lease_seconds=30),
+    )
+    proof = TurnExecute(
+        claim_epoch=claim.turn.claim_epoch,
+        claim_token=SecretStr(claim.claim_token),
+    )
+    admission_id = UUID(accepted.json()["admission_id"])
+    async with h["database"].session_factory() as session, session.begin():
+        admission = await session.get(TelegramAdmission, admission_id)
+        assert admission is not None
+        if bad_member == "agent":
+            admission.agent_id = uuid4()
+        elif bad_member == "bot":
+            admission.bot_id = "1000"
+            admission.provider_event_id = (
+                f"b{admission.bot_id}c{admission.chat_id}m{admission.message_id}"
+            )
+        else:
+            admission.provider_thread_id = "40102"
+            admission.chat_id = "40102"
+            admission.sender_id = "40102"
+            admission.provider_event_id = (
+                f"b{admission.bot_id}c{admission.chat_id}m{admission.message_id}"
+            )
+
+    port = DeterministicManagedPort()
+    with pytest.raises(DomainError) as rejected:
+        await managed_execution.execute_claimed_turn(
+            h["database"], principal, turn_id, proof, h["settings"], port,
+        )
+    assert rejected.value.code.value == "VALIDATION_ERROR"
+    assert port.calls == 0
+    async with h["database"].session_factory() as session:
+        persisted = await session.get(AgentTurn, turn_id)
+        assert persisted is not None and persisted.managed_dispatch_epoch is None
+    async with h["database"].session_factory() as session, session.begin():
+        admission = await session.get(TelegramAdmission, admission_id)
+        assert admission is not None
+        admission.agent_id = UUID(str(value["agent_id"]))
+        admission.bot_id = str(value["bot_id"])
+        admission.provider_thread_id = str(value["provider_thread_id"])
+        admission.chat_id = str(value["chat_id"])
+        admission.sender_id = str(value["sender_id"])
+        admission.provider_event_id = str(value["provider_event_id"])

@@ -402,7 +402,11 @@ async def _validated_turn_admissions(
     if (mapped[0][1].sequence != turn.input_first_sequence
             or mapped[-1][1].sequence != turn.input_last_sequence):
         raise DomainError(ErrorCode.VALIDATION_ERROR)
-    if any(row.ordinal != index or row.sequence != message.sequence
+    expected_count = turn.input_last_sequence - turn.input_first_sequence + 1
+    if len(mapped) != expected_count or any(
+            row.ordinal != index
+            or row.sequence != turn.input_first_sequence + index
+            or row.sequence != message.sequence
            for index, (row, message) in enumerate(mapped)):
         raise DomainError(ErrorCode.VALIDATION_ERROR)
     map_ids = [message.id for _, message in mapped]

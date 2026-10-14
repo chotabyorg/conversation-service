@@ -253,6 +253,8 @@ async def begin_response(database: Database, principal: Principal, request: Webs
             ).with_for_update().execution_options(populate_existing=True))
             if attempt is None or delivery is None or attempt.delivery_id != delivery.id:
                 raise DomainError(ErrorCode.DELIVERY_IDENTITY_CONFLICT)
+            if delivery.source_turn_id != turn.id:
+                raise DomainError(ErrorCode.DELIVERY_IDENTITY_CONFLICT)
 
         def settling_revision_is_current() -> bool:
             if turn.settling_burst_id is None:

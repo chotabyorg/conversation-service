@@ -455,6 +455,7 @@ async def test_real_http_identity_replay_conflict_same_text_new_id_and_isolation
     await start_chain(h)
     body = h.body()
     first = await h.eventual_chat(body)
+    await wait_response_outcome(h, body["message_id"], "WRITE_COMPLETED")
     first_state = await h.state(body["message_id"])
     replay = await h.chat(body)
     assert replay.status_code == 200 and replay.json() == first.json()
@@ -539,6 +540,7 @@ async def test_completed_response_replay_after_gateway_restart_is_read_only(wh):
     first = await h.eventual_chat(body)
     assert first.status_code == 200
     assert first.headers["Cache-Control"] == "no-store"
+    await wait_response_outcome(h, body["message_id"], "WRITE_COMPLETED")
     before = await h.rows(
         "SELECT id,admission_id,delivery_id,send_authorized,outcome "
         "FROM website_response_attempts ORDER BY created_at,id"

@@ -10,17 +10,17 @@ import subprocess
 import sys
 import tarfile
 from pathlib import Path
-from uuid import NAMESPACE_URL, uuid4, uuid5
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 import httpx
 import pytest
 from sqlalchemy import select, text
 from sqlalchemy.engine import make_url
 
-from models import AgentTurn, WebsiteAdmission, WebsiteImmediateTurn
+from models import AgentTurn, WebsiteAdmission, WebsiteImmediateTurn, WebsiteResponseAttempt
 from tests.conftest import ROOT
 from tests.test_managed_migration import migrate
-from tests.test_website import identity, payload
+from tests.test_website import admit, identity, payload, v2_response_attempt_id
 from tests.test_website import wh as website_fixture
 
 wh = website_fixture
@@ -765,3 +765,80 @@ async def test_no_policy_input_revision_matches_across_0005_and_0006(
     finally:
         await runtime.close()
         await upgrade_after_0005(wh, sql, database_url)
+
+
+@pytest.mark.parametrize("completed", [False, True], ids=["unresolved", "cached-success"])
+async def test_begin_rejects_same_conversation_attempt_with_wrong_delivery_parent(
+    wh, sql, completed: bool,
+) -> None:
+    """A retained attempt cannot replay or reconcile another Turn's delivery."""
+    session_id = str(uuid4())
+    first = payload(wh, session_id=session_id, message_id=str(uuid4()))
+    second = payload(wh, session_id=session_id, message_id=str(uuid4()))
+    assert (await admit(wh, first))["route"] == "MANAGED"
+    assert await wh.worker.run_once()
+    assert (await admit(wh, second))["route"] == "MANAGED"
+    assert await wh.worker.run_once()
+
+    first_attempt_id = await v2_response_attempt_id(wh, first)
+    second_attempt_id = await v2_response_attempt_id(wh, second)
+    first_begin = await wh.call("POST", "/website/responses/begin", {
+        **identity(first), "response_attempt_id": first_attempt_id,
+    })
+    second_begin = await wh.call("POST", "/website/responses/begin", {
+        **identity(second), "response_attempt_id": second_attempt_id,
+    })
+    assert first_begin.status_code == second_begin.status_code == 200
+    assert first_begin.json()["action"] == second_begin.json()["action"] == "SEND"
+    if completed:
+        evidence = await wh.call("POST", "/website/responses/complete", {
+            **identity(first), "response_attempt_id": first_attempt_id,
+            "outcome": "WRITE_COMPLETED",
+        })
+        assert evidence.status_code == 200, evidence.text
+
+    async with wh.database.session_factory() as session, session.begin():
+        first_attempt = await session.get(WebsiteResponseAttempt, UUID(first_attempt_id))
+        second_attempt = await session.get(WebsiteResponseAttempt, UUID(second_attempt_id))
+        assert first_attempt is not None and second_attempt is not None
+        first_delivery_id = first_attempt.delivery_id
+        second_delivery_id = second_attempt.delivery_id
+        assert first_delivery_id != second_delivery_id
+        first_attempt.delivery_id = second_delivery_id
+
+    async def retained_state():
+        async with sql.connect() as connection:
+            attempts = (await connection.execute(text(
+                "SELECT id::text,admission_id::text,delivery_id::text,conversation_id::text,"
+                "send_authorized,outcome,finished_at FROM website_response_attempts "
+                "ORDER BY id"
+            ))).mappings().all()
+            deliveries = (await connection.execute(text(
+                "SELECT id::text,source_turn_id::text,status,revision,error_code,"
+                "dispatch_requested_at,updated_at FROM delivery_attempts ORDER BY id"
+            ))).mappings().all()
+            reconciliations = (await connection.execute(text(
+                "SELECT id::text,delivery_attempt_id::text,reconciliation_key::text,status,"
+                "error_code,result_revision,accepted_at FROM delivery_reconciliations ORDER BY id"
+            ))).mappings().all()
+            history = (await connection.execute(text(
+                "SELECT id::text,conversation_id::text,sequence,actor,direction,text,"
+                "source_agent_turn_id::text FROM messages ORDER BY conversation_id,sequence"
+            ))).mappings().all()
+        return (list(map(dict, attempts)), list(map(dict, deliveries)),
+                list(map(dict, reconciliations)), list(map(dict, history)))
+
+    before = await retained_state()
+    if completed:
+        assert any(row["id"] == first_attempt_id
+                   and row["outcome"] == "WRITE_COMPLETED" for row in before[0])
+    else:
+        assert any(row["id"] == first_attempt_id and row["outcome"] is None
+                   for row in before[0])
+
+    rejected = await wh.call("POST", "/website/responses/begin", {
+        **identity(first), "response_attempt_id": first_attempt_id,
+    })
+    assert rejected.status_code == 409, rejected.text
+    assert rejected.json()["detail"]["code"] == "DELIVERY_IDENTITY_CONFLICT"
+    assert await retained_state() == before

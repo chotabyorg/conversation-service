@@ -42,7 +42,7 @@ from schemas.managed import (
     PreparedManagedRequest,
     prepare_request,
 )
-from services import turns
+from services import telegram, turns
 from services.common import db_clock, locked_turn
 from services.history_projection import canonical_window, projected_request
 from services.managed_client import ManagedAIPort, ManagedPortFailure
@@ -99,6 +99,26 @@ async def validate_website_agent(
         raise DomainError(ErrorCode.VALIDATION_ERROR)
 
 
+async def validate_fresh_telegram_dispatch(
+    session: AsyncSession, turn: AgentTurn, conversation: Conversation, agent_id: UUID
+) -> None:
+    """Fence new Telegram v2 AI execution on the pinned account and full input range."""
+    if (conversation.channel != Channel.TELEGRAM.value
+            or turn.managed_contract_version != 2):
+        return
+    account = await telegram._telegram_account(
+        session, conversation.owner_id, conversation.integration_id
+    )
+    if (account is None or account.state != "BOUND" or account.bot_id is None
+            or turn.managed_projection_agent_id != agent_id):
+        raise DomainError(ErrorCode.VALIDATION_ERROR)
+    members = await telegram._validated_turn_admissions(
+        session, conversation, turn, agent_id
+    )
+    if not members or any(member.bot_id != account.bot_id for member in members):
+        raise DomainError(ErrorCode.VALIDATION_ERROR)
+
+
 async def claimed_state(
     session: AsyncSession, principal: Principal, turn_id: UUID, proof: TurnExecute
 ) -> tuple[AgentTurn, TurnResult | RecoverMarked | None]:
@@ -136,6 +156,9 @@ async def take_snapshot(
         if binding is None or settings.managed_ai_base_url is None:
             raise DomainError(ErrorCode.SERVICE_UNAVAILABLE)
         await validate_website_agent(session, turn, binding.agent_id, conversation.channel)
+        await validate_fresh_telegram_dispatch(
+            session, turn, conversation, binding.agent_id
+        )
         messages = await canonical_window(session, conversation.id,
             turn.managed_context_first_sequence, turn.context_last_sequence)
         snapshot = Snapshot(TurnRead.model_validate(turn), *scope, binding, messages,
@@ -195,6 +218,9 @@ async def mark_dispatch(
             raise DomainError(ErrorCode.NOT_FOUND)
         await validate_website_agent(
             session, turn, prepared.request.agent_id, conversation.channel
+        )
+        await validate_fresh_telegram_dispatch(
+            session, turn, conversation, prepared.request.agent_id
         )
         messages = await canonical_window(session, conversation.id,
             turn.managed_context_first_sequence, turn.context_last_sequence)

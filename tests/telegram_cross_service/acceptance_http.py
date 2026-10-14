@@ -44,6 +44,40 @@ CS_PYTHON = Path(os.environ.get(
     "GOAL5_CONVERSATION_PYTHON", str(CS_ROOT / ".venv/bin/python")
 ))
 EVIDENCE: list[dict[str, object]] = []
+_SENSITIVE_EVIDENCE_FIELDS = {
+    "authorization", "body", "bot_token", "password", "payload", "raw",
+    "raw_provider_response", "secret", "text", "token",
+}
+
+
+def _safe_evidence(value):
+    if isinstance(value, dict):
+        return {
+            str(key): _safe_evidence(item)
+            for key, item in value.items()
+            if str(key).lower() not in _SENSITIVE_EVIDENCE_FIELDS
+        }
+    if isinstance(value, (list, tuple)):
+        return [_safe_evidence(item) for item in value]
+    return value
+
+
+def _persist_telegram_evidence() -> None:
+    path = os.environ.get("GOAL4B_EVIDENCE_PATH")
+    if not path:
+        return
+    target = Path(path)
+    if not target.is_absolute() or target.parent != Path("/private/tmp"):
+        raise RuntimeError("Evidence path must be inside /private/tmp")
+    target.write_text(json.dumps(_safe_evidence(EVIDENCE), indent=2,
+                                 sort_keys=True, default=str))
+    target.chmod(0o600)
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _persist_evidence_after_acceptance_module():
+    yield
+    _persist_telegram_evidence()
 
 
 @pytest.fixture(scope="session")
@@ -1385,13 +1419,7 @@ async def test_goal4b_required_local_process_matrix(th, sql) -> None:
                      "run existing Website process acceptance separately"})
     EVIDENCE.append({"scenario": 21, "conversation_v1_v2_regression":
                      "run complete Conversation suite separately"})
-    evidence_path = os.environ.get("GOAL4B_EVIDENCE_PATH")
-    if evidence_path:
-        target = Path(evidence_path)
-        if not target.is_absolute() or target.parent != Path("/private/tmp"):
-            raise RuntimeError("Evidence path must be inside /private/tmp")
-        target.write_text(json.dumps(EVIDENCE, indent=2, sort_keys=True, default=str))
-        target.chmod(0o600)
+    _persist_telegram_evidence()
 
 
 @pytest.mark.asyncio
@@ -1589,20 +1617,6 @@ async def test_goal5_commit_response_loss_restarts_from_absent_offset(th) -> Non
         "replay_same_admission": True, "restart_offset": None,
         "provider_gaps_preserved": [570, 580, 920],
     })
-
-
-def pytest_terminal_summary(terminalreporter, exitstatus, config) -> None:
-    if EVIDENCE:
-        terminalreporter.write_line("Goal4B Telegram local process matrix (synthetic IDs only):")
-        for row in EVIDENCE:
-            terminalreporter.write_line(json.dumps(row, sort_keys=True, default=str))
-        path = os.environ.get("GOAL4B_EVIDENCE_PATH")
-        if path:
-            target = Path(path)
-            if not target.is_absolute() or target.parent != Path("/private/tmp"):
-                raise RuntimeError("Evidence path must be inside /private/tmp")
-            target.write_text(json.dumps(EVIDENCE, indent=2, sort_keys=True, default=str))
-            target.chmod(0o600)
 
 
 @pytest.mark.asyncio
