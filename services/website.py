@@ -508,9 +508,8 @@ async def complete_response(database: Database, principal: Principal,
         if not replayed:
             # Permission is bound to this exact transport attempt. A separate
             # attempt can share the Turn's delivery row but must not borrow its
-            # dispatch authorization. UNKNOWN remains eligible for late evidence.
-            if delivery.status not in {"DISPATCH_REQUESTED", "UNKNOWN"}:
-                raise DomainError(ErrorCode.INVALID_DELIVERY_TRANSITION)
+            # dispatch authorization. Its evidence remains independent of the
+            # aggregate delivery state, which may reflect another attempt.
             clock = await db_clock(session)
             attempt.outcome = request.outcome
             attempt.finished_at = clock

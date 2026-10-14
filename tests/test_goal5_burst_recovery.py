@@ -9,7 +9,7 @@ from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError
 
 import services.settling as settling_service
@@ -20,6 +20,8 @@ from models import (
     Message,
     SettlingBurst,
     TelegramAdmission,
+    TelegramImmediateTurn,
+    TelegramProviderAccount,
     TurnInputMessage,
 )
 from schemas.contracts import Channel
@@ -540,6 +542,31 @@ async def test_schema_rejects_invalid_membership_and_frozen_burst_rewrites(
         {"id": uuid4(), "conversation": conversation.id, "burst": burst.id,
          "policy": burst.policy_version}, "23514", "ck_message_settling_burst_shape",
     )
+    for input_revision, settling_revision in (
+        (None, 0), (1, None), (0, 0), (1, -1),
+    ):
+        await violation(
+            sql,
+            "INSERT INTO messages(id,conversation_id,sequence,input_revision,"
+            "settling_revision,settling_policy_version,settling_quiet_window_ms,"
+            "settling_max_wait_ms,settling_burst_id,actor,direction,content_type,text) "
+            "VALUES(:id,:conversation,99,:input_revision,:settling_revision,:policy,1000,"
+            "5000,:burst,'CUSTOMER','INBOUND','TEXT','invalid revision snapshot')",
+            {"id": uuid4(), "conversation": conversation.id,
+             "input_revision": input_revision, "settling_revision": settling_revision,
+             "policy": burst.policy_version, "burst": burst.id}, "23514",
+            "ck_message_settling_burst_shape",
+        )
+    await violation(
+        sql,
+        "UPDATE messages SET input_revision=input_revision + 1 WHERE id=:id",
+        {"id": messages[0].id}, "23514",
+    )
+    await violation(
+        sql,
+        "UPDATE messages SET settling_revision=settling_revision + 1 WHERE id=:id",
+        {"id": messages[0].id}, "23514",
+    )
 
     clock[0] = burst.ready_at
     worker = TelegramWorker(h["database"], settings, DeterministicManagedPort())
@@ -552,6 +579,280 @@ async def test_schema_rejects_invalid_membership_and_frozen_burst_rewrites(
         "UPDATE agent_turns SET settling_burst_id=NULL WHERE id=:id",
         {"id": turn.id}, "23514",
     )
+
+
+@pytest.mark.asyncio
+async def test_malformed_first_middle_and_last_snapshots_rollback_candidate_then_select_tail(
+    telegram_harness, sql, monkeypatch
+):
+    """Every member is validated before projection and bad candidates stay isolated."""
+    h = telegram_harness
+    async with sql.connect() as connection:
+        db_now = await connection.scalar(text("SELECT clock_timestamp()"))
+    assert isinstance(db_now, datetime)
+    base = db_now - timedelta(minutes=2)
+    clock = _fixed_database_clock(monkeypatch, base)
+    settings = _settings(h, version="poison-snapshots", quiet_ms=1_000,
+                         max_wait_ms=5_000)
+    _install(h, settings)
+
+    malformed_cases = (
+        ("first", 0, "input_revision", None),
+        ("middle", 1, "settling_revision", None),
+        ("last-input", 2, "input_revision", -1),
+        ("last-settling", 2, "settling_revision", -1),
+    )
+    candidates = []
+    for group_index, (name, target_index, field, bad_value) in enumerate(malformed_cases):
+        admissions = []
+        start = base + timedelta(seconds=group_index * 2)
+        for message_index in range(3):
+            clock[0] = start + timedelta(milliseconds=message_index * 100)
+            admissions.append(await _admit(
+                h, message_id=80_000 + group_index * 10 + message_index,
+                update_id=90_000 + group_index * 10 + message_index,
+                chat_id=100_000 + group_index,
+                text_value=f"{name}-{message_index}",
+            ))
+        candidates.append((name, admissions, target_index, field, bad_value))
+
+    valid_admissions = []
+    valid_start = base + timedelta(seconds=2 * len(candidates))
+    for message_index in range(3):
+        clock[0] = valid_start + timedelta(milliseconds=message_index * 100)
+        valid_admissions.append(await _admit(
+            h, message_id=81_000 + message_index,
+            update_id=91_000 + message_index, chat_id=110_000,
+            text_value=f"valid-tail-{message_index}",
+        ))
+    clock[0] = valid_start + timedelta(seconds=3)
+
+    candidate_ids = [UUID(admission["admission_id"])
+                     for _, admissions, _, _, _ in candidates for admission in admissions]
+    valid_ids = [UUID(admission["admission_id"]) for admission in valid_admissions]
+    async with h["database"].session_factory() as session, session.begin():
+        rows_by_admission = list((await session.execute(select(
+            TelegramAdmission.id,
+            TelegramAdmission.conversation_id,
+            TelegramAdmission.canonical_message_id,
+            Message.input_revision,
+            Message.settling_revision,
+        ).join(Message, Message.id == TelegramAdmission.canonical_message_id).where(
+            TelegramAdmission.id.in_([*candidate_ids, *valid_ids])
+        ).order_by(TelegramAdmission.update_id))).all())
+    assert len(rows_by_admission) == 15
+    by_admission = {row.id: row for row in rows_by_admission}
+    corruption = []
+    expected_valid_messages = []
+    poison_conversations = set()
+    for name, admissions, target_index, field, bad_value in candidates:
+        ordered = [by_admission[UUID(item["admission_id"])] for item in admissions]
+        poison_conversations.add(ordered[0].conversation_id)
+        row = ordered[target_index]
+        corruption.append((row.canonical_message_id, field, bad_value))
+    valid_rows = [by_admission[item] for item in valid_ids]
+    valid_conversation_id = valid_rows[0].conversation_id
+    expected_valid_messages = [row.canonical_message_id for row in valid_rows]
+    assert all(row.conversation_id == valid_conversation_id for row in valid_rows)
+    assert len(poison_conversations) == len(candidates)
+
+    original_snapshots = {}
+    for message_id, _, _ in corruption:
+        row = next(row for row in rows_by_admission if row.canonical_message_id == message_id)
+        original_snapshots[message_id] = (row.input_revision, row.settling_revision)
+
+    async with sql.begin() as connection:
+        await connection.execute(text(
+            "ALTER TABLE messages DROP CONSTRAINT ck_message_settling_burst_shape"))
+        await connection.execute(text(
+            "DROP TRIGGER preserve_message_settling_membership ON messages"))
+        for message_id, field, bad_value in corruption:
+            assert field in {"input_revision", "settling_revision"}
+            await connection.execute(text(
+                f"UPDATE messages SET {field}=:value WHERE id=:id"),
+                {"value": bad_value, "id": message_id})
+
+    try:
+        worker_principal = next(item.principal() for item in settings.auth_principals
+                                if item.principal_id == settings.telegram_worker_principal_id)
+        selected_id = await select_settled_turn(
+            h["database"], worker_principal, settings,
+            (Channel.TELEGRAM,),
+        )
+        assert selected_id is not None
+        async with h["database"].session_factory() as session, session.begin():
+            selected = await session.get(AgentTurn, selected_id)
+            turns = list((await session.scalars(select(AgentTurn))).all())
+            owners = list((await session.scalars(select(TurnInputMessage).order_by(
+                TurnInputMessage.ordinal))).all())
+        assert selected is not None and selected.conversation_id == valid_conversation_id
+        assert len(turns) == 1
+        assert [owner.message_id for owner in owners] == expected_valid_messages
+        async with h["database"].session_factory() as session, session.begin():
+            poison_turns = await session.scalar(select(func.count()).select_from(
+                AgentTurn).where(AgentTurn.conversation_id.in_(poison_conversations)))
+            poison_owners = await session.scalar(select(func.count()).select_from(
+                TurnInputMessage).join(Message, Message.id == TurnInputMessage.message_id).where(
+                    Message.conversation_id.in_(poison_conversations)))
+            open_poison_bursts = await session.scalar(select(func.count()).select_from(
+                SettlingBurst).where(SettlingBurst.conversation_id.in_(poison_conversations),
+                                     SettlingBurst.closed_at.is_(None)))
+        assert poison_turns == poison_owners == 0
+        assert open_poison_bursts == len(candidates)
+        assert await select_settled_turn(
+            h["database"], worker_principal, settings,
+            (Channel.TELEGRAM,),
+        ) is None
+    finally:
+        async with sql.begin() as connection:
+            for message_id, (input_revision, settling_revision) in original_snapshots.items():
+                await connection.execute(text(
+                    "UPDATE messages SET input_revision=:input_revision,"
+                    "settling_revision=:settling_revision WHERE id=:id"), {
+                        "id": message_id, "input_revision": input_revision,
+                        "settling_revision": settling_revision,
+                    })
+            await connection.execute(text("""
+                ALTER TABLE messages ADD CONSTRAINT ck_message_settling_burst_shape CHECK (
+                  (settling_burst_id IS NULL AND settling_policy_version IS NULL
+                    AND settling_quiet_window_ms IS NULL AND settling_max_wait_ms IS NULL)
+                  OR (settling_burst_id IS NOT NULL AND actor='CUSTOMER'
+                    AND direction='INBOUND' AND settling_policy_version IS NOT NULL
+                    AND settling_quiet_window_ms IS NOT NULL
+                    AND settling_max_wait_ms IS NOT NULL AND input_revision IS NOT NULL
+                    AND input_revision >= 1 AND settling_revision IS NOT NULL
+                    AND settling_revision >= 0)
+                )
+            """))
+            await connection.execute(text(
+                "ALTER TABLE messages VALIDATE CONSTRAINT ck_message_settling_burst_shape"))
+            await connection.execute(text(
+                "CREATE TRIGGER preserve_message_settling_membership "
+                "BEFORE UPDATE ON messages FOR EACH ROW "
+                "EXECUTE FUNCTION preserve_settling_membership()"))
+
+
+@pytest.mark.asyncio
+async def test_telegram_provider_account_shape_rejects_null_bound_bot_and_conflicting_bot(
+    telegram_harness, sql
+):
+    # The first branch must be two-valued: CHECK accepts SQL UNKNOWN.
+    h = telegram_harness
+    for state, bot_id in (("BOUND", None), ("CONFLICT", "123")):
+        await violation(
+            sql,
+            "INSERT INTO telegram_provider_accounts(owner_id,integration_id,state,bot_id) "
+            "VALUES(:owner,:integration,:state,:bot_id)",
+            {"owner": f"bad-{state.lower()}", "integration": uuid4(),
+             "state": state, "bot_id": bot_id}, "23514",
+            "ck_telegram_provider_account_shape",
+        )
+    async with sql.begin() as connection:
+        await connection.execute(text(
+            "INSERT INTO telegram_provider_accounts(owner_id,integration_id,state,bot_id) "
+            "VALUES(:owner,:integration,'BOUND','123456')"), {
+                "owner": "valid-bound", "integration": uuid4(),
+            })
+        await connection.execute(text(
+            "INSERT INTO telegram_provider_accounts(owner_id,integration_id,state,bot_id) "
+            "VALUES(:owner,:integration,'CONFLICT',NULL)"), {
+                "owner": "valid-conflict", "integration": uuid4(),
+            })
+    async with h["database"].session_factory() as session, session.begin():
+        accounts = list((await session.scalars(select(TelegramProviderAccount).order_by(
+            TelegramProviderAccount.owner_id))).all())
+    assert [(account.state, account.bot_id) for account in accounts] == [
+        ("BOUND", "123456"), ("CONFLICT", None),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_canonical_agent_message_gap_splits_due_burst_into_contiguous_prefixes(
+    telegram_harness, sql, monkeypatch
+):
+    """A valid outbound row inside one burst is a prefix boundary, not poison."""
+    h = telegram_harness
+    settings = _settings(h, version="ordinary-gap-immediate", quiet_ms=1_000,
+                         max_wait_ms=5_000, enabled=False)
+    _install(h, settings)
+    port = DeterministicManagedPort()
+    worker = TelegramWorker(h["database"], settings, port)
+
+    prior = await _admit(h, message_id=82_000, update_id=92_000, chat_id=120_000)
+    assert await worker.run_once()
+    second_prior = await _admit(h, message_id=82_001, update_id=92_001, chat_id=120_000)
+    assert await worker.run_once()
+
+    async def append_agent(admission_id: str) -> UUID:
+        async with h["database"].session_factory() as session, session.begin():
+            admission = await session.get(TelegramAdmission, UUID(admission_id))
+            assert admission is not None and admission.conversation_id is not None
+            turn_id = await session.scalar(select(AgentTurn.id).join(
+                TelegramImmediateTurn, TelegramImmediateTurn.turn_id == AgentTurn.id,
+            ).where(TelegramImmediateTurn.message_id == admission.canonical_message_id))
+            assert turn_id is not None
+            conversation_id = admission.conversation_id
+        async with sql.begin() as connection:
+            sequence = await connection.scalar(text(
+                "UPDATE conversations SET last_message_sequence=last_message_sequence + 1 "
+                "WHERE id=:id RETURNING last_message_sequence"), {"id": conversation_id})
+            assert sequence is not None
+            await connection.execute(text(
+                "INSERT INTO messages(id,conversation_id,sequence,actor,direction,"
+                "content_type,text,source_agent_turn_id) VALUES(:id,:conversation,:sequence,"
+                "'AGENT','OUTBOUND','TEXT','previous turn response',:turn)"), {
+                    "id": uuid4(), "conversation": conversation_id,
+                    "sequence": sequence, "turn": turn_id,
+                })
+        return turn_id
+
+    first_prior_turn = await append_agent(prior["admission_id"])
+    async with sql.connect() as connection:
+        db_now = await connection.scalar(text("SELECT clock_timestamp()"))
+    assert isinstance(db_now, datetime)
+    base = db_now - timedelta(minutes=1)
+    clock = _fixed_database_clock(monkeypatch, base)
+    settings = _settings(h, version="ordinary-gap-settling", quiet_ms=1_000,
+                         max_wait_ms=5_000)
+    _install(h, settings)
+    worker = TelegramWorker(h["database"], settings, port)
+    first_burst = await _admit(h, message_id=82_002, update_id=92_002,
+                               chat_id=120_000)
+    second_prior_turn = await append_agent(second_prior["admission_id"])
+    clock[0] = base + timedelta(milliseconds=100)
+    second_burst = await _admit(h, message_id=82_003, update_id=92_003,
+                                chat_id=120_000)
+    clock[0] = base + timedelta(seconds=2)
+
+    async with h["database"].session_factory() as session, session.begin():
+        first_message_id = await session.scalar(select(
+            TelegramAdmission.canonical_message_id).where(
+                TelegramAdmission.id == UUID(first_burst["admission_id"])))
+        second_message_id = await session.scalar(select(
+            TelegramAdmission.canonical_message_id).where(
+                TelegramAdmission.id == UUID(second_burst["admission_id"])))
+        burst_ids = list((await session.scalars(select(Message.settling_burst_id).where(
+            Message.id.in_((first_message_id, second_message_id))
+        ))).all())
+    assert first_message_id is not None and second_message_id is not None
+    assert len(set(burst_ids)) == 1 and burst_ids[0] is not None
+    async with h["database"].session_factory() as session, session.begin():
+        conversation_id = await session.scalar(select(
+            TelegramAdmission.conversation_id).where(
+                TelegramAdmission.id == UUID(prior["admission_id"])))
+        ordered = list((await session.execute(select(
+            Message.sequence, Message.actor, Message.id
+        ).where(Message.conversation_id == conversation_id)
+         .order_by(Message.sequence))).all())
+    assert [row.actor for row in ordered] == [
+        "CUSTOMER", "CUSTOMER", "AGENT", "CUSTOMER", "AGENT", "CUSTOMER",
+    ]
+    assert ordered[3].id == first_message_id and ordered[5].id == second_message_id
+    assert await worker.run_once()
+    assert port.prepared[-1].request.selected_input_message_ids == (first_message_id,)
+    assert await worker.run_once()
+    assert port.prepared[-1].request.selected_input_message_ids == (second_message_id,)
+    assert first_prior_turn != second_prior_turn
 
 
 @pytest.mark.asyncio

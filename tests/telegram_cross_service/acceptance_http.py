@@ -432,10 +432,7 @@ class FakePeer:
                            and int(queue[0]["update_id"]) < offset):
                         removed = queue.popleft()
                         removed_id = int(removed["update_id"])
-                        self.acknowledged_update_ids[token].append(removed_id)
-                        ack_event = self._ack_events.get((token, removed_id))
-                        if ack_event is not None:
-                            ack_event.set()
+                        self._record_acknowledged(token, removed_id)
                     forced = self.forced_updates[token]
                     if forced:
                         forced_update = forced.popleft()
@@ -573,7 +570,27 @@ class FakePeer:
         return self._forced_next_poll.setdefault((token, update_id), asyncio.Event())
 
     def acknowledged(self, token: str, update_id: int) -> asyncio.Event:
-        return self._ack_events.setdefault((token, update_id), asyncio.Event())
+        event = self._ack_events.setdefault((token, update_id), asyncio.Event())
+        if update_id in self.acknowledged_update_ids[token]:
+            event.set()
+        return event
+
+    def _record_acknowledged(self, token: str, update_id: int) -> None:
+        self.acknowledged_update_ids[token].append(update_id)
+        event = self._ack_events.get((token, update_id))
+        if event is not None:
+            event.set()
+
+    def provider_poll_snapshot(self, token: str) -> dict[str, object]:
+        """Return provider-frontier evidence without exposing bot tokens or payloads."""
+        return {
+            "bot_id": token.split(":", 1)[0],
+            "get_updates_calls": self.get_updates_calls[token],
+            "offsets": self.get_updates_offsets[token][-20:],
+            "acknowledged_update_ids": self.acknowledged_update_ids[token][-20:],
+            "queued_update_ids": [int(update["update_id"])
+                                  for update in self.updates[token]],
+        }
 
     def hold_typing(self, event_id: str) -> asyncio.Event:
         entered = self.action_entered.setdefault(event_id, asyncio.Event())
@@ -618,6 +635,21 @@ class FakePeer:
             await asyncio.sleep(0.025)
         pytest.fail(f"Goal4B acceptance timed out waiting for {label}; "
                     f"fixture errors={self.request_errors!r}")
+
+
+def test_fake_peer_ack_observer_handles_early_and_late_subscribers() -> None:
+    peer = FakePeer([], "cp-token", "managed-token", "legacy-token")
+    token = "900001:fixture-token"
+    update_id = 442
+
+    early_observer = peer.acknowledged(token, update_id)
+    assert not early_observer.is_set()
+    peer._record_acknowledged(token, update_id)
+    assert early_observer.is_set()
+
+    late_observer = peer.acknowledged(token, update_id)
+    assert late_observer is early_observer
+    assert late_observer.is_set()
 
 
 @dataclass
@@ -1782,7 +1814,25 @@ async def test_goal5_real_polling_bursts_max_wait_and_restart_recovery(th, sql) 
     uncertain_state = await wait_for_state(h, uncertain_key,
         lambda row: row["delivery_status"] == "UNKNOWN",
         "UNKNOWN after provider accepted but response was lost")
-    await asyncio.wait_for(h.peer.acknowledged(token, 442).wait(), 12)
+    ack_event = h.peer.acknowledged(token, 442)
+    try:
+        await asyncio.wait_for(ack_event.wait(), 12)
+    except TimeoutError:
+        provider_snapshot = h.peer.provider_poll_snapshot(token)
+        EVIDENCE.append({
+            "scenario": "provider ACK442 frontier diagnostic",
+            "ack_observed": False,
+            "provider": provider_snapshot,
+        })
+        pytest.fail(
+            "ACK442 liveness wait expired; sanitized provider frontier="
+            f"{provider_snapshot}"
+        )
+    EVIDENCE.append({
+        "scenario": "provider ACK442 frontier diagnostic",
+        "ack_observed": True,
+        "provider": h.peer.provider_poll_snapshot(token),
+    })
     assert uncertain_state["canonical_message_id"] is not None
     assert len(h.peer.accepted_messages) == before_sends + 1
     assert len(h.peer.managed_calls) == before_ai + 1

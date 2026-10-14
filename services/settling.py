@@ -186,6 +186,22 @@ async def _maximal_projectable_prefix(
     return messages[:best]
 
 
+def _validate_settled_members(messages: list[Message]) -> None:
+    """Reject malformed persisted snapshots before projection or ownership writes."""
+    if not messages:
+        raise DomainError(ErrorCode.VALIDATION_ERROR)
+    first = messages[0]
+    for index, message in enumerate(messages):
+        if (message.input_revision is None or message.input_revision < 1
+                or message.settling_revision is None or message.settling_revision < 0
+                or message.settling_burst_id != first.settling_burst_id
+                or message.settling_policy_version != first.settling_policy_version
+                or message.settling_quiet_window_ms != first.settling_quiet_window_ms
+                or message.settling_max_wait_ms != first.settling_max_wait_ms
+                or message.sequence != first.sequence + index):
+            raise DomainError(ErrorCode.VALIDATION_ERROR)
+
+
 async def _create_turn(
     session: AsyncSession,
     conversation: Conversation,
@@ -194,11 +210,7 @@ async def _create_turn(
     channel: Channel,
     clock: datetime,
 ) -> UUID:
-    first, last = selected[0], selected[-1]
-    if first.input_revision is None or last.input_revision is None:
-        raise RuntimeError("Settled inbound Message is missing its revision snapshot")
-    if any(message.sequence != first.sequence + index for index, message in enumerate(selected)):
-        raise RuntimeError("Settled input is not a contiguous canonical Message range")
+    _validate_settled_members(selected)
     turn = _turn_for_selection(conversation, selected, clock)
     if channel == Channel.WEBSITE_WIDGET or channel == Channel.TELEGRAM:
         await freeze_website_projection(session, conversation, turn, binding.agent_id)
@@ -307,6 +319,7 @@ async def select_settled_turn(
                             break
                     if not due_messages:
                         continue
+                    _validate_settled_members(due_messages)
                     if channel == Channel.TELEGRAM:
                         account = await session.scalar(select(TelegramProviderAccount).where(
                             TelegramProviderAccount.owner_id == conversation.owner_id,

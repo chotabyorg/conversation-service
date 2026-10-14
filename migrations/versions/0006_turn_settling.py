@@ -187,7 +187,9 @@ def upgrade() -> None:
         "AND settling_quiet_window_ms IS NULL AND settling_max_wait_ms IS NULL) OR "
         "(settling_burst_id IS NOT NULL AND actor='CUSTOMER' AND direction='INBOUND' "
         "AND settling_policy_version IS NOT NULL AND settling_quiet_window_ms IS NOT NULL "
-        "AND settling_max_wait_ms IS NOT NULL)",
+        "AND settling_max_wait_ms IS NOT NULL AND input_revision IS NOT NULL "
+        "AND input_revision >= 1 AND settling_revision IS NOT NULL "
+        "AND settling_revision >= 0)",
     )
     op.create_check_constraint(
         "ck_turn_settling_burst_shape", "agent_turns",
@@ -198,7 +200,10 @@ def upgrade() -> None:
       IF ROW(NEW.settling_burst_id,NEW.settling_policy_version,
              NEW.settling_quiet_window_ms,NEW.settling_max_wait_ms) IS DISTINCT FROM
          ROW(OLD.settling_burst_id,OLD.settling_policy_version,
-             OLD.settling_quiet_window_ms,OLD.settling_max_wait_ms) THEN
+             OLD.settling_quiet_window_ms,OLD.settling_max_wait_ms)
+      OR (OLD.settling_burst_id IS NOT NULL AND ROW(
+             NEW.input_revision,NEW.settling_revision) IS DISTINCT FROM ROW(
+             OLD.input_revision,OLD.settling_revision)) THEN
         RAISE EXCEPTION 'Message settling membership is immutable.' USING ERRCODE='23514';
       END IF;
       RETURN NEW;
@@ -260,7 +265,8 @@ def upgrade() -> None:
         sa.Column("state", sa.String(16), nullable=False),
         sa.Column("bot_id", sa.String(64, collation="C"), nullable=True),
         sa.CheckConstraint(
-            "(state='BOUND' AND bot_id ~ '^[1-9][0-9]{0,18}$') OR "
+            "(state='BOUND' AND bot_id IS NOT NULL "
+            "AND bot_id ~ '^[1-9][0-9]{0,18}$') OR "
             "(state='CONFLICT' AND bot_id IS NULL)",
             name="ck_telegram_provider_account_shape",
         ),

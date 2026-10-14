@@ -272,8 +272,13 @@ class Message(Base):
             ondelete="RESTRICT",
         ),
         CheckConstraint(
-            "settling_burst_id IS NULL OR (actor='CUSTOMER' AND direction='INBOUND' "
-            "AND settling_policy_version IS NOT NULL)",
+            "(settling_burst_id IS NULL AND settling_policy_version IS NULL "
+            "AND settling_quiet_window_ms IS NULL AND settling_max_wait_ms IS NULL) OR "
+            "(settling_burst_id IS NOT NULL AND actor='CUSTOMER' AND direction='INBOUND' "
+            "AND settling_policy_version IS NOT NULL AND settling_quiet_window_ms IS NOT NULL "
+            "AND settling_max_wait_ms IS NOT NULL AND input_revision IS NOT NULL "
+            "AND input_revision >= 1 AND settling_revision IS NOT NULL "
+            "AND settling_revision >= 0)",
             name="ck_message_settling_burst_shape",
         ),
         ForeignKeyConstraint(
@@ -773,7 +778,8 @@ class TelegramProviderAccount(Base):
     bot_id: Mapped[str | None] = mapped_column(String(64, collation="C"))
     __table_args__ = (
         CheckConstraint(
-            "(state='BOUND' AND bot_id ~ '^[1-9][0-9]{0,18}$') OR "
+            "(state='BOUND' AND bot_id IS NOT NULL "
+            "AND bot_id ~ '^[1-9][0-9]{0,18}$') OR "
             "(state='CONFLICT' AND bot_id IS NULL)",
             name="ck_telegram_provider_account_shape",
         ),

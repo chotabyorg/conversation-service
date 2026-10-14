@@ -4,6 +4,7 @@ import asyncio
 import io
 import json
 import os
+import secrets
 import socket
 import subprocess
 import sys
@@ -69,6 +70,7 @@ class Accepted0005Runtime:
             host="127.0.0.1").render_as_string(hide_password=False)
         self.tmp_path = tmp_path
         self.network_allowlist = network_allowlist
+        self.full_token = secrets.token_urlsafe(32)
         # Existing Website harness grants intentionally omit agent_id because
         # they are authorization grants. The 0005 service process separately
         # requires its configured binding's agent_id.
@@ -128,6 +130,8 @@ class Accepted0005Runtime:
                      "token": self.wh.tokens["a"], "grants": grants},
                     {"principal_id": "old-processing", "role": "PROCESSING",
                      "token": self.wh.tokens["worker"], "grants": grants},
+                    {"principal_id": "old-full", "role": "FULL",
+                     "token": self.full_token, "grants": grants},
                 ]),
                 "WEBSITE_BINDINGS": json.dumps(bindings),
                 "MANAGED_AI_BASE_URL": self.url("fake"),
@@ -182,6 +186,13 @@ class Accepted0005Runtime:
         return await self.client.request(
             method, self.url("cs") + "/internal/v1/website" + path, json=body,
             headers={"X-Service-Token": self.wh.tokens["a"]},
+        )
+
+    async def reconcile(self, delivery_id: str, body: dict) -> httpx.Response:
+        return await self.client.post(
+            self.url("cs") + f"/internal/v1/delivery-attempts/{delivery_id}/reconcile",
+            json=body,
+            headers={"X-Service-Token": self.full_token},
         )
 
     async def close(self) -> None:
@@ -352,6 +363,231 @@ async def test_actual_0005_authorized_writes_replay_without_gateway_mutation(
     await move_to_0005(wh, sql, database_url)
     await assert_completed_old_write_replays_after_upgrade(
         wh, sql, database_url, network_allowlist, tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_0005_authorized_attempt_facts_survive_failed_aggregate_upgrade(
+    wh, sql, database_url, network_allowlist, tmp_path
+):
+    """Exact old send grants retain independent facts when the shared row is FAILED."""
+    await move_to_0005(wh, sql, database_url)
+    main = payload(wh, text="old authorized attempts with failed aggregate")
+    denied = payload(wh, text="separate denied sibling authorization")
+    runtime = Accepted0005Runtime(wh, database_url, tmp_path, network_allowlist,
+                                  [wh.grants["a"]])
+    try:
+        await runtime.start_api()
+        main_admission = await admit_old(runtime, main)
+        denied_admission = await admit_old(runtime, denied)
+        await runtime.start_worker()
+        main_turn = await wait_for_turn(sql, main_admission["admission_id"])
+        denied_turn = await wait_for_turn(sql, denied_admission["admission_id"])
+
+        main_first, _ = await begin_old(runtime, main, str(uuid4()))
+        main_unknown, _ = await begin_old(runtime, main, str(uuid4()))
+        main_late, _ = await begin_old(runtime, main, str(uuid4()))
+        denied_old, _ = await begin_old(runtime, denied, str(uuid4()))
+
+        async def fail_delivery(attempt_body: dict) -> str:
+            delivery_ids = await rows(sql,
+                "SELECT delivery_id::text AS id FROM website_response_attempts "
+                "WHERE id=:id", id=attempt_body["response_attempt_id"])
+            assert len(delivery_ids) == 1
+            delivery_id = delivery_ids[0]["id"]
+            response = await runtime.reconcile(delivery_id, {
+                "reconciliation_key": str(uuid4()),
+                "expected_revision": 1,
+                "status": "FAILED",
+                "error_code": "TRANSPORT_ERROR",
+            })
+            assert response.status_code == 200, response.text
+            assert response.json()["attempt"]["status"] == "FAILED"
+            return delivery_id
+
+        main_delivery = await fail_delivery(main_first)
+        denied_delivery = await fail_delivery(denied_old)
+        # These accepted 0005 facts prove that completion was independent of
+        # the shared FAILED aggregate before the new code is loaded.
+        await complete_old(runtime, main_first, "WRITE_COMPLETED")
+        await complete_old(runtime, main_unknown, "UNKNOWN")
+        assert await rows(sql,
+            "SELECT status,revision FROM delivery_attempts WHERE id=:id",
+            id=main_delivery) == [{"status": "FAILED", "revision": 2}]
+        assert await rows(sql,
+            "SELECT status,revision FROM delivery_attempts WHERE id=:id",
+            id=denied_delivery) == [{"status": "FAILED", "revision": 2}]
+
+        before_attempts = await rows(sql,
+            "SELECT id::text AS id,admission_id::text AS admission_id,"
+            "delivery_id::text AS delivery_id,conversation_id::text AS conversation_id,"
+            "outcome,finished_at FROM website_response_attempts "
+            "WHERE admission_id IN (:main,:denied) ORDER BY id",
+            main=main_admission["admission_id"], denied=denied_admission["admission_id"])
+        before_deliveries = await rows(sql,
+            "SELECT id::text AS id,status,revision,error_code,dispatch_requested_at,updated_at "
+            "FROM delivery_attempts WHERE id IN (:main,:denied) ORDER BY id",
+            main=main_delivery, denied=denied_delivery)
+        before_reconciliations = await rows(sql,
+            "SELECT id::text AS id,delivery_attempt_id::text AS delivery_id,"
+            "reconciliation_key::text AS reconciliation_key,status,error_code,"
+            "expected_revision,result_revision,accepted_at FROM delivery_reconciliations "
+            "WHERE delivery_attempt_id IN (:main,:denied) ORDER BY delivery_attempt_id,"
+            "result_revision,id", main=main_delivery, denied=denied_delivery)
+        before_history = await rows(sql,
+            "SELECT id::text AS id,conversation_id::text AS conversation_id,sequence,"
+            "actor,direction,text,source_agent_turn_id::text AS source_turn_id FROM messages "
+            "WHERE conversation_id IN (:main,:denied) ORDER BY conversation_id,sequence",
+            main=main_turn["conversation_id"], denied=denied_turn["conversation_id"])
+        assert sum(row["actor"] == "CUSTOMER" for row in before_history) == 2
+        assert sum(row["actor"] == "AGENT" for row in before_history) == 1
+        before_observations = json.loads((tmp_path / "observations.json").read_text())
+        await runtime.close()
+        await move_to_head(wh, sql, database_url)
+
+        # Migration grants permission only to the exact retained old attempts.
+        upgraded_attempts = await rows(sql,
+            "SELECT id::text AS id,send_authorized,outcome,finished_at "
+            "FROM website_response_attempts WHERE admission_id IN (:main,:denied) "
+            "ORDER BY id", main=main_admission["admission_id"],
+            denied=denied_admission["admission_id"])
+        assert [row["id"] for row in upgraded_attempts] == [
+            row["id"] for row in before_attempts]
+        assert all(row["send_authorized"] is True for row in upgraded_attempts)
+        assert await rows(sql,
+            "SELECT id::text AS id,status,revision,error_code,dispatch_requested_at,updated_at "
+            "FROM delivery_attempts WHERE id IN (:main,:denied) ORDER BY id",
+            main=main_delivery, denied=denied_delivery) == before_deliveries
+        assert await rows(sql,
+            "SELECT id::text AS id,delivery_attempt_id::text AS delivery_id,"
+            "reconciliation_key::text AS reconciliation_key,status,error_code,"
+            "expected_revision,result_revision,accepted_at FROM delivery_reconciliations "
+            "WHERE delivery_attempt_id IN (:main,:denied) ORDER BY delivery_attempt_id,"
+            "result_revision,id", main=main_delivery, denied=denied_delivery
+        ) == before_reconciliations
+
+        main_v2_id = str(uuid5(NAMESPACE_URL, V2_NAMESPACE + str(main_admission["admission_id"])))
+        main_v2 = {**identity(main), "response_attempt_id": main_v2_id}
+        pre_replay_attempts = await rows(sql,
+            "SELECT id::text AS id,send_authorized,outcome,finished_at "
+            "FROM website_response_attempts ORDER BY id")
+        pre_replay_history = await rows(sql,
+            "SELECT id::text AS id,conversation_id::text AS conversation_id,sequence,"
+            "actor,direction,text,source_agent_turn_id::text AS source_turn_id "
+            "FROM messages ORDER BY conversation_id,sequence")
+        pre_replay_observations = json.loads((tmp_path / "observations.json").read_text())
+        replay = await wh.call("POST", "/website/responses/begin", main_v2)
+        assert replay.status_code == 200, replay.text
+        assert replay.json()["action"] == "REPLAY_COMPLETED"
+        assert replay.json()["response_attempt_id"] == main_v2_id
+        assert replay.json()["replay_source_attempt_id"] == main_first["response_attempt_id"]
+        assert replay.json()["send"] is False and replay.json()["replayed"] is True
+        assert await rows(sql,
+            "SELECT id::text AS id,send_authorized,outcome,finished_at "
+            "FROM website_response_attempts ORDER BY id") == pre_replay_attempts
+        assert await rows(sql,
+            "SELECT id::text AS id,conversation_id::text AS conversation_id,sequence,"
+            "actor,direction,text,source_agent_turn_id::text AS source_turn_id "
+            "FROM messages ORDER BY conversation_id,sequence") == pre_replay_history
+        assert json.loads((tmp_path / "observations.json").read_text()) == (
+            pre_replay_observations)
+
+        # First evidence on a still-null old attempt and UNKNOWN-to-definitive
+        # late evidence both remain valid. The same Conversation lock permits
+        # only one canonical AGENT Message across these concurrent siblings.
+        late_results = await asyncio.gather(
+            wh.call("POST", "/website/responses/complete",
+                    {**main_unknown, "outcome": "WRITE_COMPLETED"}),
+            wh.call("POST", "/website/responses/complete",
+                    {**main_late, "outcome": "WRITE_COMPLETED"}),
+        )
+        assert [response.status_code for response in late_results] == [200, 200], [
+            response.text for response in late_results]
+        for body in (main_unknown, main_late):
+            repeated = await wh.call("POST", "/website/responses/complete",
+                                     {**body, "outcome": "WRITE_COMPLETED"})
+            assert repeated.status_code == 200 and repeated.json()["replayed"] is True
+        conflict = await wh.call("POST", "/website/responses/complete",
+                                 {**main_late, "outcome": "WRITE_FAILED"})
+        assert conflict.status_code == 409
+
+        denied_v2_id = str(uuid5(NAMESPACE_URL,
+                                 V2_NAMESPACE + str(denied_admission["admission_id"])))
+        denied_v2 = {**identity(denied), "response_attempt_id": denied_v2_id}
+        denied_begin = await wh.call("POST", "/website/responses/begin", denied_v2)
+        assert denied_begin.status_code == 200, denied_begin.text
+        assert denied_begin.json()["action"] == "DENY"
+        denied_row = await rows(sql,
+            "SELECT id::text AS id,send_authorized,outcome,finished_at "
+            "FROM website_response_attempts WHERE id=:id", id=denied_v2_id)
+        assert denied_row == [{"id": denied_v2_id, "send_authorized": False,
+                               "outcome": None, "finished_at": None}]
+        borrowed = await wh.call("POST", "/website/responses/complete",
+                                 {**denied_v2, "outcome": "WRITE_COMPLETED"})
+        assert borrowed.status_code == 409
+        assert await rows(sql,
+            "SELECT id::text AS id,send_authorized,outcome,finished_at "
+            "FROM website_response_attempts WHERE id=:id", id=denied_v2_id) == denied_row
+        # The exact old D attempt remains independently authorized despite the
+        # denied canonical v2 sibling, and does not change the FAILED aggregate.
+        old_denied = await wh.call("POST", "/website/responses/complete",
+                                   {**denied_old, "outcome": "WRITE_COMPLETED"})
+        assert old_denied.status_code == 200, old_denied.text
+
+        after_attempts = await rows(sql,
+            "SELECT id::text AS id,admission_id::text AS admission_id,"
+            "delivery_id::text AS delivery_id,conversation_id::text AS conversation_id,"
+            "send_authorized,outcome,finished_at FROM website_response_attempts "
+            "WHERE admission_id IN (:main,:denied) ORDER BY id",
+            main=main_admission["admission_id"], denied=denied_admission["admission_id"])
+        old_attempt_ids = {row["id"] for row in before_attempts}
+        after_old_attempts = [row for row in after_attempts if row["id"] in old_attempt_ids]
+        assert [row["id"] for row in after_old_attempts] == [
+            row["id"] for row in before_attempts]
+        assert all(row["send_authorized"] is True for row in after_old_attempts)
+        assert await rows(sql,
+            "SELECT id::text AS id,status,revision,error_code,dispatch_requested_at,updated_at "
+            "FROM delivery_attempts WHERE id IN (:main,:denied) ORDER BY id",
+            main=main_delivery, denied=denied_delivery) == before_deliveries
+        assert await rows(sql,
+            "SELECT id::text AS id,delivery_attempt_id::text AS delivery_id,"
+            "reconciliation_key::text AS reconciliation_key,status,error_code,"
+            "expected_revision,result_revision,accepted_at FROM delivery_reconciliations "
+            "WHERE delivery_attempt_id IN (:main,:denied) ORDER BY delivery_attempt_id,"
+            "result_revision,id", main=main_delivery, denied=denied_delivery
+        ) == before_reconciliations
+        assert all(row["outcome"] == "WRITE_COMPLETED" for row in after_old_attempts
+                   if row["admission_id"] == main_admission["admission_id"]
+                   and row["id"] in {main_unknown["response_attempt_id"],
+                                     main_late["response_attempt_id"]})
+        after_by_id = {row["id"]: row for row in after_old_attempts}
+        assert after_by_id[main_first["response_attempt_id"]]["outcome"] == "WRITE_COMPLETED"
+        assert after_by_id[denied_old["response_attempt_id"]]["outcome"] == "WRITE_COMPLETED"
+        after_history = await rows(sql,
+            "SELECT id::text AS id,conversation_id::text AS conversation_id,sequence,"
+            "actor,direction,text,source_agent_turn_id::text AS source_turn_id FROM messages "
+            "WHERE conversation_id IN (:main,:denied) "
+            "ORDER BY conversation_id,sequence",
+            main=main_turn["conversation_id"], denied=denied_turn["conversation_id"])
+        assert [row for row in after_history if row["actor"] != "AGENT"] == [
+            row for row in before_history if row["actor"] != "AGENT"]
+        assert len([row for row in after_history if row["actor"] == "AGENT"]) == 2
+        agent_history = await rows(sql,
+            "SELECT source_agent_turn_id::text AS source_turn_id,count(*) AS count "
+            "FROM messages WHERE actor='AGENT' AND source_agent_turn_id IN (:main,:denied) "
+            "GROUP BY source_agent_turn_id ORDER BY source_agent_turn_id",
+            main=main_turn["id"], denied=denied_turn["id"])
+        assert {row["source_turn_id"]: row["count"] for row in agent_history} == {
+            str(main_turn["id"]): 1,
+            str(denied_turn["id"]): 1,
+        }
+        assert await rows(sql,
+            "SELECT id::text AS id,send_authorized,outcome,finished_at "
+            "FROM website_response_attempts WHERE id=:id", id=denied_v2_id) == denied_row
+        # No post-upgrade replay or late fact initiated another AI/provider call.
+        assert json.loads((tmp_path / "observations.json").read_text()) == before_observations
+    finally:
+        await runtime.close()
+        await upgrade_after_0005(wh, sql, database_url)
 
 
 @pytest.mark.asyncio
