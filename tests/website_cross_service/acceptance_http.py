@@ -937,7 +937,13 @@ async def test_rollback_retains_old_managed_and_new_legacy_reservations(wh):
     assert len(calls["legacy"]) == 2  # Legacy behavior has no AI idempotency promise.
 
 
-async def test_old_and_new_gateway_policy_race_observes_one_sticky_disposition(wh):
+@pytest.mark.parametrize(("first_gateway", "expected_route"), [
+    ("website", "MANAGED"),
+    ("website2", "LEGACY"),
+])
+async def test_old_and_new_gateway_policy_race_observes_one_sticky_disposition(
+    wh, first_gateway, expected_route,
+):
     h = wh
     await start_chain(h)
     h.start("website2", cohort=False)
@@ -952,8 +958,14 @@ async def test_old_and_new_gateway_policy_race_observes_one_sticky_disposition(w
             pid = await blocker.scalar(text("SELECT pg_backend_pid()"))
             await blocker.execute(text("SELECT pg_advisory_xact_lock(:key)"),
                                   {"key": int(digest[:16], 16) - (1 << 63)})
-            tasks = [asyncio.create_task(h.chat(body, service))
-                     for service in ("website", "website2")]
+            # Put the selected first-writer request at the head of the real
+            # database lock queue, then overlap the other policy behind it.
+            second_gateway = "website2" if first_gateway == "website" else "website"
+            gateways = [first_gateway, second_gateway]
+            tasks = [asyncio.create_task(h.chat(body, first_gateway))]
+            await observed_waiters(h.sql, pid, 1,
+                                   "Goal4A first gateway in old/new routing race")
+            tasks.append(asyncio.create_task(h.chat(body, second_gateway)))
             await observed_waiters(h.sql, pid, 2, "Goal4A old/new real gateway routing race")
         responses = await asyncio.gather(*tasks)
         await h.diagnostic_snapshot("old-new-policy-after-first-responses", body["message_id"],
@@ -961,22 +973,99 @@ async def test_old_and_new_gateway_policy_race_observes_one_sticky_disposition(w
                                         {"status": response.status_code,
                                          "json": response.json()}
                                         for response in responses]})
-        for index, response in enumerate(responses):
-            if response.status_code == 503:
-                responses[index] = await recover_public_result(
-                    h, body, initial=response, label=f"old-new-policy-retry-{index}",
-                    website="website" if index == 0 else "website2")
         state = await h.state(body["message_id"])
+        assert state["route"] == expected_route
         if state["route"] == "MANAGED":
-            assert all(response.status_code in {200, 503} for response in responses)
-            assert all("reply" not in response.json() for response in responses
-                       if response.status_code == 503)
-            calls = h.observations()
+            initial_responses = list(responses)
+            retry_indexes = []
+            expected_retry_errors = {
+                "Managed service unavailable; retry the same message_id",
+                "Managed result pending; retry the same message_id",
+                "response_unavailable",
+            }
+            for index, response in enumerate(initial_responses):
+                assert response.status_code in {200, 503}
+                if response.status_code == 503:
+                    assert "reply" not in response.json()
+                    assert response.json().get("error") in expected_retry_errors
+                    retry_indexes.append(index)
+
+            successful = next(
+                (response for response in initial_responses if response.status_code == 200),
+                None,
+            )
+            if successful is not None:
+                # HTTP 200 is emitted after the physical write; wait for its
+                # durable completion before asking a concurrent 503 caller to
+                # replay the cached result under the same transport identity.
+                completed_attempts = await wait_response_outcome(
+                    h, body["message_id"], "WRITE_COMPLETED",
+                )
+                assert any(row["send_authorized"] and row["outcome"] == "WRITE_COMPLETED"
+                           for row in completed_attempts)
+
+                conversation_id = state["conversation_id"]
+
+                async def durable_facts():
+                    return {
+                        "state": await h.state(body["message_id"]),
+                        "attempts": await response_attempt_state(h, body["message_id"]),
+                        "deliveries": await h.rows(
+                            "SELECT id,source_turn_id,status,revision,error_code,"
+                            "expected_settling_revision,fenced_settling_revision "
+                            "FROM delivery_attempts WHERE conversation_id=:id "
+                            "ORDER BY created_at,id", id=conversation_id,
+                        ),
+                        "reconciliations": await h.rows(
+                            "SELECT id,delivery_attempt_id,reconciliation_key,"
+                            "expected_revision,result_revision,status,"
+                            "expected_settling_revision,result_settling_revision "
+                            "FROM delivery_reconciliations WHERE conversation_id=:id "
+                            "ORDER BY accepted_at,id", id=conversation_id,
+                        ),
+                        "history": await h.rows(
+                            "SELECT id,sequence,actor,direction,content_type,"
+                            "source_agent_turn_id,text FROM messages "
+                            "WHERE conversation_id=:id ORDER BY sequence,id",
+                            id=conversation_id,
+                        ),
+                        "calls": h.observations(),
+                    }
+
+                baseline = await durable_facts()
+                await h.diagnostic_snapshot(
+                    "old-new-policy-durable-before-cached-replay", body["message_id"],
+                    extra={
+                        "first_waiter": "managed-policy gateway",
+                        "response_statuses": [response.status_code
+                                              for response in initial_responses],
+                        "write_completed_attempt_ids": [
+                            row["id"] for row in completed_attempts
+                            if row["send_authorized"] and row["outcome"] == "WRITE_COMPLETED"
+                        ],
+                    },
+                )
+                successful_body = successful.json()
+                for index in retry_indexes:
+                    replay = await h.chat(body, gateways[index])
+                    assert replay.status_code == 200
+                    assert replay.json() == successful_body
+                    responses[index] = replay
+
+                assert await durable_facts() == baseline
+                calls = baseline["calls"]
+            else:
+                calls = h.observations()
             assert all(response.status_code == 200 for response in responses)
             assert responses[0].json() == responses[1].json()
             assert len(calls["managed"]) == len(calls["effects"]) == 1
             assert calls["legacy"] == []
         else:
+            for index, response in enumerate(responses):
+                if response.status_code == 503:
+                    responses[index] = await recover_public_result(
+                        h, body, initial=response, label=f"old-new-policy-retry-{index}",
+                        website=gateways[index])
             assert all(response.status_code in {200, 503} for response in responses)
             assert all("reply" not in response.json() for response in responses
                        if response.status_code == 503)
