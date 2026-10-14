@@ -55,7 +55,12 @@ progress independently. Unique identity/event/Message indexes and the active-Tur
 partial unique index defend the invariants at PostgreSQL level. `PENDING` and
 `CLAIMED` both occupy the one active logical Turn slot. Generic ingress primitives
 do not schedule work. Explicit Website and Telegram admissions use separate durable
-immediate workers; debounce and supersede remain outside these policies.
+workers. Optional Goal5 settling policies create immutable, Conversation-local
+bursts; the persisted deadline and selected input ownership survive worker restarts.
+Policy-free admissions retain their immediate path. Before a provider or socket
+write, the adapter records a locked send decision; stale SETTLING drafts become
+`SUPERSEDED`, while uncertain prior writes remain recover-only and are never blindly
+reissued. See [durable turn settling](docs/turn-settling.md).
 
 A claim fences a stable Turn using a monotonically increasing epoch and a random
 256-bit bearer whose SHA-256 digest alone is persisted. Expired recovery rotates
@@ -109,7 +114,8 @@ including an empty or invalid value, which fails validation instead of falling b
 docker compose up -d postgres
 python -m alembic upgrade head
 python -m uvicorn main:app --host 127.0.0.1 --port 55585 --no-access-log
-# In a separate process, after configuring the private Telegram binding:
+# In separate processes, after configuring the private worker bindings:
+python worker.py
 python telegram_worker.py
 ```
 
@@ -198,13 +204,25 @@ It has no deployment credentials or publishing step. Implementation checks are
 distinct from the fresh independent review/verification required by Goal 1; see
 the evidence record for what actually ran.
 
-## Goal4A and handoff
+## Goal4A, Goal4B and Goal5
 
 [Website canary source](docs/website-canary.md) adds immediate FIFO execution and
 protected evidence reads while retaining legacy Website traffic unless exact
 configured admission selects it. Production rollout/smoke require independent
-release and runtime verification. Full demo cutover additionally requires stable
-frontend message IDs, independent review of the [history policy](docs/history-projection.md)
-and a separately approved routing gate. Goal4B Telegram and Goal5 settling remain
-unactivated until their independent review and release gates pass. See
-[durable turn settling](docs/turn-settling.md) for Goal5 policy and delivery rules.
+release and runtime verification. Website v2 uses its retained admission identity
+for a stable response-attempt ID and preserves historical per-attempt write evidence;
+the public message ID is unchanged. Goal4B binds one immutable Telegram bot per
+owner/integration. Migration derives `BOUND` from one historical MANAGED bot and
+`CONFLICT` from mixed-bot history, preserving exact recovery evidence without
+granting new sends under conflict. Goal5 policy is optional and defaults off.
+Full demo cutover additionally requires stable frontend message IDs, independent
+review of the [history policy](docs/history-projection.md), and a separately
+approved routing gate. Goal4B Telegram and Goal5 settling remain unactivated until
+their independent review and release gates pass.
+
+Migration `0006_turn_settling` creates durable burst and provider-account state,
+records response send-permission decisions, and backfills input revisions without
+assigning settling policy retroactively. It refuses downgrade while retained
+burst ownership, supersede or send-permission evidence, settling fences, multiple
+response attempts, or non-reconstructible ownership/account history depends on the
+new schema. See the migration details in [durable turn settling](docs/turn-settling.md).

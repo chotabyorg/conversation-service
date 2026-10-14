@@ -14,6 +14,7 @@ import socket
 import subprocess
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
+from datetime import timedelta
 from email.parser import BytesParser
 from email.policy import default
 from pathlib import Path
@@ -34,6 +35,11 @@ TG_ROOT = Path(os.environ.get(
     "GOAL4B_TELEGRAM_REPO", str(CS_ROOT.parent / "telegram-gateway-service")
 )).resolve()
 TG_PYTHON = Path(os.environ.get("GOAL4B_TELEGRAM_PYTHON", str(TG_ROOT / ".venv/bin/python")))
+ACCEPTED_TG_ROOT = Path(os.environ.get(
+    "GOAL4B_TELEGRAM_ACCEPTED_REPO",
+    "/tmp/goal5-r2-telegram-review/accepted-base-4ee10d9",
+)).resolve()
+ACCEPTED_TG_SHA = "4ee10d9271d1b72427f44aa86c6a151c5250678d"
 CS_PYTHON = Path(os.environ.get(
     "GOAL5_CONVERSATION_PYTHON", str(CS_ROOT / ".venv/bin/python")
 ))
@@ -46,6 +52,15 @@ def telegram_runtime() -> tuple[Path, Path]:
             or not (TG_ROOT / "bot/handlers.py").is_file() or not TG_PYTHON.is_file()
             or not CS_PYTHON.is_file()):
         pytest.fail("Explicit Telegram candidate, pinned runtimes and clean process env required")
+    if (not (ACCEPTED_TG_ROOT / "main.py").is_file()
+            or not (ACCEPTED_TG_ROOT / "bot/handlers.py").is_file()):
+        pytest.fail("Exact accepted Telegram source archive is unavailable")
+    accepted_sha = subprocess.run(
+        ["git", "-C", str(ACCEPTED_TG_ROOT), "rev-parse", "HEAD"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    if accepted_sha != ACCEPTED_TG_SHA:
+        pytest.fail("Accepted Telegram oracle source does not match its pinned commit")
     return TG_ROOT, TG_PYTHON
 
 
@@ -91,10 +106,15 @@ class FakePeer:
         self.provider_calls: list[dict[str, object]] = []
         self.accepted_messages: list[dict[str, object]] = []
         self.get_updates_calls: dict[str, int] = defaultdict(int)
+        self.get_updates_offsets: dict[str, list[int | None]] = defaultdict(list)
+        self.acknowledged_update_ids: dict[str, list[int]] = defaultdict(list)
+        self._ack_events: dict[tuple[str, int], asyncio.Event] = {}
+        self._forced_inflight: dict[str, int] = {}
+        self._forced_next_poll: dict[tuple[str, int], asyncio.Event] = {}
         self.send_modes: deque[str] = deque()
         self.chat_action_modes: dict[str, str] = {}
-        self.require_admission_before_action: set[str] = set()
-        self.action_admission_counts: dict[str, int] = {}
+        self.action_entered: dict[str, asyncio.Event] = {}
+        self.action_release: dict[str, asyncio.Event] = {}
         self.current_updates: dict[str, dict[str, object]] = {}
         self.db: asyncpg.Pool | None = None
         self.raw_provider_response = "fixture-raw-telegram-response-secret"
@@ -105,8 +125,45 @@ class FakePeer:
         self.send_entered = asyncio.Event()
         self.send_release = asyncio.Event()
         self.send_release.set()
+        self.conversation_base_url = ""
+        self.admission_pre_modes: dict[str, deque[str]] = defaultdict(deque)
+        self.admission_after_modes: dict[str, deque[str]] = defaultdict(deque)
+        self.admission_attempts: dict[str, int] = defaultdict(int)
+        self.admission_responses: dict[str, list[dict[str, object]]] = defaultdict(list)
+        self.delivery_api_calls: list[dict[str, object]] = []
+        self.admission_mode_entered: dict[tuple[str, str], asyncio.Event] = {}
+        self.admission_mode_release: dict[tuple[str, str], asyncio.Event] = {}
         self.provider_message_id = 71000
         self.request_errors: list[str] = []
+        self.transition_generation = 0
+        self.active_transitions: set[str] = set()
+        self.transition_history: list[dict[str, object]] = []
+        self.expected_transition_errors: list[dict[str, object]] = []
+        self.unexpected_error_diagnostics: list[dict[str, object]] = []
+
+    def begin_transition(self, service: str) -> None:
+        self.transition_generation += 1
+        self.active_transitions.add(service)
+        self.transition_history.append({
+            "generation": self.transition_generation,
+            "service": service,
+            "phase": "start",
+        })
+
+    def end_transition(self, service: str) -> None:
+        self.transition_generation += 1
+        self.active_transitions.discard(service)
+        self.transition_history.append({
+            "generation": self.transition_generation,
+            "service": service,
+            "phase": "ready",
+        })
+
+    def transitions_since(self, generation: int) -> list[str]:
+        return sorted({
+            str(item["service"]) for item in self.transition_history
+            if int(item["generation"]) > generation
+        })
 
     async def start(self, port: int) -> None:
         self.server = await asyncio.start_server(self._handle, "127.0.0.1", port)
@@ -115,6 +172,10 @@ class FakePeer:
     async def close(self) -> None:
         self.managed_release.set()
         self.send_release.set()
+        for event in self.action_release.values():
+            event.set()
+        for event in self.admission_mode_release.values():
+            event.set()
         if self.server is not None:
             self.server.close()
             await self.server.wait_closed()
@@ -122,7 +183,8 @@ class FakePeer:
     async def _reply(self, writer: asyncio.StreamWriter, value: object,
                      status: int = 200) -> None:
         body = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode()
-        reason = {200: "OK", 401: "Unauthorized", 500: "Internal Server Error"}.get(
+        reason = {200: "OK", 401: "Unauthorized", 403: "Forbidden",
+                  500: "Internal Server Error"}.get(
             status, "Test response")
         writer.write((f"HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\n"
                       f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n").encode()
@@ -135,6 +197,121 @@ class FakePeer:
                       f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n").encode()
                      + body)
         await writer.drain()
+
+    async def _reply_raw(self, writer: asyncio.StreamWriter, body: bytes,
+                         status: int) -> None:
+        reason = {200: "OK", 201: "Created", 401: "Unauthorized", 403: "Forbidden",
+                  404: "Not Found", 422: "Unprocessable Entity",
+                  500: "Internal Server Error"}.get(status, "Test response")
+        writer.write((f"HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\n"
+                      f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n").encode()
+                     + body)
+        await writer.drain()
+
+    async def _proxy_conversation(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
+        method: str, path: str, headers: dict[str, str], payload: dict[str, object],
+    ) -> None:
+        event_id = str(payload.get("provider_event_id", ""))
+        is_admission = path.endswith("/admissions")
+        if is_admission:
+            self.admission_attempts[event_id] += 1
+        pre_modes = self.admission_pre_modes[event_id] if is_admission else deque()
+        pre_mode = pre_modes.popleft() if pre_modes else ""
+        if pre_mode in {"unauthorized", "forbidden", "server_500", "malformed",
+                        "reset", "timeout"}:
+            if pre_mode == "unauthorized":
+                self.admission_responses[event_id].append(
+                    {"status_code": 401, "replayed": None, "mode": pre_mode})
+                await self._reply(writer, {"detail": "fixture rejected before commit"}, 401)
+            elif pre_mode == "forbidden":
+                self.admission_responses[event_id].append(
+                    {"status_code": 403, "replayed": None, "mode": pre_mode})
+                await self._reply(writer, {"detail": "fixture forbidden before commit"}, 403)
+            elif pre_mode == "server_500":
+                self.admission_responses[event_id].append(
+                    {"status_code": 500, "replayed": None, "mode": pre_mode})
+                await self._reply(writer, {"detail": "fixture unavailable before commit"}, 500)
+            elif pre_mode == "malformed":
+                self.admission_responses[event_id].append(
+                    {"status_code": 200, "replayed": None, "mode": pre_mode})
+                await self._reply(writer, {"route": "MANAGED"})
+            elif pre_mode == "timeout":
+                self.admission_responses[event_id].append(
+                    {"status_code": None, "replayed": None, "mode": pre_mode})
+                # The Conversation client has a ten-second request timeout.
+                # Keep this socket pending long enough for that timeout and
+                # the gateway's bounded retry policy to take effect.
+                await asyncio.sleep(10.25)
+                writer.close()
+                await writer.wait_closed()
+            else:
+                self.admission_responses[event_id].append(
+                    {"status_code": None, "replayed": None, "mode": pre_mode})
+                writer.close()
+                await writer.wait_closed()
+            return
+        if pre_mode == "hold":
+            key = (event_id, "pre")
+            self.admission_mode_entered.setdefault(key, asyncio.Event()).set()
+            await self.admission_mode_release.setdefault(key, asyncio.Event()).wait()
+
+        async with httpx.AsyncClient(timeout=10, trust_env=False) as client:
+            response = await client.request(
+                method, self.conversation_base_url + path, json=payload,
+                headers={"X-Service-Token": headers.get("x-service-token", "")},
+            )
+        if path.endswith("/responses/work") or path.endswith("/responses/begin") \
+                or path.endswith("/responses/complete"):
+            try:
+                response_payload = response.json()
+            except ValueError:
+                response_payload = {}
+            if not isinstance(response_payload, dict):
+                response_payload = {}
+            items = response_payload.get("items")
+            self.delivery_api_calls.append({
+                "path": path,
+                "status_code": response.status_code,
+                "request_bot_id": payload.get("bot_id"),
+                "request_event_id": payload.get("provider_event_id"),
+                "request_attempt_id": payload.get("response_attempt_id"),
+                "request_outcome": payload.get("outcome"),
+                "request_provider_message_id": payload.get("provider_message_id"),
+                "work_kinds": [item.get("work_kind") for item in items
+                               if isinstance(item, dict)] if isinstance(items, list) else [],
+                "begin_send": response_payload.get("send"),
+                "begin_work_kind": response_payload.get("work_kind"),
+                "response_outcome": response_payload.get("outcome"),
+                "response_attempt_id": response_payload.get("response_attempt_id"),
+                "response_admission_id": response_payload.get("admission_id"),
+                "response_bot_id": response_payload.get("bot_id"),
+                "response_provider_message_id": response_payload.get("provider_message_id"),
+                "detail_code": (response_payload.get("detail", {}).get("code")
+                                if isinstance(response_payload.get("detail"), dict) else None),
+            })
+        if is_admission:
+            try:
+                response_payload = response.json()
+            except ValueError:
+                response_payload = {}
+            self.admission_responses[event_id].append({
+                "status_code": response.status_code,
+                "replayed": (response_payload.get("replayed")
+                             if isinstance(response_payload, dict) else None),
+            })
+        after_modes = self.admission_after_modes[event_id] if is_admission else deque()
+        after_mode = after_modes.popleft() if after_modes else ""
+        if after_mode in {"hold", "drop"}:
+            key = (event_id, "post")
+            self.admission_mode_entered.setdefault(key, asyncio.Event()).set()
+            if after_mode == "hold":
+                await self.admission_mode_release.setdefault(key, asyncio.Event()).wait()
+            else:
+                writer.close()
+                await writer.wait_closed()
+                return
+        await self._reply_raw(writer, response.content, response.status_code)
 
     async def _read_payload(self, reader: asyncio.StreamReader,
                             headers: dict[str, str]) -> dict[str, object]:
@@ -173,6 +350,8 @@ class FakePeer:
         return value if isinstance(value, dict) else {}
 
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        transition_generation_at_start = self.transition_generation
+        active_transitions_at_start = set(self.active_transitions)
         try:
             head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=5)
             request_line = head.split(b"\r\n", 1)[0].decode("ascii")
@@ -184,6 +363,12 @@ class FakePeer:
                     headers[key.decode("ascii").lower()] = value.decode("latin1").strip()
             payload = await self._read_payload(reader, headers)
             path = urlsplit(target).path
+
+            if path.startswith("/internal/v1/telegram/"):
+                await self._proxy_conversation(
+                    reader, writer, method, path, headers, payload,
+                )
+                return
 
             if path == "/v1/internal/integrations":
                 if headers.get("x-internal-token") != self.cp_token:
@@ -234,12 +419,30 @@ class FakePeer:
                         "username": f"fixture_{bot_id}_bot"}})
                     return
                 if method_name == "getUpdates":
-                    offset = int(payload.get("offset", 0))
+                    previous_forced = self._forced_inflight.pop(token, None)
+                    if previous_forced is not None:
+                        next_poll = self._forced_next_poll.get((token, previous_forced))
+                        if next_poll is not None:
+                            next_poll.set()
+                    raw_offset = payload.get("offset")
+                    offset = int(raw_offset) if raw_offset is not None else None
+                    self.get_updates_offsets[token].append(offset)
                     queue = self.updates[token]
-                    while queue and int(queue[0]["update_id"]) < offset:
-                        queue.popleft()
+                    while (offset is not None and queue
+                           and int(queue[0]["update_id"]) < offset):
+                        removed = queue.popleft()
+                        removed_id = int(removed["update_id"])
+                        self.acknowledged_update_ids[token].append(removed_id)
+                        ack_event = self._ack_events.get((token, removed_id))
+                        if ack_event is not None:
+                            ack_event.set()
                     forced = self.forced_updates[token]
-                    updates = [forced.popleft()] if forced else list(queue)[:100]
+                    if forced:
+                        forced_update = forced.popleft()
+                        self._forced_inflight[token] = int(forced_update["update_id"])
+                        updates = [forced_update]
+                    else:
+                        updates = list(queue)[:100]
                     self.get_updates_calls[token] += 1
                     if updates:
                         self.current_updates[token] = updates[0]
@@ -256,11 +459,9 @@ class FakePeer:
                         if isinstance(current_chat, dict):
                             event_id = (f"b{token.split(':', 1)[0]}c{current_chat['id']}"
                                         f"m{current_message['message_id']}")
-                    if event_id in self.require_admission_before_action:
-                        assert self.db is not None
-                        self.action_admission_counts[event_id] = await self.db.fetchval(
-                            "SELECT count(*) FROM telegram_admissions "
-                            "WHERE provider_event_id=$1", event_id)
+                    if event_id in self.action_entered:
+                        self.action_entered[event_id].set()
+                        await self.action_release[event_id].wait()
                     mode = self.chat_action_modes.get(event_id or "", "success")
                     if mode == "server_500":
                         await self._reply(writer, {
@@ -325,7 +526,28 @@ class FakePeer:
             pass
         except Exception as exc:  # Fixture failures become visible to the parent test.
             method_hint = path.rsplit("/", 1)[-1] if "path" in locals() else "request"
-            self.request_errors.append(f"{method_hint}:{type(exc).__name__}")
+            changed_services = sorted(
+                set(self.transitions_since(transition_generation_at_start))
+                | active_transitions_at_start | self.active_transitions
+            )
+            expected_proxy_failure = (
+                bool(changed_services)
+                and method_hint in {"work", "results"}
+                and isinstance(exc, (httpx.ConnectError, httpx.RemoteProtocolError))
+                and "conversation" in changed_services
+            )
+            diagnostic = {
+                "path": method_hint,
+                "error_class": type(exc).__name__,
+                "transition_services": changed_services,
+                "transition_generation_at_start": transition_generation_at_start,
+                "transition_generation_at_failure": self.transition_generation,
+            }
+            if expected_proxy_failure:
+                self.expected_transition_errors.append(diagnostic)
+            else:
+                self.request_errors.append(f"{method_hint}:{type(exc).__name__}")
+                self.unexpected_error_diagnostics.append(diagnostic)
             if not writer.is_closing():
                 try:
                     await self._reply(writer, {"detail": "fixture error"}, 500)
@@ -346,6 +568,40 @@ class FakePeer:
         self.updates[token].append(update)
         if duplicate:
             self.updates[token].append(dict(update))
+
+    def after_forced_update(self, token: str, update_id: int) -> asyncio.Event:
+        return self._forced_next_poll.setdefault((token, update_id), asyncio.Event())
+
+    def acknowledged(self, token: str, update_id: int) -> asyncio.Event:
+        return self._ack_events.setdefault((token, update_id), asyncio.Event())
+
+    def hold_typing(self, event_id: str) -> asyncio.Event:
+        entered = self.action_entered.setdefault(event_id, asyncio.Event())
+        self.action_release.setdefault(event_id, asyncio.Event()).clear()
+        return entered
+
+    def release_typing(self, event_id: str) -> None:
+        self.action_release.setdefault(event_id, asyncio.Event()).set()
+
+    def hold_admission_request(self, event_id: str) -> asyncio.Event:
+        key = (event_id, "pre")
+        entered = self.admission_mode_entered.setdefault(key, asyncio.Event())
+        self.admission_mode_release.setdefault(key, asyncio.Event()).clear()
+        self.admission_pre_modes[event_id].append("hold")
+        return entered
+
+    def release_admission_request(self, event_id: str) -> None:
+        self.admission_mode_release.setdefault((event_id, "pre"), asyncio.Event()).set()
+
+    def hold_admission_response(self, event_id: str) -> asyncio.Event:
+        key = (event_id, "post")
+        entered = self.admission_mode_entered.setdefault(key, asyncio.Event())
+        self.admission_mode_release.setdefault(key, asyncio.Event()).clear()
+        self.admission_after_modes[event_id].append("hold")
+        return entered
+
+    def release_admission_response(self, event_id: str) -> None:
+        self.admission_mode_release.setdefault((event_id, "post"), asyncio.Event()).set()
 
     def offset_advanced(self, token: str, update_id: int) -> bool:
         return any(
@@ -377,7 +633,10 @@ class TelegramHarness:
     log_handles: list[object] = field(default_factory=list, repr=False)
     cohort_enabled: bool = True
     settling_enabled: bool = False
+    settling_quiet_window_ms: int = 1000
+    settling_max_wait_ms: int = 1200
     db: asyncpg.Pool | None = field(default=None, repr=False)
+    gateway_source_root: Path = field(default=TG_ROOT, repr=False)
 
     def url(self, name: str) -> str:
         port = self.peer_port if name == "fake" else self.ports[name]
@@ -392,7 +651,7 @@ class TelegramHarness:
                          int(make_url(self.database_url).port or 5432)]
         env = {
             "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-            "PYTHONPATH": str(CS_ROOT if name != "gateway" else TG_ROOT),
+            "PYTHONPATH": str(CS_ROOT if name != "gateway" else self.gateway_source_root),
             "PYTHONUNBUFFERED": "1",
             "PYTHONDONTWRITEBYTECODE": "1",
             "GOAL4B_SERVICE_PORT": str(self.ports[name]),
@@ -439,8 +698,8 @@ class TelegramHarness:
                     "version": "telegram-process-v1",
                     "channel": "TELEGRAM",
                     "integration_id": self.ids["canary"],
-                    "quiet_window_ms": 1000,
-                    "max_wait_ms": 1200,
+                    "quiet_window_ms": self.settling_quiet_window_ms,
+                    "max_wait_ms": self.settling_max_wait_ms,
                 }])
         elif name == "gateway":
             telegram_bindings = [
@@ -454,7 +713,7 @@ class TelegramHarness:
                 "CONTROL_PLANE_URL": self.peer.base_url,
                 "INTERNAL_API_TOKEN": self.tokens["control_plane"],
                 "CHAT_S2S_TOKEN": self.tokens["legacy"],
-                "CONVERSATION_SERVICE_URL": self.url("conversation"),
+                "CONVERSATION_SERVICE_URL": self.peer.base_url,
                 "CONVERSATION_SERVICE_TOKEN": self.tokens["conversation_gateway"],
                 "TELEGRAM_MANAGED_BINDINGS": json.dumps(telegram_bindings),
                 "TELEGRAM_CANARY_INTEGRATION_IDS": json.dumps(
@@ -466,8 +725,10 @@ class TelegramHarness:
             })
         return env
 
-    def start(self, name: str) -> None:
+    def start(self, name: str, *, gateway_source_root: Path | None = None) -> None:
         assert name not in self.processes
+        if name == "gateway" and gateway_source_root is not None:
+            self.gateway_source_root = gateway_source_root.resolve()
         python = TG_PYTHON if name == "gateway" else CS_PYTHON
         env = self.env(name)
         log = (self.root / f"{name}.log").open("ab")
@@ -481,6 +742,8 @@ class TelegramHarness:
     def kill(self, name: str) -> None:
         process = self.processes.pop(name, None)
         if process is not None:
+            if name in {"conversation", "gateway"}:
+                self.peer.begin_transition(name)
             process.kill()
             process.wait(timeout=6)
 
@@ -499,20 +762,25 @@ class TelegramHarness:
                     guard = self.root / f"{name}-guard.json"
                     if guard.exists():
                         assert json.loads(guard.read_text())["probe_blocked"] is True
+                    if name in {"conversation", "gateway"}:
+                        self.peer.end_transition(name)
                     return
             except httpx.HTTPError:
                 pass
             await asyncio.sleep(0.05)
         pytest.fail(f"{name} process did not become ready: {last_response}")
 
-    async def restart(self, name: str, *, cohort_enabled: bool | None = None) -> None:
+    async def restart(
+        self, name: str, *, cohort_enabled: bool | None = None,
+        gateway_source_root: Path | None = None,
+    ) -> None:
         self.kill(name)
         await self.client.aclose()
         self.client = httpx.AsyncClient(timeout=20, trust_env=False)
         await asyncio.sleep(0.1)
         if cohort_enabled is not None:
             self.cohort_enabled = cohort_enabled
-        self.start(name)
+        self.start(name, gateway_source_root=gateway_source_root)
         await self.wait_ready(name)
 
     async def rows(self, query: str, *args: object) -> list[asyncpg.Record]:
@@ -590,6 +858,7 @@ async def th(sql, database_url, telegram_runtime, process_ports, tmp_path):
     ]
     peer = FakePeer(rows, tokens["control_plane"], tokens["managed"], tokens["legacy"])
     await peer.start(process_ports["fake"])
+    peer.conversation_base_url = f"http://127.0.0.1:{process_ports['conversation']}"
     client = httpx.AsyncClient(timeout=20, trust_env=False)
     dburl = make_url(database_url)
     pgurl = dburl.set(drivername="postgresql").render_as_string(hide_password=False)
@@ -641,13 +910,44 @@ async def wait_for_state(h: TelegramHarness, event_id: str,
     queued = {key.split(":", 1)[0]: len(values)
               for key, values in h.peer.updates.items()}
     final_state = dict(last_state) if last_state else None
+    process_states = {
+        name: process.poll() for name, process in h.processes.items()
+    }
+    process_logs = {name: str(h.root / f"{name}.log") for name in h.processes}
+    provider_trace = [{
+        "method": call.get("method"),
+        "chat_id": (call.get("send_record") or {}).get("chat_id"),
+        "accepted": (call.get("send_record") or {}).get("accepted"),
+        "provider_message_id": (call.get("send_record") or {}).get(
+            "provider_message_id"),
+    } for call in h.peer.provider_calls[-20:]]
+    provider_frontiers = {
+        token.split(":", 1)[0]: {
+            "offsets": h.peer.get_updates_offsets[token][-12:],
+            "acknowledged_update_ids": h.peer.acknowledged_update_ids[token][-20:],
+            "queued_update_ids": [int(update["update_id"])
+                                  for update in h.peer.updates[token]],
+            "forced_update_ids": [int(update["update_id"])
+                                  for update in h.peer.forced_updates[token]],
+            "current_update_id": (
+                int(h.peer.current_updates[token]["update_id"])
+                if token in h.peer.current_updates else None
+            ),
+        }
+        for token in ("900001:fixture-token", "900002:fixture-token")
+    }
     pytest.fail(
         f"Goal4B acceptance timed out waiting for {label}; state={final_state}; "
         f"managed_calls={len(h.peer.managed_calls)}; legacy_calls={len(h.peer.legacy_calls)}; "
         f"accepted_sends={len(h.peer.accepted_messages)}; "
         f"polls={dict(h.peer.get_updates_calls)}; "
+        f"process_exit_codes={process_states}; "
+        f"provider_trace={provider_trace}; "
+        f"provider_frontiers={provider_frontiers}; "
+        f"delivery_api_calls={h.peer.delivery_api_calls[-20:]}; "
         f"queued={queued}; "
-        f"fixture_errors={h.peer.request_errors!r}"
+        f"fixture_errors={h.peer.request_errors!r}; "
+        f"process_logs={process_logs}"
     )
 
 
@@ -671,7 +971,6 @@ async def test_goal4b_required_local_process_matrix(th, sql) -> None:
     # no Business operation, and no Redis dependency (16-18).
     managed = h.update(message_id=1, update_id=100, text_value="same words")
     managed_key = event_key(managed)
-    h.peer.require_admission_before_action.add(managed_key)
     h.queue(managed)
     state = await wait_for_state(h, managed_key,
         lambda row: row["status"] == "COMPLETED" and row["delivery_status"] == "PROVIDER_ACCEPTED",
@@ -694,31 +993,63 @@ async def test_goal4b_required_local_process_matrix(th, sql) -> None:
         "to_regclass('business_operations') AS business_operations"
     )
     assert tuple(counts[0]) == (1, 1, 1, 1, 1, 1, None)
-    assert h.peer.action_admission_counts[managed_key] == 1
+    assert not any(call.get("method") == "sendChatAction"
+                   and call.get("token") == canary_token for call in h.peer.provider_calls)
     EVIDENCE.append({"scenario": 1, "managed_process_path": "PASS", "contract_version": 2,
                      "provider_delivery": state["delivery_status"], "message_id":
                      state["provider_message_id"], "business_operations": "none"})
 
-    # 3/4: exact provider replay retains the same canonical message/Turn and
-    # sends nothing twice; changed immutable payload with the same provider key
-    # fails closed and never falls back to legacy.
+    # 3/4: a duplicate update below the acknowledged provider frontier is
+    # ignored, while Conversation's exact replay and immutable-payload conflict
+    # remain independently checked against the retained event identity.
     original_message_id = state["canonical_message_id"]
     original_turn_id = state["turn_id"]
+    replay_attempts = h.peer.admission_attempts[managed_key]
+    duplicate_poll = h.peer.after_forced_update(canary_token, 100)
     h.queue(h.update(message_id=1, update_id=100, text_value="same words"), force=True)
-    await asyncio.sleep(0.5)
+    await asyncio.wait_for(duplicate_poll.wait(), 12)
+    assert h.peer.admission_attempts[managed_key] == replay_attempts
     replay = await h.state(managed_key)
     assert replay["canonical_message_id"] == original_message_id
     assert replay["turn_id"] == original_turn_id
     assert len(h.peer.managed_calls) == 1 and len(h.peer.accepted_messages) == 1
-    EVIDENCE.append({"scenario": 3, "same_provider_replay": "PASS",
-                     "managed_calls": 1, "telegram_sends": 1})
+
+    managed_message = managed["message"]
+    assert isinstance(managed_message, dict)
+    managed_chat = managed_message["chat"]
+    managed_sender = managed_message["from"]
+    assert isinstance(managed_chat, dict) and isinstance(managed_sender, dict)
+    admission_request = {
+        "owner_id": h.ids["owner"], "integration_id": h.ids["canary"],
+        "agent_id": h.ids["canary_agent"],
+        "provider_thread_id": str(managed_chat["id"]),
+        "provider_event_id": managed_key, "update_id": managed["update_id"],
+        "chat_id": managed_chat["id"], "message_id": managed_message["message_id"],
+        "sender_id": managed_sender["id"], "bot_id": 900001,
+        "text": managed_message["text"], "desired_route": "MANAGED",
+    }
+    api_headers = {"X-Service-Token": h.tokens["conversation_gateway"]}
+    admission_url = h.url("conversation") + "/internal/v1/telegram/admissions"
+    exact_replay = await h.client.post(
+        admission_url, json=admission_request, headers=api_headers,
+    )
+    assert exact_replay.status_code == 200 and exact_replay.json()["replayed"] is True
+    assert exact_replay.json()["admission_id"] == str(state["admission_id"])
+    EVIDENCE.append({"scenario": 3, "provider_frontier_duplicate_skipped": True,
+                     "exact_http_replay": "PASS", "managed_calls": 1,
+                     "telegram_sends": 1})
+
     before_calls = len(h.peer.managed_calls)
     before_sends = len(h.peer.accepted_messages)
-    h.queue(h.update(message_id=1, update_id=100, text_value="changed immutable text"), force=True)
-    await asyncio.sleep(0.4)
+    conflict = await h.client.post(
+        admission_url, json={**admission_request, "text": "changed immutable text"},
+        headers=api_headers,
+    )
+    assert conflict.status_code == 409
+    assert conflict.json()["detail"]["code"] == "EVENT_CONFLICT"
     assert len(h.peer.managed_calls) == before_calls
     assert len(h.peer.accepted_messages) == before_sends and h.peer.legacy_calls == []
-    EVIDENCE.append({"scenario": 4, "conflicting_provider_replay": "PASS",
+    EVIDENCE.append({"scenario": 4, "conflicting_http_replay": "PASS",
                      "managed_or_legacy_fallback": False})
 
     # 5 and 19: same content on a new provider Message is a new turn; two
@@ -814,21 +1145,16 @@ async def test_goal4b_required_local_process_matrix(th, sql) -> None:
                      "same_message_and_turn": True})
 
     # 7: Restart Conversation after a durable completed Turn, then replay the
-    # exact provider update through the real Gateway against the restarted API.
+    # exact admission body over HTTP against the restarted API.
     managed_calls_before_api_restart = len(h.peer.managed_calls)
     sends_before_api_restart = len(h.peer.accepted_messages)
     h.kill("conversation")
     await h.restart("conversation")
-    actions_before_api_replay = sum(
-        call.get("method") == "sendChatAction" and call.get("token") == canary_token
-        for call in h.peer.provider_calls
+    api_replay = await h.client.post(
+        admission_url, json=admission_request, headers=api_headers,
     )
-    h.queue(h.update(message_id=1, update_id=100, text_value="same words"), force=True)
-    await h.peer.wait_for(lambda: sum(
-        call.get("method") == "sendChatAction" and call.get("token") == canary_token
-        for call in h.peer.provider_calls) > actions_before_api_replay,
-        "retained provider replay after Conversation restart")
-    await asyncio.sleep(0.5)
+    assert api_replay.status_code == 200 and api_replay.json()["replayed"] is True
+    assert api_replay.json()["admission_id"] == str(state["admission_id"])
     api_restarted = await h.state(managed_key)
     assert api_restarted["delivery_status"] == "PROVIDER_ACCEPTED"
     assert len(h.peer.managed_calls) == managed_calls_before_api_restart
@@ -840,7 +1166,6 @@ async def test_goal4b_required_local_process_matrix(th, sql) -> None:
     # The pending provider event remains unacknowledged until the retained Turn
     # completes and it is sent exactly once.
     h.kill("worker")
-    await asyncio.sleep(0.15)
     worker_event = h.update(message_id=12, update_id=111,
                             text_value="worker restart after ingress")
     worker_key = event_key(worker_event)
@@ -864,7 +1189,7 @@ async def test_goal4b_required_local_process_matrix(th, sql) -> None:
     # message and no false success. Re-enable exact cohort for new admissions.
     await h.restart("gateway", cohort_enabled=True)
     h.peer.send_modes.append("reject")
-    rejected = h.update(message_id=5, update_id=104, text_value="provider rejects")
+    rejected = h.update(message_id=5, update_id=112, text_value="provider rejects")
     rejected_key = event_key(rejected)
     h.queue(rejected)
     rejected_state = await wait_for_state(h, rejected_key,
@@ -880,16 +1205,17 @@ async def test_goal4b_required_local_process_matrix(th, sql) -> None:
     # 9/12: provider accepts a message but drops the response; the retained
     # dispatch is UNKNOWN and an exact duplicate is never resent.
     h.peer.send_modes.append("accept_drop")
-    unknown = h.update(message_id=6, update_id=105, text_value="ambiguous provider outcome")
+    unknown = h.update(message_id=6, update_id=113, text_value="ambiguous provider outcome")
     unknown_key = event_key(unknown)
     h.queue(unknown)
     unknown_state = await wait_for_state(h, unknown_key,
         lambda row: row["delivery_status"] == "UNKNOWN", "ambiguous Telegram write")
     accepted_before = len(h.peer.accepted_messages)
     ai_before = len(h.peer.managed_calls)
-    h.queue(h.update(message_id=6, update_id=105,
+    duplicate_poll = h.peer.after_forced_update(canary_token, 113)
+    h.queue(h.update(message_id=6, update_id=113,
                      text_value="ambiguous provider outcome"), force=True)
-    await asyncio.sleep(0.5)
+    await asyncio.wait_for(duplicate_poll.wait(), 12)
     assert len(h.peer.accepted_messages) == accepted_before
     assert len(h.peer.managed_calls) == ai_before
     assert unknown_state["provider_message_id"] is None
@@ -904,7 +1230,7 @@ async def test_goal4b_required_local_process_matrix(th, sql) -> None:
     # kill Gateway in the uncertain write window.
     h.peer.send_modes.append("hold_after_accept")
     h.peer.send_entered.clear()
-    sticky = h.update(message_id=7, update_id=106, text_value="sticky managed")
+    sticky = h.update(message_id=7, update_id=114, text_value="sticky managed")
     sticky_key = event_key(sticky)
     h.queue(sticky)
     await asyncio.wait_for(h.peer.send_entered.wait(), 12)
@@ -913,17 +1239,13 @@ async def test_goal4b_required_local_process_matrix(th, sql) -> None:
     h.kill("gateway")
     h.peer.send_release.set()
     await h.restart("gateway", cohort_enabled=False)
-    updates_before_restart = h.peer.get_updates_calls[canary_token]
-    # BotManager already polls the canary. Observe a fresh request from the new process.
-    await h.peer.wait_for(lambda: h.peer.get_updates_calls[canary_token] > updates_before_restart,
-                          "canary polling after rollback")
-    await asyncio.sleep(0.5)
+    await asyncio.wait_for(h.peer.acknowledged(canary_token, 114).wait(), 12)
     sticky_after = await h.state(sticky_key)
     assert sticky_after["route"] == "MANAGED"
     assert len(h.peer.legacy_calls) == 1
     assert sum(item.get("chat_id") == 404040 and item.get("mode") == "hold_after_accept"
                for item in h.peer.accepted_messages) == 1
-    rolled_back = h.update(message_id=8, update_id=107, text_value="new message after rollback")
+    rolled_back = h.update(message_id=8, update_id=115, text_value="new message after rollback")
     rolled_back_key = event_key(rolled_back)
     h.queue(rolled_back)
     await h.peer.wait_for(lambda: len(h.peer.legacy_calls) == 2,
@@ -962,7 +1284,7 @@ async def test_goal4b_required_local_process_matrix(th, sql) -> None:
     # Unsupported chat shape retains legacy behavior; non-text receives the
     # established unsupported-message response; anonymous channel posts are ignored.
     h.peer.send_release.set()
-    group = h.update(message_id=9, update_id=108, text_value="group legacy",
+    group = h.update(message_id=9, update_id=116, text_value="group legacy",
                      chat_type="group", chat_id=404042)
     group_key = event_key(group)  # This key is not submitted to Conversation.
     legacy_before = len(h.peer.legacy_calls)
@@ -971,7 +1293,7 @@ async def test_goal4b_required_local_process_matrix(th, sql) -> None:
                           "group message legacy path")
     assert (await h.rows("SELECT count(*) FROM telegram_admissions WHERE provider_event_id=$1",
                          group_key))[0][0] == 0
-    non_text = h.update(message_id=10, update_id=109, text_value="", chat_id=404043)
+    non_text = h.update(message_id=10, update_id=117, text_value="", chat_id=404043)
     token = str(non_text.pop("_token"))
     non_text["message"].pop("text")
     non_text["message"]["photo"] = [{"file_id": "synthetic-photo", "file_unique_id": "photo-1",
@@ -982,120 +1304,17 @@ async def test_goal4b_required_local_process_matrix(th, sql) -> None:
                     for item in h.peer.accepted_messages),
         "non-text compatibility reply",
     )
-    anonymous = h.update(message_id=11, update_id=110, text_value="anonymous",
+    anonymous = h.update(message_id=11, update_id=118, text_value="anonymous",
                          chat_type="channel", chat_id=404044, anonymous=True)
     anonymous_token = str(anonymous.pop("_token"))
     before_sends = len(h.peer.accepted_messages)
     h.peer.enqueue(anonymous_token, anonymous)
-    await asyncio.sleep(0.4)
+    await asyncio.wait_for(h.peer.acknowledged(anonymous_token, 118).wait(), 12)
     assert len(h.peer.accepted_messages) == before_sends
     EVIDENCE.append({"scenario": "extra", "group_nontext_and_anonymous_compatibility": "PASS"})
     EVIDENCE.append({"scenario": 16, "managed_html_formatter_parity": "PASS"})
     EVIDENCE.append({"scenario": 17, "no_redis_or_legacy_session_on_managed_path": "PASS"})
     EVIDENCE.append({"scenario": 18, "business_operations": "none"})
-
-    # A typing action is optional provider UX. Exercise actual aiogram polling
-    # against failures from the fake Bot API and verify Conversation committed
-    # admission before each sendChatAction request.
-    await h.restart("gateway", cohort_enabled=True)
-    typing_modes = ("server_500", "network", "timeout", "redirect_loop")
-    for index, mode in enumerate(typing_modes):
-        update_id = 200 + index
-        event = h.update(message_id=20 + index, update_id=update_id,
-                         text_value=f"typing failure {mode}", chat_id=404100 + index)
-        event_id = event_key(event)
-        h.peer.chat_action_modes[event_id] = mode
-        h.peer.require_admission_before_action.add(event_id)
-        managed_before = len(h.peer.managed_calls)
-        sends_before = len(h.peer.accepted_messages)
-        h.queue(event)
-        accepted_state = await wait_for_state(
-            h, event_id,
-            lambda row: row["route"] == "MANAGED" and row["status"] == "COMPLETED"
-            and row["delivery_status"] == "PROVIDER_ACCEPTED",
-            f"managed processing after typing {mode}",
-        )
-        assert accepted_state["canonical_message_id"] is not None
-        assert h.peer.action_admission_counts[event_id] == 1
-        await h.peer.wait_for(
-            lambda: h.peer.offset_advanced(canary_token, update_id),
-            f"poll offset advancement after typing {mode}",
-        )
-        counts = await h.rows(
-            "SELECT (SELECT count(*) FROM telegram_admissions WHERE provider_event_id=$1),"
-            "(SELECT count(*) FROM inbound_events WHERE provider_event_id=$1),"
-            "(SELECT count(*) FROM messages WHERE id=$2 AND actor='CUSTOMER'),"
-            "(SELECT count(*) FROM agent_turns WHERE id=$3),"
-            "(SELECT count(*) FROM messages WHERE source_agent_turn_id=$3 AND actor='AGENT'),"
-            "(SELECT count(*) FROM delivery_attempts WHERE source_turn_id=$3)",
-            event_id, accepted_state["canonical_message_id"], accepted_state["turn_id"],
-        )
-        assert tuple(counts[0]) == (1, 1, 1, 1, 1, 1)
-        assert len(h.peer.managed_calls) == managed_before + 1
-        assert len(h.peer.accepted_messages) == sends_before + 1
-
-        # An exact Telegram redelivery still resolves to the same durable work.
-        action_before_replay = sum(
-            call.get("method") == "sendChatAction" and call.get("token") == canary_token
-            for call in h.peer.provider_calls
-        )
-        polls_before_replay = h.peer.get_updates_calls[canary_token]
-        h.queue(h.update(message_id=20 + index, update_id=update_id,
-                         text_value=f"typing failure {mode}", chat_id=404100 + index),
-                force=True)
-        await h.peer.wait_for(lambda: sum(
-            call.get("method") == "sendChatAction" and call.get("token") == canary_token
-            for call in h.peer.provider_calls) > action_before_replay,
-            f"typing action replay for {mode}")
-        await h.peer.wait_for(
-            lambda: h.peer.get_updates_calls[canary_token] >= polls_before_replay + 2,
-            f"poll completion after typing replay for {mode}",
-        )
-        assert (await h.rows(
-            "SELECT count(*) FROM telegram_admissions WHERE provider_event_id=$1", event_id
-        ))[0][0] == 1
-        assert len(h.peer.managed_calls) == managed_before + 1
-        assert len(h.peer.accepted_messages) == sends_before + 1
-        EVIDENCE.append({"scenario": "typing_failure", "mode": mode,
-                         "admission_before_action": True, "offset_advanced": True,
-                         "one_admission_and_turn": True, "processing_continued": True})
-
-    # With a sticky binding but disabled cohort, a durable LEGACY decision also
-    # survives a typing failure and continues to the established legacy AI path.
-    await h.restart("gateway", cohort_enabled=False)
-    legacy_action = h.update(integration="legacy", message_id=30, update_id=204,
-                             text_value="legacy typing failure", chat_id=405100)
-    legacy_action_id = event_key(legacy_action)
-    h.peer.chat_action_modes[legacy_action_id] = "server_500"
-    h.peer.require_admission_before_action.add(legacy_action_id)
-    legacy_calls_before_action = len(h.peer.legacy_calls)
-    h.queue(legacy_action)
-    await h.peer.wait_for(
-        lambda: len(h.peer.legacy_calls) == legacy_calls_before_action + 1,
-        "legacy AI processing after typing failure",
-    )
-    legacy_action_state = await h.state(legacy_action_id)
-    assert legacy_action_state["route"] == "LEGACY"
-    assert legacy_action_state["canonical_message_id"] is None
-    assert h.peer.action_admission_counts[legacy_action_id] == 1
-    await h.peer.wait_for(
-        lambda: any(call.get("method") == "sendMessage"
-                    and call.get("token") == legacy_token
-                        and int(call.get("payload", {}).get("chat_id", 0)) == 405100
-                    for call in h.peer.provider_calls),
-        "legacy Telegram response after typing failure",
-    )
-    await h.peer.wait_for(
-        lambda: h.peer.offset_advanced(legacy_token, 204),
-        "legacy poll offset advancement after typing failure",
-    )
-    assert (await h.rows(
-        "SELECT count(*) FROM telegram_admissions WHERE provider_event_id=$1",
-        legacy_action_id,
-    ))[0][0] == 1
-    EVIDENCE.append({"scenario": "typing_failure", "mode": "retained_legacy_http_500",
-                     "admission_before_action": True, "legacy_ai_continued": True,
-                     "offset_advanced": True})
 
     # Inspect every process log sink after realistic aiohttp/aiogram failures.
     all_logs = "\n".join(path.read_text(errors="replace")
@@ -1105,10 +1324,6 @@ async def test_goal4b_required_local_process_matrix(th, sql) -> None:
         assert secret not in all_logs
     assert f"/bot{canary_token}/" not in all_logs
     assert f"/bot{legacy_token}/" not in all_logs
-    assert "event=typing_failed" in all_logs
-    assert "operation=sendChatAction" in all_logs
-    assert "error_class=TelegramServerError" in all_logs
-    assert "error_class=TelegramNetworkError" in all_logs
     EVIDENCE.append({"scenario": "secret_redaction", "log_sinks": "all process logs",
                      "provider_url_token_raw_response_and_configured_secrets": "absent"})
 
@@ -1117,7 +1332,22 @@ async def test_goal4b_required_local_process_matrix(th, sql) -> None:
     await assert_guard(h, "conversation")
     await assert_guard(h, "worker")
     await assert_guard(h, "gateway")
-    assert not h.peer.request_errors
+    assert not h.peer.request_errors, {
+        "request_errors": h.peer.request_errors,
+        "diagnostics": h.peer.unexpected_error_diagnostics,
+        "transition_history": h.peer.transition_history,
+    }
+    assert all(
+        item["path"] in {"work", "results"}
+        and item["error_class"] in {"ConnectError", "RemoteProtocolError"}
+        and "conversation" in item["transition_services"]
+        for item in h.peer.expected_transition_errors
+    )
+    EVIDENCE.append({
+        "scenario": "planned conversation restart transport evidence",
+        "expected_failures": h.peer.expected_transition_errors,
+        "unexpected_failures": h.peer.request_errors,
+    })
     EVIDENCE.append({"scenario": 10, "provider_success_evidence": "PROVIDER_ACCEPTED + message id"})
     EVIDENCE.append({"scenario": 20, "website_regression":
                      "run existing Website process acceptance separately"})
@@ -1130,6 +1360,203 @@ async def test_goal4b_required_local_process_matrix(th, sql) -> None:
             raise RuntimeError("Evidence path must be inside /private/tmp")
         target.write_text(json.dumps(EVIDENCE, indent=2, sort_keys=True, default=str))
         target.chmod(0o600)
+
+
+@pytest.mark.asyncio
+async def test_goal5_single_immediate_process_delivery_smoke(th) -> None:
+    h = th
+    token = "900001:fixture-token"
+    update = h.update(message_id=505, update_id=505,
+                      text_value="single immediate smoke", chat_id=406505)
+    key = event_key(update)
+    h.queue(update)
+    await wait_for_state(
+        h, key,
+        lambda row: row["status"] == "COMPLETED"
+        and row["delivery_status"] == "PROVIDER_ACCEPTED",
+        "single immediate update provider acceptance",
+    )
+    await h.peer.wait_for(
+        lambda: h.peer.acknowledged_update_ids[token] == [505],
+        "single provider update acknowledged after terminal delivery",
+    )
+
+
+@pytest.mark.asyncio
+async def test_goal5_same_bot_token_rotation_preserves_pinned_account(th) -> None:
+    h = th
+    original = "900001:fixture-token"
+    rotated = "900001:rotated-fixture-token"
+    h.peer.integration_rows[0]["credentials"]["BOT_TOKEN"] = rotated
+    await h.peer.wait_for(
+        lambda: h.peer.get_updates_calls[rotated] > 0,
+        "same provider bot ID re-registered with its rotated token",
+    )
+    update = h.update(message_id=506, update_id=506,
+                      text_value="same bot after token rotation", chat_id=406506)
+    update["_token"] = rotated
+    key = event_key(update)
+    h.queue(update)
+    await wait_for_state(
+        h, key,
+        lambda row: row["status"] == "COMPLETED"
+        and row["delivery_status"] == "PROVIDER_ACCEPTED",
+        "same-bot rotated credential terminal delivery",
+    )
+    await h.peer.wait_for(
+        lambda: h.peer.acknowledged_update_ids[rotated] == [506],
+        "rotated-token poll safely acknowledges provider event",
+    )
+    account = await h.rows(
+        "SELECT state,bot_id FROM telegram_provider_accounts "
+        "WHERE owner_id=$1 AND integration_id=$2",
+        h.ids["owner"], h.ids["canary"],
+    )
+    assert len(account) == 1 and account[0]["state"] == "BOUND"
+    assert account[0]["bot_id"] == "900001"
+    assert h.peer.get_updates_calls[original] > 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_index,failure_mode", [
+    (0, "unauthorized"), (1, "forbidden"), (2, "server_500"),
+    (0, "malformed"), (1, "reset"), (2, "timeout"),
+])
+async def test_goal5_rejected_admission_holds_the_provider_prefix(
+    th, failure_index, failure_mode,
+) -> None:
+    h = th
+    token = "900001:fixture-token"
+    update_ids = [510, 540, 900]
+    updates = [h.update(
+        message_id=510 + index, update_id=update_ids[index],
+        text_value=f"safe prefix failure {index}", chat_id=406510 + index,
+    ) for index in range(3)]
+    keys = [event_key(update) for update in updates]
+    failed_key = keys[failure_index]
+
+    # Commit the prefix before injecting the failure. This makes N/N+1/N+2
+    # independent of AI and delivery latency while retaining a real provider
+    # getUpdates batch for the failed event and its suffix.
+    for update, key in zip(updates[:failure_index], keys[:failure_index]):
+        acknowledged_before = len(h.peer.acknowledged_update_ids[token])
+        h.queue(update)
+        await wait_for_state(
+            h, key,
+            lambda row: row["status"] == "COMPLETED"
+            and row["delivery_status"] == "PROVIDER_ACCEPTED",
+            "prior provider prefix event reaches terminal delivery",
+        )
+        await h.peer.wait_for(
+            lambda: len(h.peer.acknowledged_update_ids[token]) == acknowledged_before + 1,
+            "prior provider prefix is acknowledged",
+        )
+    h.peer.admission_pre_modes[failed_key].append(failure_mode)
+    retry_entered = h.peer.hold_admission_request(failed_key)
+    for update in updates[failure_index:]:
+        h.queue(update)
+
+    # The first request is a real aiogram update against a fake Telegram queue;
+    # the proxy rejects its Conversation admission and holds the retry request.
+    # While held, no provider offset may confirm the failed update or its suffix.
+    await asyncio.wait_for(retry_entered.wait(), timeout=12)
+    assert h.peer.admission_attempts[failed_key] >= 2
+    assert h.peer.acknowledged_update_ids[token] == update_ids[:failure_index]
+    assert not any(offset is not None and offset > update_ids[failure_index]
+                   for offset in h.peer.get_updates_offsets[token])
+    for index, key in enumerate(keys):
+        count = (await h.rows(
+            "SELECT count(*) FROM telegram_admissions WHERE provider_event_id=$1", key
+        ))[0][0]
+        assert count == (1 if index < failure_index else 0)
+
+    h.peer.release_admission_request(failed_key)
+    for update, key in zip(updates, keys):
+        await wait_for_state(
+            h, key,
+            lambda row: row["status"] == "COMPLETED"
+            and row["delivery_status"] == "PROVIDER_ACCEPTED",
+            "all provider events after the admission retry",
+        )
+    await h.peer.wait_for(
+        lambda: h.peer.acknowledged_update_ids[token] == update_ids,
+        "fake Telegram deleting exactly the fully committed prefix",
+    )
+    assert h.peer.admission_responses[failed_key][0]["status_code"] == {
+        "unauthorized": 401, "forbidden": 403, "server_500": 500,
+        "malformed": 200, "reset": None, "timeout": None,
+    }[failure_mode]
+    assert h.peer.admission_responses[failed_key][-1]["replayed"] is False
+    EVIDENCE.append({
+        "scenario": "safe provider offset", "failure_index": failure_index,
+        "updates": update_ids, "rejected_admission_holds_suffix": True,
+        "provider_acknowledged_only_after_recovery": True,
+    })
+
+
+@pytest.mark.asyncio
+async def test_goal5_commit_response_loss_restarts_from_absent_offset(th) -> None:
+    h = th
+    token = "900001:fixture-token"
+    h.peer.managed_block = True
+    h.peer.managed_release.clear()
+    h.peer.managed_entered.clear()
+    first = h.update(message_id=570, update_id=570,
+                     text_value="commit before admission response loss", chat_id=406570)
+    first_key = event_key(first)
+    response_held = h.peer.hold_admission_response(first_key)
+    h.queue(first)
+    await asyncio.wait_for(response_held.wait(), timeout=12)
+    committed = await wait_for_state(
+        h, first_key, lambda row: row["canonical_message_id"] is not None,
+        "database commit before dropping the admission HTTP response",
+    )
+    await asyncio.wait_for(h.peer.managed_entered.wait(), timeout=12)
+    second = h.update(message_id=571, update_id=580,
+                      text_value="next retained provider event", chat_id=406571)
+    third = h.update(message_id=572, update_id=920,
+                     text_value="gapped retained provider event", chat_id=406572)
+    h.queue(second)
+    h.queue(third)
+    assert not h.peer.offset_advanced(token, 570)
+    assert h.peer.admission_responses[first_key] == [
+        {"status_code": 200, "replayed": False},
+    ]
+
+    # Killing Gateway after PostgreSQL commit but before the HTTP body reaches it
+    # makes the outcome unknown to the caller. Telegram still retains all three
+    # updates, so restart must begin with offset omitted and replay the first.
+    h.kill("gateway")
+    h.peer.release_admission_response(first_key)
+    await h.restart("gateway")
+    await h.peer.wait_for(
+        lambda: any(row.get("replayed") is True
+                    for row in h.peer.admission_responses[first_key]),
+        "same provider event replayed after response-loss restart",
+    )
+    assert committed["canonical_message_id"] is not None
+    assert any(offset is None for offset in h.peer.get_updates_offsets[token])
+    h.peer.managed_release.set()
+    for update in (first, second, third):
+        await wait_for_state(
+            h, event_key(update),
+            lambda row: row["status"] == "COMPLETED"
+            and row["delivery_status"] == "PROVIDER_ACCEPTED",
+            "provider events recovered after committed receipt response loss",
+        )
+    await h.peer.wait_for(
+        lambda: h.peer.acknowledged_update_ids[token] == [570, 580, 920],
+        "provider offset confirming each recovered event in order",
+    )
+    final = await h.state(first_key)
+    assert final["admission_id"] == committed["admission_id"]
+    assert len(h.peer.managed_calls) == 3
+    assert len(h.peer.accepted_messages) == 3
+    EVIDENCE.append({
+        "scenario": "unknown admission response", "commit_survived_gateway_restart": True,
+        "replay_same_admission": True, "restart_offset": None,
+        "provider_gaps_preserved": [570, 580, 920],
+    })
 
 
 def pytest_terminal_summary(terminalreporter, exitstatus, config) -> None:
@@ -1150,6 +1577,8 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config) -> None:
 async def test_goal5_real_polling_bursts_max_wait_and_restart_recovery(th, sql) -> None:
     h = th
     h.settling_enabled = True
+    h.settling_quiet_window_ms = 2500
+    h.settling_max_wait_ms = 3000
     # The test has no retained traffic yet, so restart the actual services with
     # the exact binding policy enabled and preserve the accepted Goal4B heads.
     for name in ("conversation", "worker", "gateway"):
@@ -1162,6 +1591,7 @@ async def test_goal5_real_polling_bursts_max_wait_and_restart_recovery(th, sql) 
                       text_value=f"two message burst {index}", chat_id=406001)
              for index in range(2)]
     burst_keys = [event_key(update) for update in burst]
+    typing_blocked = h.peer.hold_typing(burst_keys[0])
     for update in burst:
         h.queue(update)
     burst_states = [await wait_for_state(
@@ -1180,6 +1610,8 @@ async def test_goal5_real_polling_bursts_max_wait_and_restart_recovery(th, sql) 
     assert request_ids == selected_ids and len(set(request_ids)) == 2
     assert len(h.peer.managed_calls) == before_ai + 1
     assert len(h.peer.accepted_messages) == before_sends + 1
+    assert not typing_blocked.is_set(), "managed ingress must not wait on Telegram typing"
+    h.peer.release_typing(burst_keys[0])
 
     # A three-message burst is also represented by original canonical IDs in
     # one frozen ManagedTurn request and results in one provider write.
@@ -1217,7 +1649,6 @@ async def test_goal5_real_polling_bursts_max_wait_and_restart_recovery(th, sql) 
     await wait_for_state(h, outside_one_key,
         lambda row: row["delivery_status"] == "PROVIDER_ACCEPTED",
         "first outside-window Telegram response")
-    await asyncio.sleep(1.1)
     outside_two = h.update(message_id=222, update_id=422,
                            text_value="outside window two", chat_id=406003)
     outside_two_key = event_key(outside_two)
@@ -1234,17 +1665,28 @@ async def test_goal5_real_polling_bursts_max_wait_and_restart_recovery(th, sql) 
     before_ai = len(h.peer.managed_calls)
     before_sends = len(h.peer.accepted_messages)
     before_call_times = len(h.peer.managed_call_times)
-    continuous_start = asyncio.get_running_loop().time()
     continuous = [h.update(message_id=231 + index, update_id=431 + index,
                            text_value=f"continuous burst {index}", chat_id=406004)
                   for index in range(3)]
     continuous_keys = [event_key(update) for update in continuous]
-    h.queue(continuous[0])
-    await asyncio.sleep(0.3)
-    h.queue(continuous[1])
-    await asyncio.sleep(0.3)
-    last_arrival = asyncio.get_running_loop().time()
-    h.queue(continuous[2])
+    async def enqueue_and_confirm(update: dict[str, object], key: str) -> None:
+        h.queue(update)
+        await wait_for_state(
+            h, key, lambda row: row["canonical_message_id"] is not None,
+            "continuous burst provider event admission",
+        )
+        await h.peer.wait_for(
+            lambda: h.peer.offset_advanced(token, int(update["update_id"])),
+            "continuous burst event durable acknowledgment",
+        )
+
+    # These gaps deliberately keep each real DB arrival inside the prior quiet
+    # window. The persisted input timestamps below verify that precondition.
+    await enqueue_and_confirm(continuous[0], continuous_keys[0])
+    await asyncio.sleep(0.7)
+    await enqueue_and_confirm(continuous[1], continuous_keys[1])
+    await asyncio.sleep(0.7)
+    await enqueue_and_confirm(continuous[2], continuous_keys[2])
     continuous_states = [await wait_for_state(
         h, key, lambda row: row["delivery_status"] == "PROVIDER_ACCEPTED",
         "continuous burst response bounded by max wait",
@@ -1253,19 +1695,44 @@ async def test_goal5_real_polling_bursts_max_wait_and_restart_recovery(th, sql) 
                           "one Managed AI execution for continuous burst")
     assert len({state["turn_id"] for state in continuous_states}) == 1
     timed_turn = await h.rows(
-        "SELECT t.created_at, max(m.created_at) AS latest_input FROM agent_turns t "
+        "SELECT t.created_at, t.settling_burst_id, b.opened_at,b.max_cutoff_at,"
+        "b.last_input_at,b.ready_at,b.closed_at,b.quiet_window_ms,b.max_wait_ms "
+        "FROM agent_turns t JOIN settling_bursts b ON b.id=t.settling_burst_id "
         "JOIN telegram_immediate_turns i ON i.turn_id=t.id "
-        "JOIN messages m ON m.id=i.message_id WHERE t.id=$1 GROUP BY t.id",
+        "WHERE t.id=$1 GROUP BY t.id,b.id",
         continuous_states[0]["turn_id"],
     )
     assert len(timed_turn) == 1
-    wait_after_last = (timed_turn[0]["created_at"] - timed_turn[0]["latest_input"]).total_seconds()
-    assert 0 <= wait_after_last < 1.0
-    assert asyncio.get_running_loop().time() - continuous_start >= 1.0
-    # Measure dispatch itself, not the later provider response observation:
-    # delivery latency must not be counted against the scheduler's max wait.
+    burst = timed_turn[0]
+    input_times = await h.rows(
+        "SELECT m.id::text AS message_id,m.created_at,m.settling_burst_id FROM messages m "
+        "JOIN telegram_admissions a ON a.canonical_message_id=m.id "
+        "WHERE a.provider_event_id=ANY($1::text[]) ORDER BY m.sequence",
+        continuous_keys,
+    )
+    assert len(input_times) == 3
+    assert {row["settling_burst_id"] for row in input_times} == {
+        burst["settling_burst_id"]
+    }
+    assert all(
+        later["created_at"] - earlier["created_at"] < timedelta(
+            milliseconds=burst["quiet_window_ms"]
+        )
+        for earlier, later in zip(input_times, input_times[1:])
+    )
+    assert burst["max_wait_ms"] == 3000 and burst["quiet_window_ms"] == 2500
+    assert burst["max_cutoff_at"] == burst["opened_at"] + timedelta(
+        milliseconds=burst["max_wait_ms"]
+    )
+    assert burst["last_input_at"] + timedelta(
+        milliseconds=burst["quiet_window_ms"]
+    ) > burst["max_cutoff_at"]
+    assert burst["ready_at"] == burst["closed_at"] == burst["max_cutoff_at"]
+    assert burst["created_at"] >= burst["ready_at"]
     assert len(h.peer.managed_call_times) == before_call_times + 1
-    assert 0 <= h.peer.managed_call_times[-1] - last_arrival < 1.0
+    assert h.peer.managed_calls[-1]["selected_input_message_ids"] == [
+        row["message_id"] for row in input_times
+    ]
     assert len(h.peer.accepted_messages) == before_sends + 1
 
     # Once Conversation has durably admitted an update, Gateway polling may
@@ -1315,7 +1782,7 @@ async def test_goal5_real_polling_bursts_max_wait_and_restart_recovery(th, sql) 
     uncertain_state = await wait_for_state(h, uncertain_key,
         lambda row: row["delivery_status"] == "UNKNOWN",
         "UNKNOWN after provider accepted but response was lost")
-    await asyncio.sleep(0.5)
+    await asyncio.wait_for(h.peer.acknowledged(token, 442).wait(), 12)
     assert uncertain_state["canonical_message_id"] is not None
     assert len(h.peer.accepted_messages) == before_sends + 1
     assert len(h.peer.managed_calls) == before_ai + 1
@@ -1326,4 +1793,145 @@ async def test_goal5_real_polling_bursts_max_wait_and_restart_recovery(th, sql) 
         "continuous_burst": "max_wait bounded before quiet timeout",
         "durable_admission_restart": "offset advanced; response recovered",
         "provider_acceptance_restart": "UNKNOWN; no blind resend",
+    })
+
+
+@pytest.mark.asyncio
+async def test_no_policy_history_matches_exact_accepted_gateway_source(th) -> None:
+    h = th
+
+    async def run_source(source_root: Path, *, first_update_id: int,
+                         chat_id: int) -> dict[str, object]:
+        token = "900001:fixture-token"
+        h.peer.managed_block = True
+        h.peer.managed_release.clear()
+        h.peer.managed_entered.clear()
+        before_ai = len(h.peer.managed_calls)
+        before_sends = len(h.peer.accepted_messages)
+        before_ack = len(h.peer.acknowledged_update_ids[token])
+        first = h.update(
+            message_id=first_update_id, update_id=first_update_id,
+            text_value="no-policy first input", chat_id=chat_id,
+        )
+        second = h.update(
+            message_id=first_update_id + 1, update_id=first_update_id + 1,
+            text_value="no-policy second input", chat_id=chat_id,
+        )
+        first_key, second_key = event_key(first), event_key(second)
+        h.queue(first)
+        await asyncio.wait_for(h.peer.managed_entered.wait(), timeout=15)
+        first_waiting = await wait_for_state(
+            h, first_key,
+            lambda row: row["canonical_message_id"] is not None and row["turn_id"] is not None,
+            "first no-policy admission enters held Managed AI",
+        )
+        assert first_waiting["status"] in {"CLAIMED", "COMPLETED"}
+        h.queue(second)
+
+        # The first Managed request is blocked behind an event barrier. The
+        # second provider update is buffered in Fake Telegram and cannot cross
+        # the held first admission/turn frontier.
+        second_count = await h.rows(
+            "SELECT count(*) FROM telegram_admissions WHERE provider_event_id=$1",
+            second_key,
+        )
+        assert second_count[0][0] == 0
+        assert len(h.peer.managed_calls) == before_ai + 1
+        assert len(h.peer.accepted_messages) == before_sends
+        assert h.peer.acknowledged_update_ids[token][before_ack:] == []
+
+        h.peer.managed_release.set()
+        for update, key in ((first, first_key), (second, second_key)):
+            await wait_for_state(
+                h, key,
+                lambda row: row["status"] == "COMPLETED"
+                and row["delivery_status"] == "PROVIDER_ACCEPTED",
+                "no-policy provider event reaches accepted terminal delivery",
+            )
+        await h.peer.wait_for(
+            lambda: h.peer.acknowledged_update_ids[token][before_ack:]
+            == [first_update_id, first_update_id + 1],
+            "both committed provider events are acknowledged in order",
+        )
+        await h.peer.wait_for(
+            lambda: len(h.peer.accepted_messages) == before_sends + 2,
+            "two no-policy Telegram replies complete",
+        )
+        assert len(h.peer.managed_calls) == before_ai + 2
+
+        states = [await h.state(key) for key in (first_key, second_key)]
+        assert states[0]["conversation_id"] == states[1]["conversation_id"]
+        history_rows = await h.rows(
+            "SELECT sequence,actor,direction,content_type,text FROM messages "
+            "WHERE conversation_id=$1 ORDER BY sequence", states[0]["conversation_id"],
+        )
+        call_rows = h.peer.managed_calls[before_ai:]
+
+        def projected_request(call: dict[str, object]) -> dict[str, object]:
+            messages = call["messages"]
+            assert isinstance(messages, list)
+            normalized = [
+                {"sequence": message["sequence"], "actor": message["actor"],
+                 "direction": message["direction"], "content_type": message["content_type"],
+                 "text": message["text"]}
+                for message in messages
+            ]
+            sequence_by_id = {message["id"]: message["sequence"] for message in messages}
+            selected = call["selected_input_message_ids"]
+            assert isinstance(selected, list)
+            return {
+                "input_revision": call["input_revision"],
+                "authority_revision": call["authority_revision"],
+                "input_first_sequence": call["input_first_sequence"],
+                "input_last_sequence": call["input_last_sequence"],
+                "context_last_sequence": call["context_last_sequence"],
+                "messages": normalized,
+                "selected_input_sequences": [sequence_by_id[item] for item in selected],
+            }
+
+        provider_outputs = [
+            item["text"] for item in h.peer.accepted_messages[before_sends:]
+        ]
+        projection = [projected_request(row) for row in call_rows]
+        normalized_history = [
+            {"sequence": row["sequence"], "actor": row["actor"],
+             "direction": row["direction"], "content_type": row["content_type"],
+             "text": row["text"]}
+            for row in history_rows
+        ]
+        return {
+            "history": normalized_history,
+            "ai_projection": projection,
+            "ai_calls": len(call_rows),
+            "provider_outputs": provider_outputs,
+            "provider_sends": len(provider_outputs),
+            "delivery_facts": [
+                {"status": row["status"], "delivery_status": row["delivery_status"]}
+                for row in states
+            ],
+        }
+
+    await h.restart("gateway", gateway_source_root=ACCEPTED_TG_ROOT)
+    accepted = await run_source(
+        ACCEPTED_TG_ROOT, first_update_id=710, chat_id=406710,
+    )
+    await h.restart("gateway", gateway_source_root=TG_ROOT)
+    current = await run_source(
+        TG_ROOT, first_update_id=720, chat_id=406720,
+    )
+    assert accepted == current
+    assert [row["actor"] for row in accepted["history"]] == [
+        "CUSTOMER", "AGENT", "CUSTOMER", "AGENT",
+    ]
+    assert [row["input_revision"] for row in accepted["ai_projection"]] == [1, 2]
+    assert accepted["ai_calls"] == accepted["provider_sends"] == 2
+    assert all(row["status"] == "COMPLETED"
+               and row["delivery_status"] == "PROVIDER_ACCEPTED"
+               for row in accepted["delivery_facts"])
+    EVIDENCE.append({
+        "scenario": "no-policy accepted-source differential",
+        "accepted_sha": ACCEPTED_TG_SHA,
+        "matches": ["ordered customer/AGENT history", "AI projection and input revision",
+                    "AI/provider call counts", "provider output order", "delivery facts"],
+        "first_held_before_second_admitted": True,
     })

@@ -6,7 +6,7 @@ import secrets
 from datetime import timedelta
 from uuid import UUID, uuid4
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError
 
@@ -30,6 +30,7 @@ from services.common import (
     db_clock,
     fingerprint,
     locked_turn,
+    message_is_consumed,
     scope_filter,
     unique_violation,
 )
@@ -80,7 +81,8 @@ async def create_turn(
                     Message.sequence <= request.input_last_sequence,
                     Message.actor == "CUSTOMER",
                     Message.direction == "INBOUND",
-                    Message.settling_policy_version.is_not(None),
+                    or_(Message.settling_policy_version.is_not(None),
+                        Message.settling_burst_id.is_not(None)),
                 ).limit(1))
                 if settling_input is not None:
                     raise DomainError(ErrorCode.SETTLING_REQUIRED)
@@ -120,11 +122,7 @@ async def create_turn(
                     Message.sequence <= request.input_last_sequence,
                     Message.actor == "CUSTOMER",
                     Message.direction == "INBOUND",
-                    select(AgentTurn.id).where(
-                        AgentTurn.conversation_id == conversation.id,
-                        Message.sequence >= AgentTurn.input_first_sequence,
-                        Message.sequence <= AgentTurn.input_last_sequence,
-                    ).exists(),
+                    message_is_consumed(),
                 ).limit(1))
                 if covered_by_retained_turn is not None:
                     raise DomainError(ErrorCode.TURN_SELECTION_CONFLICT)
@@ -165,7 +163,7 @@ async def create_turn(
         # session.begin has rolled back before translating a recognized durable fence.
         if unique_violation(exc, "uq_turn_one_active"):
             raise DomainError(ErrorCode.ACTIVE_TURN_EXISTS) from None
-        if unique_violation(exc, "turn_input_messages_pkey"):
+        if unique_violation(exc, "pk_turn_input_messages"):
             raise DomainError(ErrorCode.TURN_SELECTION_CONFLICT) from None
         raise
     return result
@@ -191,7 +189,9 @@ async def claim_turn(
         clock = await db_clock(session)
         if turn.status in ("COMPLETED", "FAILED"):
             raise DomainError(ErrorCode.TURN_TERMINAL)
-        if conversation.control_mode != "AGENT":
+        # Once a managed request has been durably marked, recovery is about
+        # resolving that exact uncertainty, not authorizing a new AI dispatch.
+        if conversation.control_mode != "AGENT" and turn.managed_dispatch_epoch is None:
             raise DomainError(ErrorCode.CONTROL_MODE_CONFLICT)
         if turn.status == "CLAIMED" and (
             turn.lease_expires_at is None or turn.lease_expires_at > clock

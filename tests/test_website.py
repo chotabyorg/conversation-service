@@ -3,7 +3,8 @@ import asyncio
 import io
 import logging
 import secrets
-from uuid import uuid4
+from datetime import timedelta
+from uuid import UUID, uuid4
 
 import pytest
 import pytest_asyncio
@@ -11,11 +12,20 @@ from sqlalchemy import select, text, update
 
 from core.config import Settings, SettlingPolicy
 from core.logging import configure_logging
-from models import AgentTurn, Conversation, DeliveryAttempt, WebsiteAdmission
+from models import (
+    AgentTurn,
+    Conversation,
+    DeliveryAttempt,
+    DeliveryReconciliation,
+    SettlingBurst,
+    WebsiteAdmission,
+    WebsiteResponseAttempt,
+)
 from schemas.contracts import Channel, OperationReference, TurnClaim, TurnExecute
 from schemas.managed import ManagedTurnResult
 from schemas.website import ManagedEvidenceResult
 from services import managed_execution, turns
+from services.website import expected_v2_response_attempt_id
 from services.website_worker import WebsiteWorker, select_immediate
 from tests.conftest import Harness, app_client
 
@@ -102,19 +112,23 @@ async def admit(wh, value):
     return response.json()
 
 
+async def v2_response_attempt_id(wh, value):
+    async with wh.database.session_factory() as session:
+        admission_id = await session.scalar(select(WebsiteAdmission.id).where(
+            WebsiteAdmission.owner_id == value["owner_id"],
+            WebsiteAdmission.integration_id == UUID(value["integration_id"]),
+            WebsiteAdmission.channel == "WEBSITE_WIDGET",
+            WebsiteAdmission.provider_namespace == "main-chota.website-widget.v1",
+            WebsiteAdmission.message_id == UUID(value["message_id"]),
+        ))
+    assert admission_id is not None
+    return str(expected_v2_response_attempt_id(admission_id))
+
+
 async def query(wh, value):
     response = await wh.call("POST", BASE + "/results", identity(value))
     assert response.status_code == 200, response.text
     return response.json()
-
-
-async def _age_messages(sql, ages_ms: dict[int, int]) -> None:
-    async with sql.begin() as connection:
-        for sequence, age in ages_ms.items():
-            await connection.execute(text(
-                "UPDATE messages SET created_at=clock_timestamp() - "
-                "(:age * interval '1 millisecond') WHERE sequence=:sequence"
-            ), {"age": age, "sequence": sequence})
 
 
 async def test_arbitration_sticky_both_policy_directions_and_no_legacy_message(wh, sql):
@@ -134,7 +148,9 @@ async def test_arbitration_sticky_both_policy_directions_and_no_legacy_message(w
 
 
 @pytest.mark.asyncio
-async def test_website_settling_batches_messages_and_fences_stale_draft(wh, sql):
+async def test_website_settling_batches_messages_and_fences_stale_draft(
+    wh, sql, test_database_clock
+):
     policy = SettlingPolicy(version="website-test-v1", channel=Channel.WEBSITE_WIDGET,
                             quiet_window_ms=250, max_wait_ms=1200)
     settings = wh.settings.model_copy(update={"turn_settling_policies": (policy,)})
@@ -145,18 +161,19 @@ async def test_website_settling_batches_messages_and_fences_stale_draft(wh, sql)
     first = payload(wh, session_id=session_id, message_id=str(uuid4()))
     second = payload(wh, session_id=session_id, message_id=str(uuid4()))
     assert (await admit(wh, first))["route"] == "MANAGED"
+    test_database_clock.advance_to(
+        test_database_clock.current + timedelta(milliseconds=220)
+    )
     assert (await admit(wh, second))["route"] == "MANAGED"
-    async with sql.begin() as connection:
-        await connection.execute(text(
-            "UPDATE messages SET created_at=clock_timestamp() - "
-            "(:age * interval '1 millisecond') WHERE sequence=:sequence"
-        ), {"age": 300, "sequence": 1})
-        await connection.execute(text(
-            "UPDATE messages SET created_at=clock_timestamp() - "
-            "(:age * interval '1 millisecond') WHERE sequence=:sequence"
-        ), {"age": 80, "sequence": 2})
+    async with sql.connect() as connection:
+        ready_at = await connection.scalar(text(
+            "SELECT b.ready_at FROM settling_bursts b "
+            "JOIN messages m ON m.settling_burst_id=b.id WHERE m.sequence=2"
+        ))
+    assert ready_at is not None
+    test_database_clock.advance_to(ready_at - timedelta(milliseconds=1))
     assert await wh.worker.run_once() is False
-    await asyncio.sleep(0.20)
+    test_database_clock.advance_to(ready_at)
     assert await wh.worker.run_once() is True
     assert len(wh.ai.calls) == 1
     selected = wh.ai.calls[0].request
@@ -165,8 +182,10 @@ async def test_website_settling_batches_messages_and_fences_stale_draft(wh, sql)
     assert len(selected.selected_input_message_ids) == 2
 
     third = payload(wh, session_id=session_id, message_id=str(uuid4()))
-    assert (await admit(wh, third))["route"] == "MANAGED"
-    begin_body = {**identity(first), "response_attempt_id": str(uuid4())}
+    third_admission = await admit(wh, third)
+    assert third_admission["route"] == "MANAGED"
+    begin_body = {**identity(first),
+                  "response_attempt_id": await v2_response_attempt_id(wh, first)}
     begun = await wh.call("POST", "/website/responses/begin", begin_body)
     assert begun.status_code == 200, begun.text
     assert begun.json()["send"] is False
@@ -178,9 +197,18 @@ async def test_website_settling_batches_messages_and_fences_stale_draft(wh, sql)
     async with sql.connect() as connection:
         assert await connection.scalar(text(
             "SELECT count(*) FROM messages WHERE actor='AGENT'")) == 0
-    await _age_messages(sql, {3: 300})
+    async with sql.connect() as connection:
+        third_ready_at = await connection.scalar(text(
+            "SELECT b.ready_at FROM settling_bursts b "
+            "JOIN messages m ON m.settling_burst_id=b.id "
+            "JOIN website_admissions a ON a.canonical_message_id=m.id "
+            "WHERE a.id=:admission_id"
+        ), {"admission_id": third_admission["admission_id"]})
+    assert third_ready_at is not None
+    test_database_clock.advance_to(third_ready_at + timedelta(milliseconds=1))
     assert await wh.worker.run_once()
-    next_begin = dict(identity(third), response_attempt_id=str(uuid4()))
+    next_begin = dict(identity(third),
+                      response_attempt_id=await v2_response_attempt_id(wh, third))
     next_response = await wh.call("POST", "/website/responses/begin", next_begin)
     assert next_response.status_code == 200 and next_response.json()["send"] is True
     completed = await wh.call("POST", "/website/responses/complete",
@@ -195,6 +223,62 @@ async def test_website_settling_batches_messages_and_fences_stale_draft(wh, sql)
     async with sql.connect() as connection:
         assert await connection.scalar(text(
             "SELECT count(*) FROM messages WHERE actor='AGENT'")) == 1
+
+
+@pytest.mark.asyncio
+async def test_stale_settling_v2_begin_persists_superseded_fence(
+    wh, sql, test_database_clock
+):
+    policy = SettlingPolicy(version="website-stale-v2", channel=Channel.WEBSITE_WIDGET,
+                            quiet_window_ms=250, max_wait_ms=1200)
+    settings = wh.settings.model_copy(update={"turn_settling_policies": (policy,)})
+    wh.settings = settings
+    wh.client._transport.app.state.settings = settings
+    wh.worker = WebsiteWorker(wh.database, settings, wh.ai)
+
+    first = payload(wh, session_id=str(uuid4()), message_id=str(uuid4()))
+    admission = await admit(wh, first)
+    async with wh.database.session_factory() as session:
+        ready_at = await session.scalar(select(SettlingBurst.ready_at).join(
+            WebsiteAdmission,
+            WebsiteAdmission.conversation_id == SettlingBurst.conversation_id,
+        ).where(WebsiteAdmission.id == admission["admission_id"]))
+    assert ready_at is not None
+    test_database_clock.advance_to(ready_at + timedelta(milliseconds=1))
+    assert await wh.worker.run_once()
+    assert len(wh.ai.calls) == 1
+
+    later = payload(wh, session_id=first["session_id"], message_id=str(uuid4()))
+    assert (await admit(wh, later))["route"] == "MANAGED"
+    begin_body = {
+        **identity(first),
+        "response_attempt_id": str(expected_v2_response_attempt_id(
+            UUID(admission["admission_id"])
+        )),
+    }
+    begun = await wh.call("POST", BASE + "/responses/begin", begin_body)
+    assert begun.status_code == 200, begun.text
+    assert begun.json()["action"] == "DENY"
+    assert begun.json()["send"] is False
+    assert begun.json()["denial_reason"] == "SUPERSEDED"
+
+    turn_id = wh.ai.calls[0].request.turn_id
+    async with wh.database.session_factory() as session:
+        delivery = await session.scalar(select(DeliveryAttempt).where(
+            DeliveryAttempt.source_turn_id == turn_id
+        ))
+        attempt = await session.scalar(select(WebsiteResponseAttempt).where(
+            WebsiteResponseAttempt.id == UUID(begin_body["response_attempt_id"])
+        ))
+        assert delivery is not None
+        reconciliation = (await session.scalars(select(DeliveryReconciliation).where(
+            DeliveryReconciliation.delivery_attempt_id == delivery.id
+        ))).one()
+    assert delivery is not None and delivery.status == "SUPERSEDED"
+    assert delivery.expected_settling_revision == wh.ai.calls[0].request.input_revision
+    assert delivery.fenced_settling_revision > delivery.expected_settling_revision
+    assert attempt is not None and not attempt.send_authorized
+    assert reconciliation.status == "SUPERSEDED"
 
 
 @pytest.mark.parametrize("change", ["text", "session_id", "agent_id"])
@@ -297,9 +381,13 @@ async def test_claim_before_marker_reclaims_same_turn_and_dispatches_once(wh, sq
     selected = await select_immediate(wh.database, wh.principal, wh.settings)
     old = await turns.claim_turn(wh.database, wh.principal, selected,
                                 TurnClaim(worker_ref="crashed", lease_seconds=5))
+    assert old.turn.status == "CLAIMED" and old.turn.managed_dispatch_epoch is None
     async with sql.begin() as conn:
         await conn.execute(text("UPDATE agent_turns SET lease_expires_at=clock_timestamp() "
                                 "- interval '1 second' WHERE id=:id"), {"id": selected})
+    # The canonical input is already owned by this Turn. Discovery must still
+    # find and reclaim it after a process crash before the dispatch marker.
+    assert await select_immediate(wh.database, wh.principal, wh.settings) == selected
     assert await wh.worker.run_once()
     assert len(wh.ai.calls) == 1 and wh.ai.calls[0].request.turn_id == selected
     fresh = await turns.get_turn(wh.database, wh.principal, selected)
@@ -361,14 +449,17 @@ async def test_draft_replay_response_attempts_and_late_write_evidence(wh, sql):
         value = payload(wh, session_id=str(uuid4()), message_id=str(uuid4()))
         await admit(wh, value)
         assert await wh.worker.run_once()
-        attempt = dict(identity(value), response_attempt_id=str(uuid4()))
+        attempt = dict(identity(value),
+                       response_attempt_id=await v2_response_attempt_id(wh, value))
         began = await wh.call("POST", BASE + "/responses/begin", attempt)
         assert began.status_code == 200 and began.json()["send"] is True
         assert began.json()["draft_text"] == "retained reply"
         # A replay returns send=false but retains the original permission so
         # definitive late evidence from the first write can still be recorded.
         assert (await wh.call("POST", BASE + "/responses/begin", attempt)).json() == dict(
+            action="DENY",
             response_attempt_id=attempt["response_attempt_id"],
+            replay_source_attempt_id=None,
             draft_text="retained reply", send=False, replayed=True,
             denial_reason="DELIVERY_NOT_RETRYABLE",
         )
@@ -376,6 +467,16 @@ async def test_draft_replay_response_attempts_and_late_write_evidence(wh, sql):
         response = await wh.call("POST", BASE + "/responses/complete", finished)
         assert response.status_code == 200 and response.json()["outcome"] == outcome
         assert (await wh.call("POST", BASE + "/responses/complete", finished)).json()["replayed"]
+        if outcome == "UNKNOWN":
+            pending_retry = await wh.call("POST", BASE + "/responses/begin", attempt)
+            assert pending_retry.status_code == 200
+            assert pending_retry.json() == dict(
+                action="DENY",
+                response_attempt_id=attempt["response_attempt_id"],
+                replay_source_attempt_id=None,
+                draft_text="retained reply", send=False, replayed=True,
+                denial_reason="DELIVERY_NOT_RETRYABLE",
+            )
         changed = "UNKNOWN" if outcome != "UNKNOWN" else "WRITE_COMPLETED"
         changed_body = dict(finished, outcome=changed)
         changed_response = await wh.call("POST", BASE + "/responses/complete", changed_body)
@@ -389,14 +490,22 @@ async def test_draft_replay_response_attempts_and_late_write_evidence(wh, sql):
             assert changed_response.status_code == 409
         retried_begin = await wh.call("POST", BASE + "/responses/begin", attempt)
         assert retried_begin.status_code == 200
-        assert retried_begin.json() == dict(
-            response_attempt_id=attempt["response_attempt_id"],
-            draft_text="retained reply",
-            send=outcome in {"WRITE_COMPLETED", "UNKNOWN"},
-            replayed=True,
-            denial_reason=(None if outcome in {"WRITE_COMPLETED", "UNKNOWN"}
-                           else "DELIVERY_NOT_RETRYABLE"),
-        )
+        if outcome in {"WRITE_COMPLETED", "UNKNOWN"}:
+            assert retried_begin.json() == dict(
+                action="REPLAY_COMPLETED",
+                response_attempt_id=attempt["response_attempt_id"],
+                replay_source_attempt_id=attempt["response_attempt_id"],
+                draft_text="retained reply", send=False, replayed=True,
+                denial_reason=None,
+            )
+        else:
+            assert retried_begin.json() == dict(
+                action="DENY",
+                response_attempt_id=attempt["response_attempt_id"],
+                replay_source_attempt_id=None,
+                draft_text="retained reply", send=False, replayed=True,
+                denial_reason="DELIVERY_NOT_RETRYABLE",
+            )
     assert len(wh.ai.calls) == 3
     async with sql.connect() as conn:
         assert await conn.scalar(text("SELECT count(*) FROM delivery_attempts")) == 3
@@ -414,7 +523,8 @@ async def test_known_success_response_replay_is_fenced_by_later_inbound(wh):
     value = payload(wh)
     await admit(wh, value)
     assert await wh.worker.run_once()
-    attempt = dict(identity(value), response_attempt_id=str(uuid4()))
+    attempt = dict(identity(value),
+                   response_attempt_id=await v2_response_attempt_id(wh, value))
     assert (await wh.call("POST", BASE + "/responses/begin", attempt)).json()["send"]
     assert (await wh.call(
         "POST", BASE + "/responses/complete", dict(attempt, outcome="WRITE_COMPLETED")
@@ -423,26 +533,34 @@ async def test_known_success_response_replay_is_fenced_by_later_inbound(wh):
     newer = payload(wh, session_id=value["session_id"])
     await admit(wh, newer)
     replay = await wh.call("POST", BASE + "/responses/begin", attempt)
-    assert replay.status_code == 200 and replay.json()["send"] is False
-    assert replay.json()["replayed"] is True
-    assert replay.json()["denial_reason"] == "SUPERSEDED"
+    assert replay.status_code == 200
+    assert replay.json() == dict(
+        action="REPLAY_COMPLETED",
+        response_attempt_id=attempt["response_attempt_id"],
+        replay_source_attempt_id=attempt["response_attempt_id"],
+        draft_text="retained reply", send=False, replayed=True,
+        denial_reason=None,
+    )
 
 
 async def test_send_false_attempt_cannot_be_completed_as_a_client_write(wh, sql):
     value = payload(wh)
     await admit(wh, value)
     assert await wh.worker.run_once()
-    first_attempt = dict(identity(value), response_attempt_id=str(uuid4()))
-    first = await wh.call("POST", BASE + "/responses/begin", first_attempt)
-    assert first.status_code == 200 and first.json()["send"] is True
-
-    replay_attempt = dict(identity(value), response_attempt_id=str(uuid4()))
-    replay = await wh.call("POST", BASE + "/responses/begin", replay_attempt)
-    assert replay.status_code == 200 and replay.json()["send"] is False
-    assert replay.json()["denial_reason"] == "DELIVERY_NOT_RETRYABLE"
+    async with sql.begin() as conn:
+        await conn.execute(text(
+            "UPDATE conversations SET control_mode='HUMAN', "
+            "authority_revision=authority_revision+1"
+        ))
+    denied_attempt = dict(identity(value),
+                          response_attempt_id=await v2_response_attempt_id(wh, value))
+    denied = await wh.call("POST", BASE + "/responses/begin", denied_attempt)
+    assert denied.status_code == 200 and denied.json()["send"] is False
+    assert denied.json()["action"] == "DENY"
+    assert denied.json()["denial_reason"] == "SUPERSEDED"
     malicious = await wh.call(
         "POST", BASE + "/responses/complete",
-        dict(replay_attempt, outcome="WRITE_COMPLETED"),
+        dict(denied_attempt, outcome="WRITE_COMPLETED"),
     )
     assert malicious.status_code == 409
     assert malicious.json()["detail"]["code"] == "INVALID_DELIVERY_TRANSITION"
@@ -450,14 +568,15 @@ async def test_send_false_attempt_cannot_be_completed_as_a_client_write(wh, sql)
         assert await conn.scalar(text(
             "SELECT count(*) FROM messages WHERE actor='AGENT'")) == 0
         assert await conn.scalar(text(
-            "SELECT count(*) FROM website_response_attempts WHERE send_authorized")) == 1
+            "SELECT count(*) FROM website_response_attempts WHERE send_authorized")) == 0
 
 
 async def test_response_replay_binding_scope_and_agent_reassignment_denied(wh):
     value = payload(wh)
     await admit(wh, value)
     await wh.worker.run_once()
-    attempt = dict(identity(value), response_attempt_id=str(uuid4()))
+    attempt = dict(identity(value),
+                   response_attempt_id=await v2_response_attempt_id(wh, value))
     assert (await wh.call("POST", BASE + "/responses/begin", attempt)).status_code == 200
     assert (await wh.call("POST", BASE + "/responses/begin", attempt, "other")).status_code == 404
     altered = dict(attempt, session_id=str(uuid4()))
@@ -597,13 +716,16 @@ async def test_changed_authority_after_draft_cannot_begin_response(wh, sql):
     await wh.worker.run_once()
     async with sql.begin() as conn:
         await conn.execute(text("UPDATE conversations SET authority_revision=authority_revision+1"))
-    attempt = dict(identity(value), response_attempt_id=str(uuid4()))
+    attempt = dict(identity(value),
+                   response_attempt_id=await v2_response_attempt_id(wh, value))
     response = await wh.call("POST", BASE + "/responses/begin", attempt)
-    assert response.status_code == 409
-    assert response.json()["detail"]["code"] == "AUTHORITY_REVISION_CONFLICT"
+    assert response.status_code == 200
+    assert response.json()["action"] == "DENY"
+    assert response.json()["denial_reason"] == "SUPERSEDED"
     async with sql.connect() as conn:
-        assert await conn.scalar(text("SELECT count(*) FROM website_response_attempts")) == 0
-        assert await conn.scalar(text("SELECT count(*) FROM delivery_attempts")) == 0
+        assert await conn.scalar(text(
+            "SELECT count(*) FROM website_response_attempts WHERE send_authorized")) == 0
+        assert await conn.scalar(text("SELECT count(*) FROM delivery_attempts")) == 1
 
 
 @pytest.mark.parametrize(

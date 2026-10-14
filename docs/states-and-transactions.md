@@ -80,39 +80,43 @@ be reclaimed. No token/digest appears in reads or finish/fail output/logging.
 
 ## Durable settling and input ownership
 
-Admission samples one PostgreSQL acceptance timestamp and stores the selected
-policy version, quiet window, max wait, and monotonic settling revision on the
-canonical Message. The policy is resolved from a channel default plus an optional
-integration override; later config changes affect only new admissions. The first
-unassigned policy-bound Message anchors `max_deadline = accepted_at + max_wait`.
-Each following adjacent canonical inbound Message with the same snapshot and
-arriving strictly before the current deadline resets quiet to
-`min(accepted_at + quiet_window, max_deadline)`. The burst becomes eligible when
-the database clock reaches the deadline. Selection is capped at 256 Messages per
-Turn; messages at or beyond the cutoff remain for later selection.
+`SettlingBurst` is the durable mode and lifetime authority for a policy-bound
+Conversation run. Admission resolves policy under the Conversation lock and
+stores immutable first-member policy/version, opened time, maximum cutoff, tail
+sequence and current `ready_at`. Every eligible input strictly before that
+persisted ready time joins the same burst, including after policy removal or
+replacement, and resets quiet time without moving the original maximum cutoff.
+Equality closes the burst; the next input starts a new burst using current policy
+or immediate mode. Generic journal and assistant rows do not extend a burst.
+`Message.created_at` is not scheduling authority.
 
-`turn_input_messages` durably maps every selected Message to its immutable Turn,
-sequence, and ordinal. Candidate selection takes the Conversation lock, rechecks
-the active-Turn slot, reads unassigned inbound rows in canonical order, freezes
-context through the selected last Message, and writes the Turn and all assignments
-in one transaction. Restart reconstructs deadlines from retained Message
-timestamps; there is no timer authority outside PostgreSQL. Messages with no
-policy snapshot retain immediate one-message selection. They are never silently
-folded into a policy-bound burst. The scheduler orders work by the oldest
-policy-bound Message and revalidates each Conversation under
-`FOR UPDATE SKIP LOCKED`; skipped/locked or ineligible rows do not block later
-Conversations in the same scheduler pass.
+After the stored ready time, the scheduler closes the burst at that logical time
+and selects its maximal production-serializer-valid contiguous prefix, up to 256
+inputs. Residual inputs keep their membership, cutoff and deadline through
+additional Turns and restarts. `turn_input_messages` records every selected
+Message and assignment atomically with its Turn. One shared alias-safe ownership
+predicate also treats coverage by any retained AgentTurn input range as consumed,
+for every status; exact selection replay is resolved before conflict checks.
+Direct creation, immediate selectors and settling selection use that same
+predicate. A later assignment failure rolls back the Turn and all earlier
+assignments; the actual `pk_turn_input_messages` error maps to
+`TURN_SELECTION_CONFLICT`.
 
-Every new canonical customer inbound increments the Conversation settling
-revision, including immediate-mode inputs. Before a
-provider dispatch, the adapter locks Conversation then Turn and compares the
-revision captured when the Turn was frozen with the current revision, alongside current AGENT
-control and authority revision. The transaction commits either a single
-`DISPATCH_REQUESTED` send permission or terminal `SUPERSEDED` evidence; concurrent
-inbound takes the same Conversation lock, so both outcomes cannot win. A
-superseded draft retains its completed Turn and operation references. Its delivery
-is terminal and cannot be retried. An ambiguous already-started provider write
-remains `UNKNOWN` and is never blindly reissued.
+Candidate scanning uses bounded keyset pages of 100. Each candidate has an
+independent transaction and Conversation-first lock; typed malformed/projection
+errors roll back before scanning continues. The earliest pending inbound is a
+mode/FIFO barrier, including malformed or generic rows. Unknown database and
+programming errors remain visible. See [durable settling](turn-settling.md) for
+burst, scheduler, and recovery details.
+
+Every canonical inbound increments freshness counters. The Goal5 settling
+revision dispatch fence applies only to retained SETTLING Turns; IMMEDIATE Turns
+keep Goal4B control and authority checks and are not superseded solely by later
+input. For SETTLING, the adapter locks Conversation then Turn and compares the
+frozen revision with the current revision. It commits either a single
+`DISPATCH_REQUESTED` permission or terminal `SUPERSEDED` evidence. A superseded
+draft retains its completed Turn and operation references; an ambiguous
+already-started provider write remains `UNKNOWN` and is never blindly reissued.
 
 ## Control authority
 

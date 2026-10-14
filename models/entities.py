@@ -223,6 +223,7 @@ class Message(Base):
     settling_policy_version: Mapped[str | None] = mapped_column(String(64, collation="C"))
     settling_quiet_window_ms: Mapped[int | None] = mapped_column(BigInteger)
     settling_max_wait_ms: Mapped[int | None] = mapped_column(BigInteger)
+    settling_burst_id: Mapped[UUID | None] = mapped_column()
     actor: Mapped[str] = mapped_column(String(16), nullable=False)
     direction: Mapped[str] = mapped_column(String(16), nullable=False)
     content_type: Mapped[str] = mapped_column(
@@ -255,13 +256,25 @@ class Message(Base):
         ),
         CheckConstraint("sequence >= 1", name="ck_message_sequence"),
         CheckConstraint(
-            "(settling_policy_version IS NULL AND settling_quiet_window_ms IS NULL "
-            "AND settling_max_wait_ms IS NULL) OR (settling_policy_version IS NOT NULL "
+            "(settling_burst_id IS NULL AND settling_policy_version IS NULL "
+            "AND settling_quiet_window_ms IS NULL AND settling_max_wait_ms IS NULL) OR "
+            "(settling_burst_id IS NOT NULL AND settling_policy_version IS NOT NULL "
             "AND settling_quiet_window_ms IS NOT NULL AND settling_max_wait_ms IS NOT NULL "
             "AND settling_policy_version ~ '^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$' "
             "AND settling_quiet_window_ms >= 1 AND settling_max_wait_ms >= "
             "settling_quiet_window_ms)",
             name="ck_message_settling_snapshot",
+        ),
+        ForeignKeyConstraint(
+            ["settling_burst_id", "conversation_id"],
+            ["settling_bursts.id", "settling_bursts.conversation_id"],
+            name="fk_message_settling_burst_conversation",
+            ondelete="RESTRICT",
+        ),
+        CheckConstraint(
+            "settling_burst_id IS NULL OR (actor='CUSTOMER' AND direction='INBOUND' "
+            "AND settling_policy_version IS NOT NULL)",
+            name="ck_message_settling_burst_shape",
         ),
         ForeignKeyConstraint(
             ["source_agent_turn_id", "conversation_id"],
@@ -285,6 +298,40 @@ class Message(Base):
     )
 
 
+class SettlingBurst(Base):
+    """Immutable policy snapshot and durable lifetime for one Conversation burst."""
+
+    __tablename__ = "settling_bursts"
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    conversation_id: Mapped[UUID] = mapped_column(nullable=False)
+    policy_version: Mapped[str] = mapped_column(String(64, collation="C"), nullable=False)
+    quiet_window_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    max_wait_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    opened_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    max_cutoff_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_input_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    tail_sequence: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    ready_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    __table_args__ = (
+        UniqueConstraint("id", "conversation_id", name="uq_settling_burst_id_conversation"),
+        ForeignKeyConstraint(["conversation_id"], ["conversations.id"],
+                             name="fk_settling_burst_conversation", ondelete="RESTRICT"),
+        CheckConstraint(
+            "policy_version ~ '^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$' "
+            "AND quiet_window_ms >= 1 AND max_wait_ms >= quiet_window_ms "
+            "AND tail_sequence >= 1 AND max_cutoff_at > opened_at "
+            "AND last_input_at >= opened_at AND ready_at >= last_input_at "
+            "AND ready_at <= max_cutoff_at "
+            "AND (closed_at IS NULL OR closed_at = ready_at)",
+            name="ck_settling_burst_shape",
+        ),
+        Index("uq_settling_burst_open", "conversation_id", unique=True,
+              postgresql_where=sql_text("closed_at IS NULL")),
+        Index("ix_settling_burst_due", "ready_at", "conversation_id"),
+    )
+
+
 class AgentTurn(Base):
     __tablename__ = "agent_turns"
     id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
@@ -299,6 +346,7 @@ class AgentTurn(Base):
     settling_revision: Mapped[int] = mapped_column(
         BigInteger, default=0, server_default=sql_text("0")
     )
+    settling_burst_id: Mapped[UUID | None] = mapped_column()
     status: Mapped[str] = mapped_column(
         String(16), default="PENDING", server_default=sql_text("'PENDING'")
     )
@@ -355,6 +403,12 @@ class AgentTurn(Base):
             ["conversation_id", "context_last_sequence"],
             ["messages.conversation_id", "messages.sequence"],
             name="fk_turn_context_last",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["settling_burst_id", "conversation_id"],
+            ["settling_bursts.id", "settling_bursts.conversation_id"],
+            name="fk_turn_settling_burst_conversation",
             ondelete="RESTRICT",
         ),
         CheckConstraint(
@@ -706,6 +760,23 @@ class TelegramAdmission(Base):
                         "AND conversation_id IS NOT NULL AND canonical_message_id IS NOT NULL)",
                         name="ck_telegram_admission_route"),
         Index("ix_telegram_admission_processing", "conversation_id"),
+    )
+
+
+class TelegramProviderAccount(Base):
+    """Immutable provider-account pin for a managed Telegram integration."""
+
+    __tablename__ = "telegram_provider_accounts"
+    owner_id: Mapped[str] = mapped_column(String(255, collation="C"), primary_key=True)
+    integration_id: Mapped[UUID] = mapped_column(primary_key=True)
+    state: Mapped[str] = mapped_column(String(16), nullable=False)
+    bot_id: Mapped[str | None] = mapped_column(String(64, collation="C"))
+    __table_args__ = (
+        CheckConstraint(
+            "(state='BOUND' AND bot_id ~ '^[1-9][0-9]{0,18}$') OR "
+            "(state='CONFLICT' AND bot_id IS NULL)",
+            name="ck_telegram_provider_account_shape",
+        ),
     )
 
 

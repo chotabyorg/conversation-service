@@ -20,7 +20,6 @@ async def test_populated0002_to_head_keeps_ids_fingerprints_leases_drafts_and_re
             "managed_dispatch_started_at=started_at,managed_request_fingerprint=:digest "
             "WHERE id=:id"
         ), {"agent": str(uuid4()), "digest": "b" * 64, "id": turn["id"]})
-    before = await rows(sql, exclude=PRE_GOAL5_COLUMNS)
     # This scenario exercises compatibility of pre-Goal5 retained state. The
     # rows above were created by the current service, so project the added
     # settling counters back to their exact 0005 defaults before the downgrade.
@@ -28,6 +27,7 @@ async def test_populated0002_to_head_keeps_ids_fingerprints_leases_drafts_and_re
         await conn.execute(text("UPDATE conversations SET settling_revision=0"))
         await conn.execute(text("UPDATE messages SET settling_revision=0"))
         await conn.execute(text("UPDATE agent_turns SET settling_revision=0"))
+    before = await rows(sql, exclude=PRE_GOAL5_COLUMNS)
     await h.database.dispose()
     migrate(database_url, "downgrade", "0002_managed_execution")
     assert not await h.database.ready()

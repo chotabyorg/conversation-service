@@ -1,125 +1,152 @@
 # Goal5 durable turn settling
 
-## Policy and admission snapshot
+## Policy and persisted burst lifetime
 
-`TURN_SETTLING_POLICIES` is optional service configuration. Each policy has a
-version, channel, optional integration ID, quiet window, and maximum wait. A
-channel policy provides the default; one integration-specific policy overrides
-it. Values have finite bounds, and `max_wait_ms` must be at least the quiet
-window. There is no implicit timeout. With no matching policy, the existing
-immediate one-message path remains available.
+`TURN_SETTLING_POLICIES` is optional service configuration. A policy has a
+version, channel, optional integration override, quiet window, and maximum wait.
+There is no implicit timeout. With no matching policy, the existing immediate
+one-message path remains available.
 
-Admission resolves policy once and writes the selected version and timing values
-to the canonical `Message` in the same PostgreSQL transaction that accepts the
-event and advances Conversation counters. A policy edit therefore affects only
-later Messages. Replays do not change Message timestamps, quiet deadlines, or
-settling revisions.
+Admission resolves policy once and, in the same PostgreSQL transaction that
+accepts the event, creates or extends a Conversation-local `SettlingBurst`.
+The burst freezes its policy version, quiet and maximum-wait values, opening
+time, maximum cutoff, last accepted time, tail sequence, and ready time. Each
+member `Message` points to that burst and retains the same policy snapshot.
+Replays do not change the canonical Message, burst, timestamps, or settling
+revision.
 
-## Deadline and burst selection
-
-For the oldest unassigned policy-bound Message at time `T0`:
+For a burst opened at database time `T0`:
 
 ```text
-max_deadline   = T0 + max_wait
-quiet_deadline = min(T0 + quiet_window, max_deadline)
+max_cutoff_at = T0 + max_wait
+ready_at      = min(T0 + quiet_window, max_cutoff_at)
 ```
 
-Each next adjacent canonical inbound Message with the same policy snapshot and
-accepted strictly before the current deadline resets the quiet deadline to
-`min(message.created_at + quiet_window, max_deadline)`. At the deadline, the
-oldest eligible prefix becomes one Turn. A Message at or beyond the cutoff stays
-pending for a later Turn. Selection includes at most 256 Messages; a longer burst
-continues in a later Turn after the active slot is free. Canonical Message IDs,
-sequence, and order are retained individually in `turn_input_messages`; no
-synthetic concatenated Message is created. Turn context freezes at the selected
-last sequence, so later arrivals cannot leak into that request.
+A following accepted input joins the open burst only if it arrives strictly
+before the persisted `ready_at`. It advances the burst tail and sets
+`ready_at = min(accepted_at + quiet_window, max_cutoff_at)`. An input at equality
+or later closes that burst and resolves current policy for a new one. Policy
+replacement or removal cannot rewrite an open burst's membership, deadline, or
+cutoff; it only applies when a new burst opens. Policy-free Messages remain
+IMMEDIATE and are not merged into a burst.
 
-Non-adjacent canonical sequences, an intervening agent Message, or a changed
-policy snapshot ends the current selection. Policy-free Messages stay on the
-immediate selector and are not merged into a policy-bound burst. A direct
-`POST /conversations/{id}/turns` request that includes a policy-bound inbound
-Message fails with `SETTLING_REQUIRED`.
+## Migration 0006 and retained history
 
-## Persistence, active work, and forward progress
+Upgrade backfills the input revision of each historical CUSTOMER/INBOUND Message
+in Conversation order and initializes settling revisions to zero. Existing rows
+receive no settling policy or burst membership, so upgrade does not reinterpret
+past traffic as debounced work. Historical Website response attempts retain
+their original authorization as `send_authorized=true`. For Telegram, the
+migration reconstructs authorization only for the first retained response
+attempt of each non-GENERATED delivery; an old attempt after that point is not
+promoted into new send authority. The account backfill creates `BOUND` only when
+all retained MANAGED admissions for an owner/integration name one bot; mixed bot
+history becomes `CONFLICT` with no selected bot.
 
-The worker reconstructs deadlines from persisted `Message.created_at` and policy
-snapshot columns after every restart. The Conversation row lock serializes
-admission against selection. Under that lock the scheduler rechecks control
-authority and the active-Turn slot, selects unassigned inputs, and inserts the
-Turn and all `turn_input_messages` mappings in one transaction. The partial
-unique index on active Turn status remains the final one-active-Turn guard.
+Downgrade takes exclusive locks over the affected journals and refuses whenever
+the old schema could not represent retained facts. This includes burst membership
+or policy snapshots, nonzero settling revisions, `SUPERSEDED` delivery evidence,
+send-permission decisions, settling fences, multiple response attempts for one
+delivery, input ownership that cannot be reconstructed exactly, multi-input
+immediate Turn mappings, or a Telegram account row that differs from the
+historical MANAGED admissions. A refusal leaves the upgraded schema and data in
+place; do not remove that evidence manually to force a downgrade.
 
-Additional inbound during settling, claim, execution, or a delivery attempt is
-retained as a canonical Message. It never mutates a frozen Turn. The scheduler
-orders candidate Conversations by the oldest pending policy-bound Message and
-examines the full candidate set in that order, rather than repeatedly stopping
-at a fixed first-N prefix. Each candidate is revalidated with
-`FOR UPDATE SKIP LOCKED`; locked, not-yet-due, or otherwise ineligible work does
-not prevent later eligible Conversations from being considered in the same pass.
-The Telegram worker's separate bounded keyset scan remains the Goal4B immediate
-path; Goal5 does not replace or duplicate its starvation fix.
+## Selection, ownership, and restart
 
-The settling pass currently materializes its candidate Conversation IDs before
-locking them. This is accepted canary-scale debt, not a durable fairness
-guarantee; replace it with bounded keyset pages before candidate volume requires
-that change. Projection-invalid bursts are isolated to their Conversation and
-later candidates still get a selection opportunity in the same pass.
+The scheduler reads the retained burst deadline after restart; `Message.created_at`
+is not scheduling authority. At equality, it closes a due burst at its stored
+ready time and selects the oldest unconsumed contiguous prefix, up to 256
+canonical inputs. A larger burst's residual keeps the same burst ID, policy,
+cutoff, tail history, and ready time across Turns and worker restarts. A following
+burst never joins a residual. The selected Turn freezes context through its last
+input sequence. No synthetic concatenated Message is created.
 
-## Supersede and dispatch fence
+Input is globally consumed when it has an explicit `TurnInputMessage` owner or
+falls in any retained `AgentTurn` frozen input range, for every Turn status.
+Exact selection replay precedes ownership conflict checks. Direct creation,
+immediate selection, settling selection, and Website selection use the same
+alias-safe consumed predicate. All ownership rows commit atomically with the
+Turn. A failure on a later assignment rolls back the Turn and every earlier
+assignment; the actual `pk_turn_input_messages` violation maps to
+`TURN_SELECTION_CONFLICT`.
 
-Every new canonical customer inbound increments `Conversation.settling_revision`,
-including Messages admitted with no settling policy; those still use immediate
-one-message selection but can supersede an older, not-yet-dispatched draft. A
-Turn snapshots the current Conversation revision in its freeze transaction, so
-Messages already accepted but outside its selected window are ordered for later
-work without making the newly frozen Turn stale. Before
-provider/socket dispatch, the managed adapter acquires locks in this order:
+The Conversation row lock serializes admission against selection. Under that
+lock, the scheduler rechecks authority and the active-Turn slot, validates each
+member, freezes projection, and inserts the Turn plus all ownership rows in one
+transaction. The partial unique index on active Turn status remains the final
+one-active-Turn guard. Generic or malformed oldest inputs remain a FIFO/mode
+barrier inside that Conversation; a later input cannot bypass them.
 
-1. Conversation;
-2. completed AgentTurn;
-3. the source Turn's unique DeliveryAttempt.
+Candidate Conversations are discovered in bounded keyset pages of 100, ordered
+by oldest due burst time and Conversation ID. Each candidate is revalidated in
+its own short transaction under the Conversation-first lock. Typed candidate
+validation/projection failures roll back before paging continues, so a finite
+malformed prefix cannot starve a valid tail. Candidates are ranked before
+account or delivery eligibility is applied. Unknown database or programming
+failures remain visible.
 
-Within one transaction it checks completed draft identity, current AGENT control,
-unchanged authority revision, and whether any newer policy-bound input advanced
-the settling revision. It writes either `DISPATCH_REQUESTED` and returns
-`send=true`, or terminal `SUPERSEDED` evidence and returns `send=false` with the
-`SUPERSEDED` denial reason. Website retries of an existing attempt report
-`DELIVERY_NOT_RETRYABLE` for unresolved/failed transport evidence and may replay
-only a known completed write while the same Turn remains current. Inbound
-admission uses the same Conversation lock, so it serializes on one side of this
-decision. No gateway-local debounce or send permit exists.
+## Telegram provider-account and dispatch recovery
 
-Superseding affects communication only. The immutable Turn result and its opaque
-`operation_refs` remain retained, and Conversation never rolls back completed
-Business effects. The next Turn uses later unassigned canonical Messages. An
-unfinished external write is marked `UNKNOWN` when retried after an interrupted
-attempt; no new provider send is authorized. Definitive late evidence may still
-reconcile the existing delivery.
+Telegram keeps one immutable provider-account binding per owner/integration.
+The first accepted MANAGED admission binds its bot. New MANAGED admissions must
+match that binding. Migration reconstructs a single `BOUND` account from
+single-bot history and a `CONFLICT` account from mixed-bot history; it never
+chooses an arbitrary bot. `CONFLICT` blocks new work but preserves exact
+previously authorized provider recovery and late evidence.
 
-## Issue #18 acceptance mapping
+New provider permission and recovery are separate. A `SEND_CANDIDATE` requires a
+current BOUND account, complete Turn-member identity, and current control and
+authority. `RECOVER_ONLY` identifies the exact prior authorized attempt,
+admission, and bot, survives authority change or historical account conflict,
+and cannot send. Begin may record the existing interrupted-to-UNKNOWN transition
+and returns `send=false`; the gateway then stops. A wrong runtime bot cannot
+mutate recovery. A correct late provider fact may still resolve the exact
+attempt. Marked AI execution recovery also stays on the same Turn and preserves
+the existing mark-before-new-account/preparation ordering.
 
-The relevant runtime criteria from [AI issue #18](https://github.com/chotabyorg/ai-agent-service/issues/18)
-map to this implementation:
+`POST /telegram/results` is observational. It reports coordination mode,
+canonical Turn/account correlation, exhaustive delivery state, and
+`progress_disposition`: `WAIT`, `TERMINAL`, `AUTHORITY_FENCED`, or
+`ACCOUNT_CONFLICT`. Only a fully correlated non-WAIT result releases an
+IMMEDIATE gateway waiter. SETTLING does not wait for results. A revoked
+authority, missing configuration, or HTTP status alone never fabricates
+terminal/provider evidence. Authorized unresolved dispatch remains WAIT even
+after revocation; PARTIAL and INTERRUPTED stay distinct from success.
 
-| Criterion | Implementation and evidence |
+## Supersede and Website response history
+
+Each canonical inbound increments `Conversation.settling_revision`, including
+IMMEDIATE input. Before provider/socket dispatch, the adapter locks Conversation,
+completed Turn, then delivery and checks current AGENT control, authority, and
+the frozen settling revision. It commits either `DISPATCH_REQUESTED` with
+`send=true` or terminal `SUPERSEDED` with `send=false`. A new inbound shares the
+Conversation lock, so only one side of this decision can win. Superseding
+affects communication only; the Turn and opaque `operation_refs` remain
+retained, and Conversation never rolls back AI-owned Business effects.
+
+Website v2 derives a stable response-attempt ID from the retained admission ID;
+it never rewrites the public `message_id`. Historical UUID4 attempts remain
+retained with their original send permissions. Before returning a persisted v2
+denial, begin looks for an authorized completed source from the same admission
+and delivery. A completed source returns `REPLAY_COMPLETED` with its exact
+source-attempt ID and no new socket write. A denied row remains denied. Late
+completion records evidence for that exact authorized old attempt and does not
+authorize a retry. An unfinished external write becomes `UNKNOWN` when recovered
+and is never blindly repeated.
+
+## Focused evidence
+
+| Invariant | Conversation test evidence |
 | --- | --- |
-| Quiet window resets on new eligible Message | Admission snapshots timing; `_burst` advances quiet deadline; `test_quiet_reset_selects_original_messages_once_as_one_turn` |
-| Bounded wait under continuous inbound | Fixed first-message max deadline; `test_max_wait_bounds_continuous_burst` |
-| Policies vary by channel/integration; no universal timeout | `SettlingPolicy`, exact integration override in `Settings.settling_policy_for`, `test_settling_policy_resolution_is_explicit_and_integration_override_wins` |
-| Original IDs and ordering are preserved | `turn_input_messages` plus immutable selected IDs; quiet-reset and Website settling tests |
-| One eligible burst forms one Turn; no second queue authority | Shared PostgreSQL selector and one-active unique index; `test_two_workers_racing_select_one_turn` |
-| Single Message and inputs beyond the window are explicit | Snapshot selection with a single-ID Turn; separated-input regression in `test_settled_inputs_outside_window_form_later_turns` |
-| Retries, duplicates, and concurrent inbound preserve canonical identity | Inbound event idempotency plus scheduler lock; restart and inbound/delivery race tests |
-| No gateway debounce | No gateway changes; workers call the shared Conversation scheduler |
-| Voice partial/VAD exclusion | The scheduler begins only from persisted canonical CUSTOMER/INBOUND Messages; no Voice adapter or partial transcript is added here |
+| Quiet reset, equality, max wait, and settings snapshots | `tests/test_settling.py` and `tests/test_goal5_burst_recovery.py` |
+| 257+/600 members, original cutoff, byte split, fresh-process residual | `tests/test_goal5_burst_recovery.py` |
+| 131 malformed candidates, immutable schema, atomic second-owner rollback | `tests/test_goal5_burst_recovery.py` |
+| Exact duplicate owner PK name and translation | `tests/test_turns.py::test_actual_turn_input_primary_key_conflict_is_translated_after_rollback` |
+| Historical Website attempts, denied-v2 late success, scoped IDs | `tests/test_goal5_website_recovery.py` |
+| Stale undispatched Website v2 attempt persists SUPERSEDED fence | `tests/test_website.py::test_stale_settling_v2_begin_persists_superseded_fence` |
+| Telegram account, progress, RECOVER_ONLY and marked-AI recovery | `tests/test_goal5_telegram_recovery.py` |
 
-Existing worker adapters currently invoke the shared selector for managed
-Telegram and Website. Other channels can adopt it when their Conversation-owned
-worker and managed binding are introduced; no behavior is enabled by this
-checkpoint alone.
-
-Candidate Conversations are enumerated in keyset pages of 100, ordered by the
-oldest pending Message timestamp and Conversation ID. Each candidate is then
-rechecked under its own short transaction. A not-yet-due or invalid candidate
-does not prevent the worker from checking the next page, and the worker keeps
-only one bounded page in memory at a time.
+No Voice adapter, partial transcript, or gateway debounce is introduced. The
+existing ManagedTurn v1/v2 and `OperationReference` contracts remain unchanged;
+Business-operation policy remains with AI/Business Runtime.

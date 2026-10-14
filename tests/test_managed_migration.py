@@ -39,6 +39,9 @@ from tests.test_website import (
     payload as website_payload,
 )
 from tests.test_website import (
+    v2_response_attempt_id as website_v2_response_attempt_id,
+)
+from tests.test_website import (
     wh as website_fixture,
 )
 
@@ -64,7 +67,7 @@ HISTORY_COLUMNS = {
     "managed_projection_agent_id", "managed_projection_fingerprint",
 }
 SETTLING_COLUMNS = {
-    "settling_revision", "settling_policy_version",
+    "settling_revision", "settling_burst_id", "settling_policy_version",
     "settling_quiet_window_ms", "settling_max_wait_ms",
     "expected_settling_revision", "fenced_settling_revision", "result_settling_revision",
 }
@@ -151,9 +154,9 @@ async def goal4b_rows(sql):
     omitted["conversations"].update({"settling_revision"})
     omitted["messages"].update({
         "input_revision", "settling_revision", "settling_policy_version",
-        "settling_quiet_window_ms", "settling_max_wait_ms",
+        "settling_quiet_window_ms", "settling_max_wait_ms", "settling_burst_id",
     })
-    omitted["agent_turns"].update({"settling_revision"})
+    omitted["agent_turns"].update({"settling_revision", "settling_burst_id"})
     omitted["delivery_attempts"].update({
         "expected_settling_revision", "fenced_settling_revision",
     })
@@ -276,16 +279,30 @@ async def test_goal5_policy_snapshot_blocks_downgrade_without_losing_schema_or_d
     h, sql, database_url
 ):
     accepted = await h.ingest()
+    burst_id = uuid4()
     async with sql.begin() as connection:
         await connection.execute(text(
-            "UPDATE conversations SET settling_revision=0 WHERE id=:id"),
-            {"id": accepted["conversation"]["id"]},
-        )
+            "INSERT INTO settling_bursts "
+            "(id,conversation_id,policy_version,quiet_window_ms,max_wait_ms,opened_at,"
+            "max_cutoff_at,last_input_at,tail_sequence,ready_at) "
+            "SELECT :id,:conversation,'migration-policy',250,1500,clock.opened,"
+            "clock.opened+interval '1500 milliseconds',clock.opened,2,"
+            "clock.opened+interval '250 milliseconds' FROM "
+            "(SELECT clock_timestamp() AS opened) AS clock"
+        ), {"id": str(burst_id), "conversation": accepted["conversation"]["id"]})
         await connection.execute(text(
-            "UPDATE messages SET settling_revision=0, settling_policy_version='migration-policy', "
-            "settling_quiet_window_ms=250,settling_max_wait_ms=1500 WHERE id=:id"),
-            {"id": accepted["message"]["id"]},
-        )
+            "INSERT INTO messages "
+            "(id,conversation_id,sequence,input_revision,settling_revision,"
+            "settling_policy_version,settling_quiet_window_ms,settling_max_wait_ms,"
+            "settling_burst_id,actor,direction,content_type,text,created_at) "
+            "VALUES (:id,:conversation,2,2,0,'migration-policy',250,1500,:burst_id,"
+            "'CUSTOMER','INBOUND','TEXT','retained settling snapshot',clock_timestamp())"
+        ), {"id": str(uuid4()), "conversation": accepted["conversation"]["id"],
+             "burst_id": str(burst_id)})
+        await connection.execute(text(
+            "UPDATE conversations SET last_message_sequence=2,input_revision=2,"
+            "settling_revision=0 WHERE id=:id"
+        ), {"id": accepted["conversation"]["id"]})
     await assert_downgrade_refused(
         h, sql, database_url, "Retained Message settling snapshots prevent downgrade."
     )
@@ -520,7 +537,10 @@ async def test_goal4b_retained_state_matrix_upgrades_without_rewriting_history(
     website_value = website_payload(wh, session_id=str(uuid4()), message_id=str(uuid4()))
     assert (await website_admit(wh, website_value))["route"] == "MANAGED"
     assert await wh.worker.run_once()
-    website_begin = dict(website_identity(website_value), response_attempt_id=str(uuid4()))
+    website_begin = dict(
+        website_identity(website_value),
+        response_attempt_id=await website_v2_response_attempt_id(wh, website_value),
+    )
     begun = await wh.call("POST", WEBSITE_BASE + "/responses/begin", website_begin)
     assert begun.status_code == 200 and begun.json()["send"] is True
     written = await wh.call("POST", WEBSITE_BASE + "/responses/complete",

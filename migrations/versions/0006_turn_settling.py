@@ -57,12 +57,12 @@ def upgrade() -> None:
       OR (OLD.managed_contract_version=2 AND ROW(
         NEW.id,NEW.conversation_id,NEW.selection_key,NEW.creation_fingerprint,
         NEW.input_first_sequence,NEW.input_last_sequence,NEW.context_last_sequence,
-        NEW.input_revision,NEW.settling_revision,NEW.authority_revision,
+        NEW.input_revision,NEW.settling_revision,NEW.settling_burst_id,NEW.authority_revision,
         NEW.managed_contract_version,NEW.managed_context_first_sequence,
         NEW.managed_projection_agent_id,NEW.managed_projection_fingerprint) IS DISTINCT FROM ROW(
         OLD.id,OLD.conversation_id,OLD.selection_key,OLD.creation_fingerprint,
         OLD.input_first_sequence,OLD.input_last_sequence,OLD.context_last_sequence,
-        OLD.input_revision,OLD.settling_revision,OLD.authority_revision,
+        OLD.input_revision,OLD.settling_revision,OLD.settling_burst_id,OLD.authority_revision,
         OLD.managed_contract_version,OLD.managed_context_first_sequence,
         OLD.managed_projection_agent_id,OLD.managed_projection_fingerprint)) THEN
         RAISE EXCEPTION 'Frozen Website projection cannot change.' USING ERRCODE='23514';
@@ -138,10 +138,154 @@ def upgrade() -> None:
         SELECT message_id,conversation_id,turn_id,sequence,ordinal FROM chosen
     """)
 
-    # Preserve the first pre-Goal5 response attempt that could have received the
-    # legacy dispatch permission. Subsequent attempts against the same delivery
-    # were already no-send replays in the pre-Goal5 service.
-    for table in ("website_response_attempts", "telegram_response_attempts"):
+    op.create_table(
+        "settling_bursts",
+        sa.Column("id", sa.Uuid(), primary_key=True),
+        sa.Column("conversation_id", sa.Uuid(), nullable=False),
+        sa.Column("policy_version", sa.String(64, collation="C"), nullable=False),
+        sa.Column("quiet_window_ms", sa.BigInteger(), nullable=False),
+        sa.Column("max_wait_ms", sa.BigInteger(), nullable=False),
+        sa.Column("opened_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("max_cutoff_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("last_input_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("tail_sequence", sa.BigInteger(), nullable=False),
+        sa.Column("ready_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("closed_at", sa.DateTime(timezone=True), nullable=True),
+        sa.UniqueConstraint("id", "conversation_id",
+                            name="uq_settling_burst_id_conversation"),
+        sa.ForeignKeyConstraint(["conversation_id"], ["conversations.id"],
+                                name="fk_settling_burst_conversation", ondelete="RESTRICT"),
+        sa.CheckConstraint(
+            "policy_version ~ '^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$' "
+            "AND quiet_window_ms >= 1 AND max_wait_ms >= quiet_window_ms "
+            "AND tail_sequence >= 1 AND max_cutoff_at > opened_at "
+            "AND last_input_at >= opened_at AND ready_at >= last_input_at "
+            "AND ready_at <= max_cutoff_at "
+            "AND (closed_at IS NULL OR closed_at = ready_at)",
+            name="ck_settling_burst_shape",
+        ),
+    )
+    op.create_index("uq_settling_burst_open", "settling_bursts", ["conversation_id"],
+                    unique=True, postgresql_where=sa.text("closed_at IS NULL"))
+    op.create_index("ix_settling_burst_due", "settling_bursts", ["ready_at", "conversation_id"],
+                    )
+    op.add_column("messages", sa.Column("settling_burst_id", sa.Uuid(), nullable=True))
+    op.add_column("agent_turns", sa.Column("settling_burst_id", sa.Uuid(), nullable=True))
+    op.create_foreign_key(
+        "fk_message_settling_burst_conversation", "messages", "settling_bursts",
+        ["settling_burst_id", "conversation_id"], ["id", "conversation_id"],
+        ondelete="RESTRICT",
+    )
+    op.create_foreign_key(
+        "fk_turn_settling_burst_conversation", "agent_turns", "settling_bursts",
+        ["settling_burst_id", "conversation_id"], ["id", "conversation_id"],
+        ondelete="RESTRICT",
+    )
+    op.create_check_constraint(
+        "ck_message_settling_burst_shape", "messages",
+        "(settling_burst_id IS NULL AND settling_policy_version IS NULL "
+        "AND settling_quiet_window_ms IS NULL AND settling_max_wait_ms IS NULL) OR "
+        "(settling_burst_id IS NOT NULL AND actor='CUSTOMER' AND direction='INBOUND' "
+        "AND settling_policy_version IS NOT NULL AND settling_quiet_window_ms IS NOT NULL "
+        "AND settling_max_wait_ms IS NOT NULL)",
+    )
+    op.create_check_constraint(
+        "ck_turn_settling_burst_shape", "agent_turns",
+        "settling_burst_id IS NULL OR settling_revision >= 0",
+    )
+    op.execute("""CREATE FUNCTION preserve_settling_membership() RETURNS trigger
+    LANGUAGE plpgsql AS $$ BEGIN
+      IF ROW(NEW.settling_burst_id,NEW.settling_policy_version,
+             NEW.settling_quiet_window_ms,NEW.settling_max_wait_ms) IS DISTINCT FROM
+         ROW(OLD.settling_burst_id,OLD.settling_policy_version,
+             OLD.settling_quiet_window_ms,OLD.settling_max_wait_ms) THEN
+        RAISE EXCEPTION 'Message settling membership is immutable.' USING ERRCODE='23514';
+      END IF;
+      RETURN NEW;
+    END $$""")
+    op.execute("CREATE TRIGGER preserve_message_settling_membership BEFORE UPDATE ON messages "
+               "FOR EACH ROW EXECUTE FUNCTION preserve_settling_membership()")
+    op.execute("""CREATE FUNCTION preserve_burst_definition() RETURNS trigger
+    LANGUAGE plpgsql AS $$ BEGIN
+      IF ROW(NEW.id,NEW.conversation_id,NEW.policy_version,NEW.quiet_window_ms,
+             NEW.max_wait_ms,NEW.opened_at,NEW.max_cutoff_at) IS DISTINCT FROM
+         ROW(OLD.id,OLD.conversation_id,OLD.policy_version,OLD.quiet_window_ms,
+             OLD.max_wait_ms,OLD.opened_at,OLD.max_cutoff_at)
+      OR OLD.closed_at IS NOT NULL
+      OR (NEW.closed_at IS NOT NULL AND NEW.closed_at IS DISTINCT FROM OLD.ready_at)
+      OR (OLD.closed_at IS NULL AND NEW.closed_at IS NULL
+          AND NEW.ready_at < OLD.ready_at) THEN
+        RAISE EXCEPTION 'Settling burst definition cannot be rewritten.' USING ERRCODE='23514';
+      END IF;
+      RETURN NEW;
+    END $$""")
+    op.execute("CREATE TRIGGER preserve_settling_burst_definition BEFORE UPDATE "
+               "ON settling_bursts FOR EACH ROW EXECUTE FUNCTION preserve_burst_definition()")
+    op.execute("""CREATE FUNCTION preserve_turn_settling_burst() RETURNS trigger
+    LANGUAGE plpgsql AS $$ BEGIN
+      IF NEW.settling_burst_id IS DISTINCT FROM OLD.settling_burst_id THEN
+        RAISE EXCEPTION 'Turn settling membership is immutable.' USING ERRCODE='23514';
+      END IF;
+      RETURN NEW;
+    END $$""")
+    op.execute("CREATE TRIGGER preserve_turn_settling_burst BEFORE UPDATE ON agent_turns "
+               "FOR EACH ROW EXECUTE FUNCTION preserve_turn_settling_burst()")
+
+    # Reissue after the nullable discriminator exists so the frozen projection
+    # trigger protects its exact persisted mode on later updates.
+    op.execute("""CREATE OR REPLACE FUNCTION preserve_website_projection() RETURNS trigger
+    LANGUAGE plpgsql AS $$ BEGIN
+      IF NEW.managed_contract_version IS DISTINCT FROM OLD.managed_contract_version
+      OR (OLD.managed_contract_version=2 AND ROW(
+        NEW.id,NEW.conversation_id,NEW.selection_key,NEW.creation_fingerprint,
+        NEW.input_first_sequence,NEW.input_last_sequence,NEW.context_last_sequence,
+        NEW.input_revision,NEW.settling_revision,NEW.settling_burst_id,NEW.authority_revision,
+        NEW.managed_contract_version,NEW.managed_context_first_sequence,
+        NEW.managed_projection_agent_id,NEW.managed_projection_fingerprint) IS DISTINCT FROM ROW(
+        OLD.id,OLD.conversation_id,OLD.selection_key,OLD.creation_fingerprint,
+        OLD.input_first_sequence,OLD.input_last_sequence,OLD.context_last_sequence,
+        OLD.input_revision,OLD.settling_revision,OLD.settling_burst_id,OLD.authority_revision,
+        OLD.managed_contract_version,OLD.managed_context_first_sequence,
+        OLD.managed_projection_agent_id,OLD.managed_projection_fingerprint)) THEN
+        RAISE EXCEPTION 'Frozen Website projection cannot change.' USING ERRCODE='23514';
+      END IF;
+      RETURN NEW;
+    END $$""")
+
+    # Account identity is reconstructed from every retained MANAGED admission.
+    op.create_table(
+        "telegram_provider_accounts",
+        sa.Column("owner_id", sa.String(255, collation="C"), primary_key=True),
+        sa.Column("integration_id", sa.Uuid(), primary_key=True),
+        sa.Column("state", sa.String(16), nullable=False),
+        sa.Column("bot_id", sa.String(64, collation="C"), nullable=True),
+        sa.CheckConstraint(
+            "(state='BOUND' AND bot_id ~ '^[1-9][0-9]{0,18}$') OR "
+            "(state='CONFLICT' AND bot_id IS NULL)",
+            name="ck_telegram_provider_account_shape",
+        ),
+    )
+    op.execute("""
+        INSERT INTO telegram_provider_accounts(owner_id,integration_id,state,bot_id)
+        SELECT owner_id,integration_id,
+               CASE WHEN count(DISTINCT bot_id)=1 THEN 'BOUND' ELSE 'CONFLICT' END,
+               CASE WHEN count(DISTINCT bot_id)=1 THEN min(bot_id) ELSE NULL END
+        FROM telegram_admissions WHERE route='MANAGED'
+        GROUP BY owner_id,integration_id
+    """)
+    op.execute("""CREATE FUNCTION immutable_telegram_provider_account() RETURNS trigger
+    LANGUAGE plpgsql AS $$ BEGIN
+      RAISE EXCEPTION 'Telegram provider-account identity is immutable.' USING ERRCODE='23514';
+    END $$""")
+    op.execute("CREATE TRIGGER immutable_telegram_provider_account BEFORE UPDATE OR DELETE "
+               "ON telegram_provider_accounts FOR EACH ROW "
+               "EXECUTE FUNCTION immutable_telegram_provider_account()")
+    # The historical Website writer authorized every retained response attempt.
+    op.add_column("website_response_attempts", sa.Column("send_authorized", sa.Boolean(),
+                                                            nullable=False,
+                                                            server_default=sa.text("false")))
+    op.execute("UPDATE website_response_attempts SET send_authorized=true")
+    for table in ("telegram_response_attempts",):
         op.add_column(table, sa.Column("send_authorized", sa.Boolean(), nullable=False,
                                        server_default=sa.text("false")))
         op.execute(sa.text(f"""
@@ -159,7 +303,8 @@ def upgrade() -> None:
 def downgrade() -> None:
     op.execute("LOCK TABLE conversations, messages, agent_turns, delivery_attempts, "
                "delivery_reconciliations, turn_input_messages, website_response_attempts, "
-               "telegram_response_attempts, website_immediate_turns, telegram_immediate_turns "
+               "telegram_response_attempts, website_immediate_turns, telegram_immediate_turns, "
+               "settling_bursts, telegram_provider_accounts, telegram_admissions "
                "IN ACCESS EXCLUSIVE MODE")
     bind = op.get_bind()
     guards = (
@@ -181,6 +326,10 @@ def downgrade() -> None:
            )""", "Retained Message settling snapshots prevent downgrade."),
         ("SELECT EXISTS(SELECT 1 FROM agent_turns WHERE settling_revision <> 0)",
          "Retained Turn settling revisions prevent downgrade."),
+        ("SELECT EXISTS(SELECT 1 FROM settling_bursts) OR EXISTS(SELECT 1 FROM messages "
+         "WHERE settling_burst_id IS NOT NULL) OR EXISTS(SELECT 1 FROM agent_turns "
+         "WHERE settling_burst_id IS NOT NULL)",
+         "Retained settling burst membership prevents downgrade."),
         ("SELECT EXISTS(SELECT 1 FROM delivery_attempts WHERE status='SUPERSEDED')",
          "Retained supersede evidence prevents downgrade."),
         ("""SELECT EXISTS(SELECT 1 FROM website_response_attempts WHERE NOT send_authorized)
@@ -225,6 +374,43 @@ def downgrade() -> None:
     for query, message in guards:
         if bind.scalar(sa.text(query)):
             raise RuntimeError(message)
+    account_difference = bind.scalar(sa.text("""
+        WITH expected AS (
+          SELECT owner_id,integration_id,
+                 CASE WHEN count(DISTINCT bot_id)=1 THEN 'BOUND' ELSE 'CONFLICT' END AS state,
+                 CASE WHEN count(DISTINCT bot_id)=1 THEN min(bot_id) ELSE NULL END AS bot_id
+          FROM telegram_admissions WHERE route='MANAGED'
+          GROUP BY owner_id,integration_id
+        ), different AS (
+          (SELECT owner_id,integration_id,state,bot_id FROM expected
+           EXCEPT SELECT owner_id,integration_id,state,bot_id FROM telegram_provider_accounts)
+          UNION ALL
+          (SELECT owner_id,integration_id,state,bot_id FROM telegram_provider_accounts
+           EXCEPT SELECT owner_id,integration_id,state,bot_id FROM expected)
+        ) SELECT EXISTS(SELECT 1 FROM different)
+    """))
+    if account_difference:
+        raise RuntimeError("Telegram provider-account authority cannot be safely reconstructed.")
+    op.execute("DROP TRIGGER immutable_telegram_provider_account ON telegram_provider_accounts")
+    op.execute("DROP FUNCTION immutable_telegram_provider_account()")
+    op.execute("DROP TRIGGER preserve_turn_settling_burst ON agent_turns")
+    op.execute("DROP FUNCTION preserve_turn_settling_burst()")
+    op.execute("DROP TRIGGER preserve_settling_burst_definition ON settling_bursts")
+    op.execute("DROP FUNCTION preserve_burst_definition()")
+    op.execute("DROP TRIGGER preserve_message_settling_membership ON messages")
+    op.execute("DROP FUNCTION preserve_settling_membership()")
+    op.drop_constraint("ck_turn_settling_burst_shape", "agent_turns", type_="check")
+    op.drop_constraint("fk_turn_settling_burst_conversation", "agent_turns",
+                       type_="foreignkey")
+    op.drop_column("agent_turns", "settling_burst_id")
+    op.drop_constraint("ck_message_settling_burst_shape", "messages", type_="check")
+    op.drop_constraint("fk_message_settling_burst_conversation", "messages",
+                       type_="foreignkey")
+    op.drop_column("messages", "settling_burst_id")
+    op.drop_index("ix_settling_burst_due", table_name="settling_bursts")
+    op.drop_index("uq_settling_burst_open", table_name="settling_bursts")
+    op.drop_table("settling_bursts")
+    op.drop_table("telegram_provider_accounts")
     op.drop_index("ix_turn_input_conversation_sequence", table_name="turn_input_messages")
     op.drop_table("turn_input_messages")
     op.drop_constraint("uq_message_identity_sequence", "messages", type_="unique")

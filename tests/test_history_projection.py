@@ -15,7 +15,7 @@ from models import (
     WebsiteAdmission,
     WebsiteImmediateTurn,
 )
-from schemas.contracts import ErrorCode, TurnClaim, TurnExecute
+from schemas.contracts import ErrorCode, TurnClaim, TurnComplete, TurnCreate, TurnExecute
 from schemas.managed import MAX_REQUEST_BYTES, ManagedTurnRequest, prepare_request
 from services import managed_execution, turns
 from services.common import fingerprint
@@ -25,7 +25,7 @@ from tests.conftest import locked_race
 from tests.test_database import violation
 from tests.test_managed_contracts import wire_request
 from tests.test_managed_migration import migrate
-from tests.test_website import BASE, admit, identity, payload, query
+from tests.test_website import BASE, admit, identity, payload, query, v2_response_attempt_id
 from tests.test_website import wh as website_fixture
 
 wh = website_fixture
@@ -121,7 +121,10 @@ async def complete(wh, value, outcome="WRITE_COMPLETED", *, expected_status=200)
     # A transport retry/reconciliation reuses the one retained response attempt.
     # A fresh attempt id must not borrow the earlier attempt's send permission.
     message_id = str(value["message_id"])
-    response_attempt_id = RESPONSE_ATTEMPT_IDS.setdefault(message_id, str(uuid4()))
+    response_attempt_id = RESPONSE_ATTEMPT_IDS.get(message_id)
+    if response_attempt_id is None:
+        response_attempt_id = await v2_response_attempt_id(wh, value)
+        RESPONSE_ATTEMPT_IDS[message_id] = response_attempt_id
     attempt = dict(identity(value), response_attempt_id=response_attempt_id)
     begun = await wh.call("POST", BASE + "/responses/begin", attempt)
     assert begun.status_code == 200, begun.text
@@ -205,30 +208,35 @@ async def test_negative_fact_not_promoted_late_success_does_not_retrofit_frozen_
 
 
 @pytest.mark.parametrize("iteration", range(5))
-async def test_concurrent_successful_attempts_and_admission_serialize_actual_pg(
+async def test_concurrent_same_v2_completion_and_admission_serialize_actual_pg(
     wh, sql, iteration
 ):
     value = payload(wh)
     await admit(wh, value)
     await wh.worker.run_once()
-    attempts = [dict(identity(value), response_attempt_id=str(uuid4())) for _ in range(2)]
-    begun = [await wh.call("POST", BASE + "/responses/begin", attempt)
-             for attempt in attempts]
-    assert all(response.status_code == 200 for response in begun)
-    assert begun[0].json()["send"] is True
-    assert begun[1].json()["send"] is False
+    attempt = dict(identity(value),
+                   response_attempt_id=await v2_response_attempt_id(wh, value))
+    first = await wh.call("POST", BASE + "/responses/begin", attempt)
+    assert first.status_code == 200 and first.json()["send"] is True
+    # A canonical v2 admission owns one stable transport id. A repeated begin
+    # may mark its unresolved write UNKNOWN but cannot mint another permission.
+    retry = await wh.call("POST", BASE + "/responses/begin", attempt)
+    assert retry.status_code == 200 and retry.json()["action"] == "DENY"
+    assert retry.json()["send"] is False and retry.json()["replayed"] is True
     async with sql.connect() as conn:
         conversation_id = str(await conn.scalar(select(Conversation.id)))
     responses = await locked_race(sql, conversation_id, [
         wh.call("POST", BASE + "/responses/complete",
-                dict(attempts[0], outcome="WRITE_COMPLETED")),
+                dict(attempt, outcome="WRITE_COMPLETED")),
+        wh.call("POST", BASE + "/responses/complete",
+                dict(attempt, outcome="WRITE_COMPLETED")),
         wh.call("POST", BASE + "/admissions", dict(value, message_id=str(uuid4()))),
     ],
-        f"Goal4A.1 simultaneous assistant promotion and customer admission, iteration={iteration}")
+        f"Goal4A.1 same v2 transport retries and customer admission, iteration={iteration}")
     assert all(r.status_code == 200 for r in responses)
-    rejected = await wh.call("POST", BASE + "/responses/complete",
-                             dict(attempts[1], outcome="WRITE_COMPLETED"))
-    assert rejected.status_code == 409
+    replayed = await wh.call("POST", BASE + "/responses/complete",
+                             dict(attempt, outcome="WRITE_COMPLETED"))
+    assert replayed.status_code == 200 and replayed.json()["replayed"] is True
     rows = await history(sql)
     assert [m["sequence"] for m in rows] == [1, 2, 3]
     assert len([m for m in rows if m["actor"] == "AGENT"]) == 1
@@ -240,7 +248,8 @@ async def test_assistant_append_failure_rolls_back_physical_outcome_and_counters
     value = payload(wh)
     await admit(wh, value)
     await wh.worker.run_once()
-    attempt = dict(identity(value), response_attempt_id=str(uuid4()))
+    attempt = dict(identity(value),
+                   response_attempt_id=await v2_response_attempt_id(wh, value))
     assert (await wh.call("POST", BASE + "/responses/begin", attempt)).status_code == 200
     async with sql.begin() as conn:
         await conn.execute(text("ALTER TABLE messages ADD CONSTRAINT history_test_failure "
@@ -446,7 +455,8 @@ async def test_retained_old_success_replay_does_not_backfill_history(wh, sql):
     proof, _, _ = await claimed_snapshot(wh, turn_id)
     await managed_execution.execute_claimed_turn(wh.database, wh.principal, turn_id, proof,
                                                 wh.settings, wh.ai)
-    attempt = dict(identity(value), response_attempt_id=str(uuid4()))
+    attempt = dict(identity(value),
+                   response_attempt_id=await v2_response_attempt_id(wh, value))
     RESPONSE_ATTEMPT_IDS[str(value["message_id"])] = attempt["response_attempt_id"]
     assert (await wh.call("POST", BASE + "/responses/begin", attempt)).status_code == 200
     async with sql.begin() as conn:
@@ -475,6 +485,34 @@ async def seed_window(wh, sql, count, content="hello", paired=True):
             "input_revision=:revision WHERE id=:id"),
             dict(count=count, revision=(count + 1) // 2 if paired else count, id=conversation))
     return conversation
+
+
+async def consume_seeded_inputs(wh, conversation_id, last_sequence):
+    async with wh.database.session_factory() as session:
+        conversation = await session.get(Conversation, conversation_id)
+        assert conversation is not None
+        input_revision = conversation.input_revision
+        authority_revision = conversation.authority_revision
+    created = await turns.create_turn(
+        wh.database, wh.principal, conversation_id,
+        TurnCreate(
+            selection_key=uuid4(), input_first_sequence=1,
+            input_last_sequence=last_sequence,
+            expected_input_revision=input_revision,
+            expected_authority_revision=authority_revision,
+        ),
+    )
+    claim = await turns.claim_turn(
+        wh.database, wh.principal, created.turn.id,
+        TurnClaim(worker_ref="seed-history", lease_seconds=30),
+    )
+    await turns.complete_turn(
+        wh.database, wh.principal, created.turn.id,
+        TurnComplete(
+            claim_epoch=claim.turn.claim_epoch,
+            claim_token=SecretStr(claim.claim_token), outcome="NO_RESPONSE",
+        ),
+    )
 
 
 @pytest.mark.parametrize("count,content,paired,expected_first", [
@@ -546,9 +584,9 @@ async def test_downgrade_refuses_retained_v2_or_history(wh, sql, database_url, r
 async def test_long_window_survives_unmarked_claim_recovery_without_budget_reselection(wh, sql,
                                                                                      monkeypatch):
     conversation_id = await seed_window(wh, sql, 499)
-    # Process the retained first Website admission; the other seed rows are only
-    # canonical fixture history, with no admission or scheduled work.
-    await wh.worker.run_once()
+    # Mark the synthetic seed prefix as completed input ownership. The next
+    # admission then exercises projection over old conversation history only.
+    await consume_seeded_inputs(wh, conversation_id, 499)
     async with sql.connect() as conn:
         session_id = await conn.scalar(select(WebsiteAdmission.session_id))
     value = payload(wh, session_id=str(session_id), text="selected500")

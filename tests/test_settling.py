@@ -6,6 +6,7 @@ import asyncio
 import multiprocessing
 import queue
 import secrets
+from datetime import datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -21,11 +22,18 @@ from models import (
     Conversation,
     DeliveryAttempt,
     Message,
+    SettlingBurst,
     TelegramAdmission,
     TurnInputMessage,
 )
 from schemas.contracts import Channel
 from schemas.managed import MAX_PROJECTED_TEXT_BYTES
+from services.common import (
+    advance_test_database_clock,
+    current_test_database_clock,
+    reset_test_database_clock,
+    set_test_database_clock,
+)
 from services.settling import CANDIDATE_PAGE_SIZE, select_settled_turn
 from services.telegram import expected_response_attempt_id
 from services.telegram_worker import TelegramWorker
@@ -46,7 +54,7 @@ class PausingManagedPort(DeterministicManagedPort):
 
 
 @pytest_asyncio.fixture
-async def telegram_harness(database_url):
+async def telegram_harness(database_url, test_database_clock):
     from db.database import Database
     from main import create_app
 
@@ -86,6 +94,7 @@ async def telegram_harness(database_url):
         ) as client:
             yield {"app": app, "client": client, "database": database,
                    "settings": settings,
+                   "test_clock": test_database_clock,
                    "gateway_headers": {"X-Service-Token": gateway_token},
                    "worker_token": worker_token, "full_token": full_token}
 
@@ -102,13 +111,31 @@ def _install_settings(harness, settings: Settings) -> None:
     harness["app"].state.settings = settings
 
 
-async def _age_messages(sql, ages_ms: dict[int, int]) -> None:
-    async with sql.begin() as connection:
-        for sequence, age in ages_ms.items():
-            await connection.execute(text(
-                "UPDATE messages SET created_at=clock_timestamp() - "
-                "(:age * interval '1 millisecond') WHERE sequence=:sequence"
-            ), {"age": age, "sequence": sequence})
+async def _advance_to_due(
+    sql,
+    *,
+    sequences: tuple[int, ...] | list[int] | None = None,
+    conversation_ids: tuple[UUID, ...] | list[UUID] | None = None,
+    offset_ms: int = 0,
+) -> datetime:
+    """Move the deterministic service clock to a durable burst deadline."""
+    statement = select(func.max(SettlingBurst.ready_at)).join(
+        Message, Message.settling_burst_id == SettlingBurst.id
+    ).where(SettlingBurst.closed_at.is_(None))
+    if sequences is not None:
+        statement = statement.where(Message.sequence.in_(sequences))
+    if conversation_ids is not None:
+        statement = statement.where(Message.conversation_id.in_(conversation_ids))
+    async with sql.connect() as connection:
+        ready_at = await connection.scalar(statement)
+    if not isinstance(ready_at, datetime):
+        raise AssertionError("No open durable settling burst matched the test filter")
+    current = current_test_database_clock()
+    if current is None:
+        raise AssertionError("The deterministic test database clock is not installed")
+    target = max(current, ready_at + timedelta(milliseconds=offset_ms))
+    advance_test_database_clock(target)
+    return target
 
 
 @pytest.mark.asyncio
@@ -149,8 +176,8 @@ async def test_quiet_reset_selects_original_messages_once_as_one_turn(telegram_h
     assert invalid_direct.status_code == 409
     assert invalid_direct.json()["detail"]["code"] == "SETTLING_REQUIRED"
 
-    # The second accepted Message extends quiet to 1000ms from its own DB time.
-    await _age_messages(sql, {1: 800, 2: 100})
+    # The second accepted Message extends the durable burst's quiet deadline.
+    await _advance_to_due(sql, sequences=[1, 2], offset_ms=-1)
     # A config update affects future admissions only; both accepted Messages keep
     # their original 1000ms/5000ms policy snapshot.
     changed_settings = _policy_settings(h["settings"], quiet_ms=10_000,
@@ -159,7 +186,7 @@ async def test_quiet_reset_selects_original_messages_once_as_one_turn(telegram_h
     port = DeterministicManagedPort()
     worker = TelegramWorker(h["database"], changed_settings, port)
     assert await worker.run_once() is False
-    await asyncio.sleep(0.95)
+    await _advance_to_due(sql, sequences=[1, 2])
     assert await worker.run_once() is True
     assert port.calls == 1
     request = port.prepared[0].request
@@ -187,7 +214,7 @@ async def test_telegram_delivery_work_coalesces_burst_and_fences_restarts(telegr
     second = await telegram_admit(h["client"], h["gateway_headers"], message_id=8, update_id=56)
     assert first.status_code == second.status_code == 200
     second_admission = second.json()
-    await _age_messages(sql, {1: 500, 2: 300})
+    await _advance_to_due(sql, sequences=[1, 2])
     port = DeterministicManagedPort()
     worker = TelegramWorker(h["database"], settings, port)
     assert await worker.run_once()
@@ -199,7 +226,7 @@ async def test_telegram_delivery_work_coalesces_burst_and_fences_restarts(telegr
             "/internal/v1/telegram/responses/work",
             json={"owner_id": binding.owner_id,
                   "integration_id": str(binding.integration_id),
-                  "agent_id": str(binding.agent_id)},
+                  "agent_id": str(binding.agent_id), "bot_id": 999},
             headers=h["gateway_headers"],
         )
         assert response.status_code == 200, response.text
@@ -273,9 +300,12 @@ async def test_settled_inputs_outside_window_form_later_turns(telegram_harness, 
     settings = _policy_settings(h["settings"], quiet_ms=50, max_wait_ms=2000)
     _install_settings(h, settings)
     first = await telegram_admit(h["client"], h["gateway_headers"], message_id=7, update_id=55)
+    assert first.status_code == 200
+    first_id = UUID(first.json()["admission_id"])
+    await _advance_to_due(sql, sequences=[1])
     second = await telegram_admit(h["client"], h["gateway_headers"], message_id=8, update_id=56)
-    assert first.status_code == second.status_code == 200
-    first_id, second_id = UUID(first.json()["admission_id"]), UUID(second.json()["admission_id"])
+    assert second.status_code == 200
+    second_id = UUID(second.json()["admission_id"])
     async with h["database"].session_factory() as session, session.begin():
         first_message_id = await session.scalar(select(
             TelegramAdmission.canonical_message_id).where(TelegramAdmission.id == first_id))
@@ -283,8 +313,7 @@ async def test_settled_inputs_outside_window_form_later_turns(telegram_harness, 
             TelegramAdmission.canonical_message_id).where(TelegramAdmission.id == second_id))
     assert first_message_id is not None and second_message_id is not None
     message_rows = (first_message_id, second_message_id)
-    # The first admission has already closed its quiet window before the second.
-    await _age_messages(sql, {1: 500, 2: 100})
+    await _advance_to_due(sql, sequences=[2])
     port = DeterministicManagedPort()
     worker = TelegramWorker(h["database"], settings, port)
     assert await worker.run_once()
@@ -316,29 +345,30 @@ async def test_byte_bounded_burst_splits_maximal_prefix_and_later_work_progresse
         h["client"], h["gateway_headers"], message_id=100 + index,
         update_id=200 + index, text_value="x" * 16_384,
     ) for index in range(33)]
-    later = await telegram_admit(
-        h["client"], h["gateway_headers"], message_id=500, update_id=600,
-        chat_id=124, text_value="later conversation",
-    )
     assert all(response.status_code == 200 for response in large)
-    assert later.status_code == 200
     large_admissions = [UUID(response.json()["admission_id"]) for response in large]
     async with h["database"].session_factory() as session, session.begin():
         large_ids = list((await session.scalars(select(
             TelegramAdmission.canonical_message_id).where(
                 TelegramAdmission.id.in_(large_admissions)
             ).order_by(TelegramAdmission.update_id))).all())
+        conversation_id = await session.scalar(select(
+            TelegramAdmission.conversation_id).where(
+                TelegramAdmission.id == large_admissions[0]))
+    assert conversation_id is not None
+    # Give the distinct conversation a later immutable deadline so the 33-item
+    # burst remains the first candidate while still being settled.
+    await _advance_to_due(sql, conversation_ids=[conversation_id])
+    later = await telegram_admit(
+        h["client"], h["gateway_headers"], message_id=500, update_id=600,
+        chat_id=124, text_value="later conversation",
+    )
+    assert later.status_code == 200
+    async with h["database"].session_factory() as session, session.begin():
         later_id = await session.scalar(select(TelegramAdmission.canonical_message_id).where(
             TelegramAdmission.id == UUID(later.json()["admission_id"])))
     assert len(large_ids) == 33 and later_id is not None
-    async with sql.begin() as connection:
-        for message_id in large_ids:
-            await connection.execute(text(
-                "UPDATE messages SET created_at=clock_timestamp()-interval '5 seconds' "
-                "WHERE id=:id"), {"id": message_id})
-        await connection.execute(text(
-            "UPDATE messages SET created_at=clock_timestamp()-interval '4 seconds' "
-            "WHERE id=:id"), {"id": later_id})
+    await _advance_to_due(sql)
 
     port = DeterministicManagedPort()
     worker = TelegramWorker(h["database"], settings, port)
@@ -392,10 +422,7 @@ async def test_message_count_and_byte_limits_both_bound_a_257_message_burst(
         conversation_id = await session.scalar(select(
             TelegramAdmission.conversation_id).where(TelegramAdmission.id == first_admission))
     assert conversation_id is not None
-    async with sql.begin() as connection:
-        await connection.execute(text(
-            "UPDATE messages SET created_at=clock_timestamp()-interval '500 milliseconds' "
-            "WHERE conversation_id=:id"), {"id": conversation_id})
+    await _advance_to_due(sql, conversation_ids=[conversation_id])
     port = DeterministicManagedPort()
     worker = TelegramWorker(h["database"], settings, port)
     assert await worker.run_once() is True
@@ -465,11 +492,7 @@ async def test_projection_prunes_old_context_but_keeps_every_new_burst_input(
             TelegramAdmission.canonical_message_id).where(
                 TelegramAdmission.id.in_(admission_ids)
             ).order_by(TelegramAdmission.update_id))).all())
-    async with sql.begin() as connection:
-        for message_id in input_ids:
-            await connection.execute(text(
-                "UPDATE messages SET created_at=clock_timestamp()-interval '5 seconds' "
-                "WHERE id=:id"), {"id": message_id})
+    await _advance_to_due(sql, sequences=[33, 34])
 
     worker = TelegramWorker(h["database"], settings, port)
     assert await worker.run_once() is True
@@ -493,18 +516,17 @@ async def test_max_wait_bounds_continuous_burst(telegram_harness, sql):
     settings = _policy_settings(h["settings"], quiet_ms=500, max_wait_ms=1000)
     _install_settings(h, settings)
     admissions = []
-    for message_id in range(7, 11):
+    clock = h["test_clock"]
+    opened_at = clock.current
+    for index, message_id in enumerate(range(7, 11)):
+        if index:
+            elapsed_ms = (400, 800, 1000)[index - 1]
+            clock.advance_to(opened_at + timedelta(milliseconds=elapsed_ms))
         response = await telegram_admit(h["client"], h["gateway_headers"],
                                         message_id=message_id, update_id=message_id + 48)
         assert response.status_code == 200
         admissions.append(UUID(response.json()["admission_id"]))
-    async with sql.begin() as connection:
-        await connection.execute(text("""
-            WITH base AS (SELECT clock_timestamp() AS now),
-                 ages(sequence, age_ms) AS (VALUES (1,2000),(2,1600),(3,1200),(4,1000))
-            UPDATE messages m SET created_at=base.now-(ages.age_ms*interval '1 millisecond')
-            FROM base,ages WHERE m.sequence=ages.sequence
-        """))
+    clock.advance_to(opened_at + timedelta(milliseconds=1000))
     port = DeterministicManagedPort()
     worker = TelegramWorker(h["database"], settings, port)
     assert await worker.run_once() is True
@@ -525,7 +547,7 @@ async def test_settling_survives_worker_process_restart(telegram_harness, sql, d
     _install_settings(h, settings)
     accepted = await telegram_admit(h["client"], h["gateway_headers"], message_id=7, update_id=55)
     assert accepted.status_code == 200
-    await _age_messages(sql, {1: 500})
+    logical_now = await _advance_to_due(sql, sequences=[1])
     process_settings = {
         "database_url": database_url,
         "auth_principals": [{
@@ -555,7 +577,7 @@ async def test_settling_survives_worker_process_restart(telegram_harness, sql, d
     context = multiprocessing.get_context("spawn")
     results = context.Queue()
     process = context.Process(target=_select_in_fresh_process,
-                              args=(database_url, process_settings, results))
+                              args=(database_url, process_settings, logical_now, results))
     process.start()
     process.join(timeout=20)
     if process.is_alive():
@@ -577,13 +599,16 @@ async def test_settling_survives_worker_process_restart(telegram_harness, sql, d
     assert count is not None
 
 
-def _select_in_fresh_process(database_url: str, data: dict[str, Any], output) -> None:
+def _select_in_fresh_process(
+    database_url: str, data: dict[str, Any], logical_now: datetime, output
+) -> None:
     async def run() -> str | None:
         from db.database import Database
 
         settings = Settings(**data, _env_file=None)
         principal = next(item for item in settings.auth_principals
                          if item.principal_id == settings.telegram_worker_principal_id).principal()
+        clock_token = set_test_database_clock(logical_now)
         database = Database(database_url)
         try:
             result = await select_settled_turn(
@@ -592,6 +617,7 @@ def _select_in_fresh_process(database_url: str, data: dict[str, Any], output) ->
             return str(result) if result else None
         finally:
             await database.dispose()
+            reset_test_database_clock(clock_token)
 
     try:
         output.put(asyncio.run(run()))
@@ -607,7 +633,7 @@ async def test_two_workers_racing_select_one_turn(telegram_harness, sql):
     _install_settings(h, settings)
     accepted = await telegram_admit(h["client"], h["gateway_headers"], message_id=7, update_id=55)
     assert accepted.status_code == 200
-    await _age_messages(sql, {1: 500})
+    await _advance_to_due(sql, sequences=[1])
     principal = next(item for item in settings.auth_principals
                      if item.principal_id == settings.telegram_worker_principal_id).principal()
     left, right = await asyncio.gather(
@@ -627,7 +653,7 @@ async def test_inbound_during_claimed_turn_is_retained_for_next_selection(telegr
     first = await telegram_admit(h["client"], h["gateway_headers"], message_id=7, update_id=55)
     assert first.status_code == 200
     assert first.json()["route"] == "MANAGED"
-    await _age_messages(sql, {1: 500})
+    await _advance_to_due(sql, sequences=[1])
     port = PausingManagedPort()
     worker = TelegramWorker(h["database"], settings, port)
     running = asyncio.create_task(worker.run_once())
@@ -648,7 +674,7 @@ async def test_inbound_during_claimed_turn_is_retained_for_next_selection(telegr
 
     port.release.set()
     assert await running
-    await _age_messages(sql, {2: 500})
+    await _advance_to_due(sql, sequences=[2])
     assert await worker.run_once()
     assert [prepared.request.input_first_sequence for prepared in port.prepared] == [1, 2]
     assert [prepared.request.input_last_sequence for prepared in port.prepared] == [1, 2]
@@ -683,11 +709,7 @@ async def test_large_unsettled_prefix_does_not_hide_later_due_conversation(
     backlog = await submit(message_id=1000, thread_id="123")
     later = await submit(message_id=1001, thread_id="124")
     assert backlog.status_code == later.status_code == 200
-    async with sql.begin() as connection:
-        await connection.execute(text(
-            "UPDATE messages SET created_at=clock_timestamp()-interval '500 milliseconds' "
-            "WHERE settling_policy_version IS NOT NULL"
-        ))
+    await _advance_to_due(sql)
     principal = next(item for item in settings.auth_principals
                      if item.principal_id == settings.telegram_worker_principal_id).principal()
     selected_id = await select_settled_turn(
@@ -704,10 +726,10 @@ async def test_large_unsettled_prefix_does_not_hide_later_due_conversation(
 @pytest.mark.asyncio
 async def test_candidate_scan_uses_bounded_keyset_pages(telegram_harness, sql):
     h = telegram_harness
-    settings = _policy_settings(h["settings"], quiet_ms=10, max_wait_ms=100)
-    _install_settings(h, settings)
+    old_settings = _policy_settings(h["settings"], quiet_ms=5, max_wait_ms=100)
+    _install_settings(h, old_settings)
     candidate_count = CANDIDATE_PAGE_SIZE + 1
-    chat_ids = [6000 + index for index in range(candidate_count + 1)]
+    chat_ids = [6000 + index for index in range(candidate_count)]
 
     for batch_start in range(0, len(chat_ids), 20):
         responses = await asyncio.gather(*(
@@ -722,27 +744,35 @@ async def test_candidate_scan_uses_bounded_keyset_pages(telegram_harness, sql):
         ))
         assert all(response.status_code == 200 for response in responses)
 
-    old_chat_ids = chat_ids[:candidate_count]
-    due_chat_id = chat_ids[-1]
+    old_chat_ids = chat_ids
+    due_chat_id = 7000 + candidate_count
     async with h["database"].session_factory() as session, session.begin():
         old_conversation_ids = (await session.scalars(select(Conversation.id).where(
             Conversation.provider_thread_id.in_(list(map(str, old_chat_ids)))
         ))).all()
+        assert len(old_conversation_ids) == candidate_count
+        await session.execute(update(Conversation).where(
+            Conversation.id.in_(old_conversation_ids)
+        ).values(control_mode="HUMAN"))
+
+    # The first page contains 101 real due bursts that are skipped by the
+    # locked control-mode check. The eligible conversation has a later deadline.
+    await _advance_to_due(sql, conversation_ids=old_conversation_ids)
+    settings = _policy_settings(h["settings"], quiet_ms=10, max_wait_ms=100)
+    _install_settings(h, settings)
+    due = await h["client"].post(
+        "/internal/v1/telegram/admissions",
+        json=inbound(message_id=10_000 + candidate_count,
+                     update_id=20_000 + candidate_count, chat_id=due_chat_id),
+        headers=h["gateway_headers"],
+    )
+    assert due.status_code == 200, due.text
+    async with h["database"].session_factory() as session, session.begin():
         due_conversation_id = await session.scalar(select(Conversation.id).where(
             Conversation.provider_thread_id == str(due_chat_id)
         ))
-        assert len(old_conversation_ids) == candidate_count
-        assert due_conversation_id is not None
-        await session.execute(update(Message).where(
-            Message.conversation_id.in_(old_conversation_ids)
-        ).values(
-            settling_quiet_window_ms=100_000,
-            settling_max_wait_ms=200_000,
-            created_at=text("clock_timestamp() - interval '5 seconds'"),
-        ))
-        await session.execute(update(Message).where(
-            Message.conversation_id == due_conversation_id
-        ).values(created_at=text("clock_timestamp() - interval '500 milliseconds'")))
+    assert due_conversation_id is not None
+    await _advance_to_due(sql, conversation_ids=[due_conversation_id])
 
     principal = next(item for item in settings.auth_principals
                      if item.principal_id == settings.telegram_worker_principal_id).principal()
@@ -767,7 +797,7 @@ async def test_new_eligible_input_supersedes_draft_and_retains_operation_refs(
     _install_settings(h, settings)
     first = await telegram_admit(h["client"], h["gateway_headers"], message_id=7, update_id=55)
     assert first.status_code == 200
-    await _age_messages(sql, {1: 500})
+    await _advance_to_due(sql, sequences=[1])
     port = DeterministicManagedPort()
     port.operation_refs = [{"origin": "AI_AGENT_SERVICE", "operation_id": "op-unknown",
                             "outcome": "UNKNOWN"}]
@@ -808,7 +838,7 @@ async def test_control_change_before_dispatch_blocks_telegram_send(telegram_harn
         conversation_id = await session.scalar(select(
             TelegramAdmission.conversation_id).where(TelegramAdmission.id == admission_id))
     assert conversation_id is not None
-    await _age_messages(sql, {1: 500})
+    await _advance_to_due(sql, sequences=[1])
     worker = TelegramWorker(h["database"], settings, DeterministicManagedPort())
     assert await worker.run_once()
 
@@ -839,7 +869,7 @@ async def test_inbound_and_delivery_fence_have_one_postgres_ordering(telegram_ha
     _install_settings(h, settings)
     first = await telegram_admit(h["client"], h["gateway_headers"], message_id=7, update_id=55)
     assert first.status_code == 200
-    await _age_messages(sql, {1: 500})
+    await _advance_to_due(sql, sequences=[1])
     worker = TelegramWorker(h["database"], settings, DeterministicManagedPort())
     assert await worker.run_once()
     first_identity = {key: inbound()[key] for key in (

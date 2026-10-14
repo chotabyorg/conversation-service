@@ -122,7 +122,9 @@ async def test_migrated_catalog_constraints_indexes_utc_and_exact_collation(h, s
             "telegram_admissions",
             "telegram_immediate_turns",
             "telegram_response_attempts",
+            "telegram_provider_accounts",
             "turn_input_messages",
+            "settling_bursts",
         }
         assert (
             await connection.scalar(text("SELECT version_num FROM alembic_version"))
@@ -287,13 +289,56 @@ async def test_turn_input_message_foreign_key_binds_exact_id_and_sequence(h, sql
     )
 
 
-async def test_goal5_settling_checks_are_null_safe_for_raw_sql(h, sql):
+async def test_goal5_settling_checks_reject_malformed_raw_sql(h, sql):
     accepted = await h.ingest()
+    # Membership is intentionally immutable on UPDATE, so clone the canonical
+    # inbound row and make malformed snapshots on INSERT to exercise the
+    # named CHECKs themselves rather than the immutability trigger.
+    async with sql.connect() as connection:
+        columns = list((await connection.execute(text(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema='public' AND table_name='messages' "
+            "ORDER BY ordinal_position"
+        ))).scalars())
+    burst_id = uuid4()
+    async with sql.begin() as connection:
+        await connection.execute(text(
+            "INSERT INTO settling_bursts "
+            "(id,conversation_id,policy_version,quiet_window_ms,max_wait_ms,"
+            "opened_at,max_cutoff_at,last_input_at,tail_sequence,ready_at) "
+            "VALUES (:id,:conversation,'telegram-v1',100,1000,clock_timestamp(),"
+            "clock_timestamp()+interval '1 second',clock_timestamp(),1,"
+            "clock_timestamp()+interval '100 milliseconds')"
+        ), {"id": str(burst_id), "conversation": accepted["conversation"]["id"]})
+    overrides = {
+        "id": ":new_id",
+        "sequence": "sequence + 1000000",
+        "settling_policy_version": "'telegram-v1'",
+        "settling_quiet_window_ms": "0",
+        "settling_max_wait_ms": "1000",
+        "settling_burst_id": ":burst_id",
+        "source_inbound_event_id": "NULL",
+    }
+    expressions = [overrides.get(column, column) for column in columns]
     await violation(
         sql,
-        "UPDATE messages SET settling_policy_version='telegram-v1', "
-        "settling_quiet_window_ms=NULL,settling_max_wait_ms=1000 WHERE id=:id",
-        {"id": accepted["message"]["id"]}, "23514", "ck_message_settling_snapshot",
+        "INSERT INTO messages (" + ",".join(columns) + ") SELECT "
+        + ",".join(expressions) + " FROM messages WHERE id=:id",
+        {"id": accepted["message"]["id"], "new_id": str(uuid4()),
+         "burst_id": str(burst_id)},
+        "23514", "ck_message_settling_snapshot",
+    )
+    null_expressions = [
+        "NULL" if column == "settling_quiet_window_ms" else expression
+        for column, expression in zip(columns, expressions, strict=True)
+    ]
+    await violation(
+        sql,
+        "INSERT INTO messages (" + ",".join(columns) + ") SELECT "
+        + ",".join(null_expressions) + " FROM messages WHERE id=:id",
+        {"id": accepted["message"]["id"], "new_id": str(uuid4()),
+         "burst_id": str(burst_id)},
+        "23514", "ck_message_settling_burst_shape",
     )
     _, attempt, _ = await h.delivery()
     await violation(

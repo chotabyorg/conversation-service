@@ -24,6 +24,7 @@ class TelegramIdentity(Contract):
     agent_id: UUID
     provider_thread_id: WorkerRef
     provider_event_id: WorkerRef
+    bot_id: PositiveCounter | None = None
 
 
 class TelegramAdmission(TelegramIdentity):
@@ -48,19 +49,44 @@ class TelegramAdmissionResult(Contract):
     route: Literal["MANAGED", "LEGACY"]
     admission_id: UUID
     replayed: bool
+    bot_id: PositiveCounter
+    coordination_mode: Literal["IMMEDIATE", "SETTLING"]
 
 
 class TelegramResult(TelegramIdentity):
     state: Literal["PENDING", "DRAFT_READY", "NO_RESPONSE", "FAILED", "UNKNOWN"]
     draft_text: TextContent | None = None
+    admission_id: UUID
+    bot_id: PositiveCounter
+    coordination_mode: Literal["IMMEDIATE", "SETTLING"]
+    turn_id: UUID | None = None
+    delivery_state: Literal[
+        "NOT_STARTED", "GENERATED", "DISPATCH_REQUESTED", "SUPERSEDED",
+        "PROVIDER_ACCEPTED", "DELIVERED", "READ", "FAILED", "UNKNOWN",
+        "PARTIAL", "INTERRUPTED",
+    ]
+    progress_disposition: Literal[
+        "WAIT", "TERMINAL", "AUTHORITY_FENCED", "ACCOUNT_CONFLICT"
+    ]
+
+    @model_validator(mode="after")
+    def disposition_matches_progress(self) -> "TelegramResult":
+        if self.progress_disposition == "WAIT":
+            return self
+        if self.progress_disposition == "AUTHORITY_FENCED" and self.state != "DRAFT_READY":
+            raise ValueError("invalid authority-fenced progress")
+        return self
 
 
 class TelegramResponseBegin(TelegramIdentity):
     response_attempt_id: UUID
 
 
-class TelegramResponseBegun(Contract):
+class TelegramResponseBegun(TelegramIdentity):
     response_attempt_id: UUID
+    admission_id: UUID
+    bot_id: PositiveCounter
+    work_kind: Literal["SEND_CANDIDATE", "RECOVER_ONLY"]
     draft_text: TextContent
     send: bool
     replayed: bool
@@ -86,8 +112,10 @@ class TelegramResponseComplete(TelegramResponseBegin):
         return self
 
 
-class TelegramResponseCompleted(Contract):
+class TelegramResponseCompleted(TelegramIdentity):
     response_attempt_id: UUID
+    admission_id: UUID
+    bot_id: PositiveCounter
     outcome: Literal["PROVIDER_ACCEPTED", "FAILED", "UNKNOWN"]
     replayed: bool
 
@@ -96,11 +124,15 @@ class TelegramDeliveryWorkRequest(Contract):
     owner_id: OwnerId
     integration_id: UUID
     agent_id: UUID
+    bot_id: PositiveCounter
 
 
 class TelegramDeliveryWorkItem(TelegramIdentity):
+    admission_id: UUID
+    bot_id: PositiveCounter
     turn_id: UUID
     response_attempt_id: UUID
+    work_kind: Literal["SEND_CANDIDATE", "RECOVER_ONLY"]
     draft_text: TextContent
 
 

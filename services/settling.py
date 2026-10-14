@@ -5,31 +5,75 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from uuid import UUID, uuid4, uuid5
 
-from sqlalchemy import and_, exists, func, literal, or_, select, tuple_
+from sqlalchemy import and_, func, literal, or_, select, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.elements import ColumnElement
 
-from core.config import ManagedBinding, Settings
+from core.config import ManagedBinding, Settings, SettlingPolicy
 from core.errors import DomainError
 from db.database import Database
 from models import (
     AgentTurn,
     Conversation,
     Message,
+    SettlingBurst,
     TelegramAdmission,
     TelegramImmediateTurn,
+    TelegramProviderAccount,
     TurnInputMessage,
     WebsiteAdmission,
     WebsiteImmediateTurn,
 )
 from schemas.contracts import Channel, ErrorCode, Principal
 from schemas.managed import MAX_MESSAGES
-from services.common import db_clock, fingerprint, scope_filter
+from services.common import db_clock, fingerprint, message_is_consumed, scope_filter
 from services.history_projection import freeze_website_projection
 
 MAX_BURST_MESSAGES = MAX_MESSAGES
 CANDIDATE_PAGE_SIZE = 100
 _SELECTION_NAMESPACE = UUID("d05d07b0-70a5-4f27-9628-801b852bd49e")
+
+
+async def freeze_admission_membership(
+    session: AsyncSession,
+    conversation: Conversation,
+    policy: SettlingPolicy | None,
+    sequence: int,
+) -> tuple[datetime, UUID | None, str | None, int | None, int | None]:
+    """Freeze one accepted input into the open burst or create a new burst."""
+    burst = await session.scalar(select(SettlingBurst).where(
+        SettlingBurst.conversation_id == conversation.id,
+        SettlingBurst.closed_at.is_(None),
+    ).with_for_update())
+    clock = await db_clock(session)
+    if burst is not None and clock < burst.ready_at:
+        if sequence <= burst.tail_sequence:
+            raise RuntimeError("Settling burst tail is not monotonic")
+        burst.last_input_at = clock
+        burst.tail_sequence = sequence
+        burst.ready_at = min(
+            clock + timedelta(milliseconds=burst.quiet_window_ms), burst.max_cutoff_at
+        )
+        await session.flush()
+        return (clock, burst.id, burst.policy_version,
+                burst.quiet_window_ms, burst.max_wait_ms)
+    if burst is not None:
+        burst.closed_at = burst.ready_at
+    if policy is None:
+        return clock, None, None, None, None
+    version = policy.version
+    quiet_ms = policy.quiet_window_ms
+    max_ms = policy.max_wait_ms
+    cutoff = clock + timedelta(milliseconds=max_ms)
+    burst = SettlingBurst(
+        id=uuid4(), conversation_id=conversation.id, policy_version=version,
+        quiet_window_ms=quiet_ms, max_wait_ms=max_ms, opened_at=clock,
+        max_cutoff_at=cutoff, last_input_at=clock, tail_sequence=sequence,
+        ready_at=min(clock + timedelta(milliseconds=quiet_ms), cutoff), closed_at=None,
+    )
+    session.add(burst)
+    await session.flush()
+    return clock, burst.id, version, quiet_ms, max_ms
 
 
 def _bindings(settings: Settings, channel: Channel) -> tuple[ManagedBinding, ...]:
@@ -75,48 +119,12 @@ async def _record_selection(
         ) for message in selected)
 
 
-def _burst(messages: list[Message], now: datetime) -> tuple[list[Message], datetime] | None:
-    if not messages or messages[0].settling_policy_version is None:
-        return None
-    first = messages[0]
-    quiet_ms = first.settling_quiet_window_ms
-    max_ms = first.settling_max_wait_ms
-    if quiet_ms is None or max_ms is None:
-        return None
-    max_deadline = first.created_at + timedelta(milliseconds=max_ms)
-    quiet_deadline = min(first.created_at + timedelta(milliseconds=quiet_ms), max_deadline)
-    selected = [first]
-    for message in messages[1:MAX_BURST_MESSAGES]:
-        if message.sequence != selected[-1].sequence + 1:
-            break
-        if (message.settling_policy_version != first.settling_policy_version
-                or message.settling_quiet_window_ms != quiet_ms
-                or message.settling_max_wait_ms != max_ms):
-            break
-        if message.created_at >= min(quiet_deadline, max_deadline):
-            break
-        selected.append(message)
-        quiet_deadline = min(message.created_at + timedelta(milliseconds=quiet_ms), max_deadline)
-    deadline = min(quiet_deadline, max_deadline)
-    if now < deadline:
-        return None
-    return selected, deadline
-
-
 async def _pending_messages(session: AsyncSession, conversation_id: UUID) -> list[Message]:
-    assigned = exists(select(TurnInputMessage.message_id).where(
-        TurnInputMessage.message_id == Message.id))
-    in_frozen_legacy_range = exists(select(AgentTurn.id).where(
-        AgentTurn.conversation_id == Message.conversation_id,
-        Message.sequence >= AgentTurn.input_first_sequence,
-        Message.sequence <= AgentTurn.input_last_sequence,
-    ))
     return list((await session.scalars(select(Message).where(
         Message.conversation_id == conversation_id,
         Message.actor == "CUSTOMER",
         Message.direction == "INBOUND",
-        ~assigned,
-        ~in_frozen_legacy_range,
+        ~message_is_consumed(),
     ).order_by(Message.sequence).limit(MAX_BURST_MESSAGES + 1))).all())
 
 
@@ -132,8 +140,12 @@ def _turn_for_selection(
         "input_first_sequence": first.sequence,
         "input_last_sequence": last.sequence,
         "context_last_sequence": last.sequence,
-        "input_revision": last.input_revision,
+        # All eligible members are known before selection; residual chunks must
+        # share the same selection-time input freshness snapshot.
+        "input_revision": conversation.input_revision,
         "settling_revision": conversation.settling_revision,
+        "settling_burst_id": (str(first.settling_burst_id)
+                              if first.settling_burst_id is not None else None),
         "authority_revision": conversation.authority_revision,
         "message_ids": [str(message.id) for message in selected],
         "policy_version": first.settling_policy_version,
@@ -142,8 +154,9 @@ def _turn_for_selection(
         id=uuid4(), conversation_id=conversation.id, selection_key=selection_key,
         creation_fingerprint=fingerprint(boundaries),
         input_first_sequence=first.sequence, input_last_sequence=last.sequence,
-        context_last_sequence=last.sequence, input_revision=last.input_revision,
+        context_last_sequence=last.sequence, input_revision=conversation.input_revision,
         settling_revision=conversation.settling_revision,
+        settling_burst_id=first.settling_burst_id,
         authority_revision=conversation.authority_revision, status="PENDING", claim_epoch=0,
         operation_refs=[], created_at=clock,
     )
@@ -207,18 +220,19 @@ async def select_settled_turn(
     scope = _binding_clause(bindings)
     if scope is None:
         return None
-    pending = ~exists(select(TurnInputMessage.message_id).where(
-        TurnInputMessage.message_id == Message.id)) & ~exists(select(AgentTurn.id).where(
-            AgentTurn.conversation_id == Message.conversation_id,
-            Message.sequence >= AgentTurn.input_first_sequence,
-            Message.sequence <= AgentTurn.input_last_sequence,
-        ))
+    pending = ~message_is_consumed()
+    async with database.session_factory() as session:
+        discovery_clock = await db_clock(session)
     candidate_rows = select(
         Conversation.id.label("conversation_id"),
-        func.min(Message.created_at).label("oldest_created_at"),
-    ).join(Message, Message.conversation_id == Conversation.id).where(
+        func.min(SettlingBurst.ready_at).label("oldest_ready_at"),
+    ).join(Message, Message.conversation_id == Conversation.id).join(
+        SettlingBurst, and_(SettlingBurst.id == Message.settling_burst_id,
+                            SettlingBurst.conversation_id == Message.conversation_id),
+    ).where(
         Message.actor == "CUSTOMER", Message.direction == "INBOUND",
-        Message.settling_policy_version.is_not(None), pending,
+        Message.settling_burst_id.is_not(None), pending,
+        SettlingBurst.ready_at <= discovery_clock,
         scope_filter(principal), scope,
     ).group_by(Conversation.id).subquery()
     cursor: tuple[datetime, UUID] | None = None
@@ -226,75 +240,137 @@ async def select_settled_turn(
         async with database.session_factory() as session, session.begin():
             page_query = select(
                 candidate_rows.c.conversation_id,
-                candidate_rows.c.oldest_created_at,
+                candidate_rows.c.oldest_ready_at,
             )
             if cursor is not None:
                 page_query = page_query.where(tuple_(
-                    candidate_rows.c.oldest_created_at,
+                    candidate_rows.c.oldest_ready_at,
                     candidate_rows.c.conversation_id,
                 ) > tuple_(literal(cursor[0]), literal(cursor[1])))
             page = list((await session.execute(
-                page_query.order_by(candidate_rows.c.oldest_created_at,
+                page_query.order_by(candidate_rows.c.oldest_ready_at,
                                     candidate_rows.c.conversation_id)
                 .limit(CANDIDATE_PAGE_SIZE)
             )).all())
         if not page:
             return None
 
-        for conversation_id, _oldest_created_at in page:
-            async with database.session_factory() as session, session.begin():
-                conversation = await session.scalar(select(Conversation).where(
-                    Conversation.id == conversation_id, scope_filter(principal)
-                ).with_for_update(skip_locked=True).execution_options(populate_existing=True))
-                if conversation is None or conversation.control_mode != "AGENT":
-                    continue
-                active = await session.scalar(select(AgentTurn).where(
-                    AgentTurn.conversation_id == conversation.id,
-                    AgentTurn.status.in_(("PENDING", "CLAIMED")),
-                ).with_for_update())
-                if active is not None:
-                    continue
-                rows = await _pending_messages(session, conversation.id)
-                if not rows or rows[0].settling_policy_version is None:
-                    continue
-                channel = Channel(conversation.channel)
-                channel_bindings = _bindings(settings, channel)
-                binding = next((candidate for candidate in channel_bindings
-                                if candidate.owner_id == conversation.owner_id
-                                and candidate.integration_id == conversation.integration_id), None)
-                if binding is None:
-                    continue
-                if channel == Channel.TELEGRAM:
-                    admission = await session.scalar(select(TelegramAdmission).where(
-                        TelegramAdmission.canonical_message_id == rows[0].id,
-                        TelegramAdmission.conversation_id == conversation.id,
-                        TelegramAdmission.route == "MANAGED",
-                    ))
-                    if admission is None or admission.agent_id != binding.agent_id:
+        for conversation_id, _oldest_ready_at in page:
+            try:
+                async with database.session_factory() as session, session.begin():
+                    conversation = await session.scalar(select(Conversation).where(
+                        Conversation.id == conversation_id, scope_filter(principal)
+                    ).with_for_update(skip_locked=True).execution_options(populate_existing=True))
+                    if conversation is None or conversation.control_mode != "AGENT":
                         continue
-                elif channel == Channel.WEBSITE_WIDGET:
-                    admission = await session.scalar(select(WebsiteAdmission).where(
-                        WebsiteAdmission.canonical_message_id == rows[0].id,
-                        WebsiteAdmission.conversation_id == conversation.id,
-                        WebsiteAdmission.route == "MANAGED",
-                    ))
-                    if admission is None or admission.agent_id != binding.agent_id:
+                    active = await session.scalar(select(AgentTurn).where(
+                        AgentTurn.conversation_id == conversation.id,
+                        AgentTurn.status.in_(("PENDING", "CLAIMED")),
+                    ).with_for_update())
+                    if active is not None:
                         continue
-                else:
+                    rows = await _pending_messages(session, conversation.id)
+                    if not rows or rows[0].settling_burst_id is None:
+                        continue
+                    channel = Channel(conversation.channel)
+                    binding = next((candidate for candidate in _bindings(settings, channel)
+                                    if candidate.owner_id == conversation.owner_id
+                                    and candidate.integration_id ==
+                                    conversation.integration_id), None)
+                    if binding is None:
+                        continue
+                    burst = await session.scalar(select(SettlingBurst).where(
+                        SettlingBurst.id == rows[0].settling_burst_id,
+                        SettlingBurst.conversation_id == conversation.id,
+                    ).with_for_update().execution_options(populate_existing=True))
+                    if burst is None:
+                        raise DomainError(ErrorCode.VALIDATION_ERROR)
+                    clock = await db_clock(session)
+                    if burst.closed_at is None:
+                        if clock < burst.ready_at:
+                            continue
+                        burst.closed_at = burst.ready_at
+                    if clock < burst.closed_at:
+                        continue
+                    due_messages: list[Message] = []
+                    for message in rows:
+                        if message.settling_burst_id != burst.id:
+                            break
+                        if (message.settling_policy_version != burst.policy_version
+                                or message.settling_quiet_window_ms != burst.quiet_window_ms
+                                or message.settling_max_wait_ms != burst.max_wait_ms):
+                            raise DomainError(ErrorCode.VALIDATION_ERROR)
+                        if due_messages and message.sequence != due_messages[-1].sequence + 1:
+                            break
+                        due_messages.append(message)
+                        if len(due_messages) == MAX_BURST_MESSAGES:
+                            break
+                    if not due_messages:
+                        continue
+                    if channel == Channel.TELEGRAM:
+                        account = await session.scalar(select(TelegramProviderAccount).where(
+                            TelegramProviderAccount.owner_id == conversation.owner_id,
+                            TelegramProviderAccount.integration_id == conversation.integration_id,
+                        ))
+                        admissions: list[TelegramAdmission] = []
+                        for message in due_messages:
+                            admission = await session.scalar(select(TelegramAdmission).where(
+                                TelegramAdmission.canonical_message_id == message.id,
+                                TelegramAdmission.conversation_id == conversation.id,
+                            ))
+                            if (admission is None or admission.route != "MANAGED"
+                                    or admission.owner_id != conversation.owner_id
+                                    or admission.integration_id != conversation.integration_id
+                                    or admission.agent_id != binding.agent_id
+                                    or admission.provider_thread_id !=
+                                    conversation.provider_thread_id
+                                    or admission.chat_id != conversation.provider_thread_id
+                                    or admission.sender_id != admission.chat_id
+                                    or admission.provider_event_id != (
+                                        f"b{admission.bot_id}c{admission.chat_id}m{admission.message_id}"
+                                    )):
+                                raise DomainError(ErrorCode.VALIDATION_ERROR)
+                            admissions.append(admission)
+                        if (account is None or account.state != "BOUND"
+                                or admissions[0].bot_id != account.bot_id):
+                            continue
+                        if any(item.bot_id != admissions[0].bot_id for item in admissions):
+                            raise DomainError(ErrorCode.VALIDATION_ERROR)
+                    elif channel == Channel.WEBSITE_WIDGET:
+                        for message in due_messages:
+                            admission = await session.scalar(select(WebsiteAdmission).where(
+                                WebsiteAdmission.canonical_message_id == message.id,
+                                WebsiteAdmission.conversation_id == conversation.id,
+                            ))
+                            try:
+                                session_id_matches = (
+                                    admission is not None and admission.session_id ==
+                                    UUID(conversation.provider_thread_id)
+                                )
+                            except ValueError:
+                                session_id_matches = False
+                            if (admission is None or admission.route != "MANAGED"
+                                    or admission.agent_id != binding.agent_id
+                                    or admission.owner_id != conversation.owner_id
+                                    or admission.integration_id != conversation.integration_id
+                                    or not session_id_matches):
+                                raise DomainError(ErrorCode.VALIDATION_ERROR)
+                    else:
+                        continue
+                    selected = await _maximal_projectable_prefix(
+                        session, conversation, due_messages, binding
+                    )
+                    if not selected:
+                        # A candidate-specific invalid projection remains durable
+                        # and cannot prevent later Conversations from making progress.
+                        continue
+                    return await _create_turn(session, conversation, selected, binding,
+                                              channel, clock)
+            except DomainError as exc:
+                if exc.code == ErrorCode.VALIDATION_ERROR:
+                    # This candidate transaction has rolled back before advancing.
                     continue
-                clock = await db_clock(session)
-                choice = _burst(rows, clock)
-                if choice is None:
-                    continue
-                due_messages, _deadline = choice
-                selected = await _maximal_projectable_prefix(
-                    session, conversation, due_messages, binding
-                )
-                if not selected:
-                    # A candidate-specific invalid projection remains durable and
-                    # cannot prevent later Conversations from making progress.
-                    continue
-                return await _create_turn(session, conversation, selected, binding, channel, clock)
+                raise
 
         if len(page) < CANDIDATE_PAGE_SIZE:
             return None

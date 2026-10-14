@@ -164,6 +164,52 @@ async def test_concurrent_competing_turn_creates_keep_one_complete_mapping(h, sq
         assert await connection.scalar(text("SELECT count(*) FROM turn_input_messages")) == 1
 
 
+async def test_actual_turn_input_primary_key_conflict_is_translated_after_rollback(h, sql):
+    accepted = await h.ingest()
+    conversation_id = accepted["conversation"]["id"]
+    function_name = "goal5_inject_duplicate_turn_input_owner_fn"
+    trigger_name = "goal5_inject_duplicate_turn_input_owner"
+    async with sql.connect() as connection:
+        primary_key = await connection.scalar(text(
+            "SELECT conname FROM pg_constraint WHERE conrelid='turn_input_messages'::regclass "
+            "AND contype='p'"
+        ))
+    assert primary_key == "pk_turn_input_messages"
+    async with sql.begin() as connection:
+        await connection.execute(text(f"""
+            CREATE FUNCTION {function_name}() RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN
+              IF pg_trigger_depth() = 1 THEN
+                INSERT INTO turn_input_messages(message_id,conversation_id,turn_id,sequence,ordinal)
+                VALUES(NEW.message_id,NEW.conversation_id,NEW.turn_id,NEW.sequence,NEW.ordinal);
+              END IF;
+              RETURN NEW;
+            END $$
+        """))
+        await connection.execute(text(
+            f"CREATE TRIGGER {trigger_name} BEFORE INSERT ON turn_input_messages "
+            f"FOR EACH ROW EXECUTE FUNCTION {function_name}()"
+        ))
+    try:
+        response = await h.call(
+            "POST", f"/conversations/{conversation_id}/turns",
+            dict(selection_key=str(uuid4()), input_first_sequence=1, input_last_sequence=1,
+                 expected_input_revision=1, expected_authority_revision=0),
+        )
+        assert response.status_code == 409, response.text
+        assert response.json()["detail"]["code"] == "TURN_SELECTION_CONFLICT"
+    finally:
+        async with sql.begin() as connection:
+            await connection.execute(text(
+                f"DROP TRIGGER IF EXISTS {trigger_name} ON turn_input_messages"
+            ))
+            await connection.execute(text(f"DROP FUNCTION IF EXISTS {function_name}()"))
+
+    async with sql.connect() as connection:
+        assert await connection.scalar(text("SELECT count(*) FROM agent_turns")) == 0
+        assert await connection.scalar(text("SELECT count(*) FROM turn_input_messages")) == 0
+
+
 async def test_recovery_rotates_proof_same_identity_and_stale_owner_rejected(h, sql):
     accepted = await h.ingest()
     turn, _ = await h.select(accepted)

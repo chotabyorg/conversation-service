@@ -9,6 +9,7 @@ import subprocess
 import sys
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -22,9 +23,36 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 
+from services.common import (
+    advance_test_database_clock,
+    reset_test_database_clock,
+    set_test_database_clock,
+)
+
 ROOT = Path(__file__).resolve().parents[1]
 PREFIX = "/internal/v1"
 LOCK_EVIDENCE: list[dict[str, Any]] = []
+
+
+@dataclass
+class TestDatabaseClock:
+    current: datetime
+
+    def advance_to(self, value: datetime) -> None:
+        if value < self.current:
+            raise ValueError("Test database clock cannot move backwards")
+        self.current = value
+        advance_test_database_clock(value)
+
+
+@pytest.fixture
+def test_database_clock() -> TestDatabaseClock:
+    clock = TestDatabaseClock(datetime.now(UTC))
+    token = set_test_database_clock(clock.current)
+    try:
+        yield clock
+    finally:
+        reset_test_database_clock(token)
 
 
 @pytest.fixture(scope="session")
@@ -113,8 +141,10 @@ async def sql(database_url: str):
         await connection.execute(
             text(
                 "TRUNCATE telegram_response_attempts, telegram_immediate_turns, "
-                "telegram_admissions, delivery_reconciliations, delivery_attempts, "
-                "agent_turns, messages, inbound_events, conversations CASCADE"
+                "telegram_admissions, telegram_provider_accounts, settling_bursts, "
+                "website_response_attempts, website_immediate_turns, website_admissions, "
+                "delivery_reconciliations, delivery_attempts, agent_turns, messages, "
+                "inbound_events, conversations CASCADE"
             )
         )
     try:
