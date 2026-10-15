@@ -84,7 +84,7 @@ class BoundaryMiddleware:
             )
             await safe_send({"type": "http.response.body", "body": body})
 
-        def has_duplicate_json_keys(raw: bytes) -> bool:
+        def has_duplicate_or_overdeep_json(raw: bytes) -> bool:
             def unique(pairs: list[tuple[str, object]]) -> dict[str, object]:
                 value: dict[str, object] = {}
                 for key, item in pairs:
@@ -99,6 +99,8 @@ class BoundaryMiddleware:
                 return str(exc) == "duplicate key"
             except (UnicodeDecodeError, json.JSONDecodeError):
                 return False
+            except RecursionError:
+                return True
             return False
 
         try:
@@ -256,7 +258,7 @@ class BoundaryMiddleware:
                         if k.lower() == b"content-type"
                     )
                 )
-                and has_duplicate_json_keys(bytes(body))
+                and has_duplicate_or_overdeep_json(bytes(body))
             ):
                 await reject(ErrorCode.VALIDATION_ERROR)
                 return

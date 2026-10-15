@@ -1884,6 +1884,25 @@ async def test_handoff_private_auth_precedes_bad_bodies_and_duplicate_credential
         assert await connection.scalar(text("SELECT count(*) FROM inbox_grant_scopes")) == 0
 
 
+@pytest.mark.asyncio
+async def test_authenticated_overdeep_json_is_rejected_without_grant_mutation(
+    inbox_harness, sql
+):
+    deeply_nested = b'{"nested":' + b"[" * 1200 + b"0" + b"]" * 1200 + b"}"
+    response = await inbox_harness.client.post(
+        "/internal/v1/inbox-grants/provision",
+        content=deeply_nested,
+        headers={
+            **inbox_harness.cp_lifecycle_headers,
+            "Content-Type": "application/json",
+        },
+    )
+    assert response.status_code == 422, response.text
+    assert response.json()["detail"]["code"] == "VALIDATION_ERROR"
+    async with sql.connect() as connection:
+        assert await connection.scalar(text("SELECT count(*) FROM inbox_grant_scopes")) == 0
+
+
 @pytest.mark.parametrize("invalid_version", [True, 1.0, "1"])
 @pytest.mark.asyncio
 async def test_new_lifecycle_and_telegram_versions_reject_coercions_without_mutation(
