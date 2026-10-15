@@ -45,6 +45,21 @@ def install_loopback_guard() -> None:
 
     socket.socket.connect = guarded_connect  # type: ignore[method-assign]
     socket.socket.connect_ex = guarded_connect_ex  # type: ignore[method-assign]
+    if os.name == "nt":
+        original_pair = socket.socketpair
+
+        def local_socketpair(*args, **kwargs):
+            # Winsock implements this address-free primitive with loopback TCP.
+            # Normal sockets remain restricted to the fixture endpoint list.
+            socket.socket.connect = original_connect
+            socket.socket.connect_ex = original_connect_ex
+            try:
+                return original_pair(*args, **kwargs)
+            finally:
+                socket.socket.connect = guarded_connect
+                socket.socket.connect_ex = guarded_connect_ex
+
+        socket.socketpair = local_socketpair
     probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
         try:
