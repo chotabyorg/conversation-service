@@ -493,8 +493,10 @@ async def end(database: Database, principal: Principal, request: CallEnd,
 
 async def close_call(session: AsyncSession, conversation: Conversation, call: VoiceCall,
                      clock: datetime, reason: str) -> None:
+    from services.authority import advance_authority
+
     call.ended_at, call.end_reason = clock, reason
-    conversation.authority_revision += 1
+    advance_authority(conversation)
     conversation.updated_at = clock
     pending = (await session.scalars(select(VoiceResponse).where(
         VoiceResponse.call_id == call.id, VoiceResponse.send_authorized.is_(True),

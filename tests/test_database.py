@@ -53,6 +53,15 @@ async def test_migrated_catalog_constraints_indexes_utc_and_exact_collation(h, s
         "uq_conversation_identity",
         "uq_conversation_id_scope",
         "ck_conversation_counters",
+        "ck_conversation_authority_input_floor",
+        "ck_effect_permit_namespace",
+        "ck_effect_permit_operation_fingerprint",
+        "ck_effect_permit_request_fingerprint",
+        "ck_effect_permit_floors",
+        "fk_effect_permit_conversation",
+        "fk_effect_permit_turn",
+        "fk_effect_permit_origin_turn",
+        "uq_effect_permit_operation",
         "uq_inbound_event_scope",
         "uq_inbound_event_id_conversation",
         "fk_inbound_event_conversation_scope",
@@ -93,6 +102,12 @@ async def test_migrated_catalog_constraints_indexes_utc_and_exact_collation(h, s
                 )
             ).all()
         )
+        assert {
+            "ix_effect_permit_turn",
+            "ix_settling_burst_conversation_tail",
+            "ix_message_burst_sequence",
+            "ix_turn_conversation_settling_burst",
+        } <= definitions.keys()
         active = definitions["uq_turn_one_active"]
         assert (
             "UNIQUE" in active
@@ -129,10 +144,11 @@ async def test_migrated_catalog_constraints_indexes_utc_and_exact_collation(h, s
             "voice_inputs",
             "voice_responses",
             "voice_playback_events",
+            "external_effect_permits",
         }
         assert (
             await connection.scalar(text("SELECT version_num FROM alembic_version"))
-            == "0007_voice_bridge"
+            == "0008_business_effect_permits"
         )
         timestamps = (
             (
@@ -373,7 +389,7 @@ async def test_missing_or_wrong_revision_and_missing_table_are_not_ready(h, sql)
     finally:
         async with sql.begin() as connection:
             await connection.execute(
-                text("UPDATE alembic_version SET version_num='0007_voice_bridge'")
+                text("UPDATE alembic_version SET version_num='0008_business_effect_permits'")
             )
     async with sql.begin() as connection:
         await connection.execute(

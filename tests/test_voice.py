@@ -101,7 +101,16 @@ async def test_complete_call_history_and_no_repeat_send(vh):
         rows = list((await session.scalars(select(Message).order_by(Message.sequence))).all())
         assert [row.actor for row in rows] == ["CUSTOMER", "AGENT"]
         assert (await session.scalar(select(DeliveryAttempt.status))) == "PROVIDER_ACCEPTED"
-    assert (await post(vh, "calls/end", reason="DISCONNECTED")).status_code == 200
+    ended = await post(vh, "calls/end", reason="DISCONNECTED")
+    assert ended.status_code == 200
+    async with vh["database"].session_factory() as session:
+        conversation = await session.scalar(select(Conversation))
+        assert conversation is not None
+        assert conversation.authority_revision == 1
+        assert (
+            conversation.authority_input_floor_sequence
+            == conversation.last_message_sequence == 2
+        )
     assert (await post(vh, "calls/end", reason="DISCONNECTED")).json()["replayed"]
     assert (await post(vh, "utterances", sequence=2, text="late")).status_code == 409
     assert not await vh["worker"].run_once()
@@ -312,6 +321,91 @@ async def test_call_end_fences_an_unmarked_selected_turn_without_ai(vh):
     async with vh["database"].session_factory() as session:
         turn = await session.get(AgentTurn, turn_id)
         assert turn.status == "FAILED" and turn.managed_dispatch_epoch is None
+
+
+async def test_voice_input_ownership_can_authorize_an_opaque_business_permit(vh):
+    """Voice's immediate TurnInputMessage path follows the same authority proof."""
+    from core.config import AuthPrincipal
+
+    await start(vh)
+    assert (await post(vh, "utterances", sequence=1, text="proposal")).status_code == 200
+    assert await vh["worker"].run_once()
+    async with vh["database"].session_factory() as session:
+        origin = await session.scalar(select(AgentTurn))
+        conversation = await session.scalar(select(Conversation))
+    assert origin is not None and origin.status == "COMPLETED"
+    assert conversation is not None
+
+    business_token = secrets.token_urlsafe(32)
+    business = AuthPrincipal.model_validate({
+        "principal_id": "voice-business-effect",
+        "role": "BUSINESS_EFFECT",
+        "token": business_token,
+        "grants": [{"owner_id": OWNER, "integration_id": INTEGRATION,
+                    "channel": "VOICE", "provider_namespace": "main-chota.voice.v1"}],
+    })
+    app_settings = vh["settings"].model_copy(update={
+        "auth_principals": (*vh["settings"].auth_principals, business),
+    })
+    vh["app"].state.settings = app_settings
+
+    assert (await post(vh, "utterances", sequence=2, text="confirmation")).status_code == 200
+    entered, release = asyncio.Event(), asyncio.Event()
+    original_execute = vh["port"].execute
+
+    async def hold_after_marker(prepared, binding, request_id=""):
+        entered.set()
+        await release.wait()
+        return await original_execute(prepared, binding, request_id)
+
+    vh["port"].execute = hold_after_marker
+    running = asyncio.create_task(vh["worker"].run_once())
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        async with vh["database"].session_factory() as session:
+            current = await session.scalar(select(AgentTurn).where(
+                AgentTurn.status == "CLAIMED"))
+            conversation = await session.get(Conversation, conversation.id)
+        assert current is not None and current.managed_request_fingerprint is not None
+        assert conversation is not None
+        assert await voice.select_turn(
+            vh["database"], vh["worker"].principal, vh["settings"]
+        ) is None
+        context = {
+            "contract_version": 1,
+            "conversation_id": str(conversation.id),
+            "turn_id": str(current.id),
+            "origin_turn_id": str(origin.id),
+            "owner_id": OWNER,
+            "integration_id": str(INTEGRATION),
+            "channel": "VOICE",
+            "agent_id": str(AGENT),
+            "authority_revision": conversation.authority_revision,
+            "managed_request_fingerprint": current.managed_request_fingerprint,
+        }
+        headers = {"X-Service-Token": business_token}
+        eligibility = await vh["client"].post(
+            "/internal/v1/external-effect-eligibility", json=context, headers=headers)
+        assert eligibility.status_code == 200, eligibility.text
+        assert eligibility.json()["eligible"] is True
+        request = {
+            **context,
+            "operation_namespace": "main-chota.ai-business.v1",
+            "operation_id": str(uuid4()),
+            "operation_fingerprint": "d" * 64,
+        }
+        issued = await vh["client"].post(
+            "/internal/v1/external-effect-permits", json=request, headers=headers)
+        assert issued.status_code == 200, issued.text
+        assert issued.json()["replayed"] is False
+    finally:
+        release.set()
+    assert await running
+    replay = await vh["client"].post(
+        "/internal/v1/external-effect-permits", json=request, headers=headers)
+    assert replay.status_code == 200, replay.text
+    assert replay.json()["replayed"] is True
+    assert replay.json()["permit_id"] == issued.json()["permit_id"]
 
 
 async def test_invalid_candidate_does_not_starve_a_later_call(vh):

@@ -136,7 +136,7 @@ Compose binds only `127.0.0.1:55585` (HTTP) and `127.0.0.1:55595` (PostgreSQL),
 using its own internal network rather than the existing microservices network.
 The application image runs as UID 10001 and Compose uses a read-only filesystem.
 Migrations are explicit; startup never substitutes `create_all`. `/ready` succeeds
-only against migration `0006_turn_settling` and the required table queries. `/health`
+only against migration `0008_business_effect_permits` and the required table queries. `/health`
 checks process liveness. Both return bounded public status only.
 
 ## Internal authentication
@@ -161,8 +161,8 @@ registration API. Future production provisioning requires separate integration
 work. Current CP does not yet implement WHATSAPP despite the reserved generic
 identity value here.
 
-Registry roles are `FULL` (existing default), `WEBSITE`, `PROCESSING`, `TELEGRAM`
-and `TELEGRAM_PROCESSING`; narrow
+Registry roles are `FULL` (existing default), `WEBSITE`, `PROCESSING`, `TELEGRAM`,
+`TELEGRAM_PROCESSING`, `VOICE`, `VOICE_PROCESSING` and `BUSINESS_EFFECT`; narrow
 roles cannot call foundation/control/execution/OpenAPI routes. Every business/OpenAPI
 request requires exactly one `X-Service-Token`; malformed,
 duplicated, wrong and missing tokens return the same 401. Authentication precedes
@@ -222,8 +222,14 @@ owner/integration. Migration derives `BOUND` from one historical MANAGED bot and
 granting new sends under conflict. Goal5 policy is optional and defaults off.
 Full demo cutover additionally requires stable frontend message IDs, independent
 review of the [history policy](docs/history-projection.md), and a separately
-approved routing gate. Goal4B Telegram and Goal5 settling remain unactivated until
-their independent review and release gates pass.
+approved routing gate. A Business effect permit is an additional private
+Conversation authority boundary for opaque AI Business operations; it does not
+store business plans, parameters, receipts or operation status. The exact contract
+and conservative input-completeness behavior are in
+[external-effect authority](docs/external-effect-authority.md). Settling remains a
+FIFO of separate temporal bursts. Cross-burst catch-up grouping is deferred to a
+bounded follow-up before broad tester rollout; no larger quiet window is used to
+mask accumulated backlog.
 
 Migration `0006_turn_settling` creates durable burst and provider-account state,
 records response send-permission decisions, and backfills input revisions without
@@ -231,3 +237,7 @@ assigning settling policy retroactively. It refuses downgrade while retained
 burst ownership, supersede or send-permission evidence, settling fences, multiple
 response attempts, or non-reconstructible ownership/account history depends on the
 new schema. See the migration details in [durable turn settling](docs/turn-settling.md).
+Migration `0008_business_effect_permits` adds the authority input floor and
+append-only opaque effect permits. Existing nonzero authority epochs are backfilled
+to their current message tail, so their historical customer inputs cannot be
+reinterpreted as fresh business authority after upgrade.

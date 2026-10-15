@@ -274,7 +274,7 @@ class Principal(Contract):
     model_config = ConfigDict(extra="forbid", frozen=True)
     principal_id: WorkerRef
     role: Literal["FULL", "WEBSITE", "PROCESSING", "TELEGRAM", "TELEGRAM_PROCESSING",
-                  "VOICE", "VOICE_PROCESSING"] = "FULL"
+                  "VOICE", "VOICE_PROCESSING", "BUSINESS_EFFECT"] = "FULL"
     grants: tuple[ScopeGrant, ...] = Field(min_length=1, max_length=64)
 
 

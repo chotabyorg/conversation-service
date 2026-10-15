@@ -116,6 +116,9 @@ class Conversation(Base):
     authority_revision: Mapped[int] = mapped_column(
         BigInteger, default=0, server_default=sql_text("0")
     )
+    authority_input_floor_sequence: Mapped[int] = mapped_column(
+        BigInteger, default=0, server_default=sql_text("0")
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=sql_text("clock_timestamp()")
     )
@@ -148,8 +151,9 @@ class Conversation(Base):
         CheckConstraint(
             (
                 "last_message_sequence >= 0 AND input_revision >= 0 AND settling_revision >= 0 AND "
-                "input_revision <= last_message_sequence AND authority_revision >= "
-                "0"
+                "input_revision <= last_message_sequence AND authority_revision >= 0 AND "
+                "authority_input_floor_sequence >= 0 AND "
+                "authority_input_floor_sequence <= last_message_sequence"
             ),
             name="ck_conversation_counters",
         ),
@@ -300,6 +304,7 @@ class Message(Base):
             "source_inbound_event_id IS NULL OR (actor = 'CUSTOMER' AND direction = 'INBOUND')",
             name="ck_message_source_actor",
         ),
+        Index("ix_message_burst_sequence", "conversation_id", "settling_burst_id", "sequence"),
     )
 
 
@@ -334,6 +339,8 @@ class SettlingBurst(Base):
         Index("uq_settling_burst_open", "conversation_id", unique=True,
               postgresql_where=sql_text("closed_at IS NULL")),
         Index("ix_settling_burst_due", "ready_at", "conversation_id"),
+        Index("ix_settling_burst_conversation_tail", "conversation_id",
+              sql_text("tail_sequence DESC")),
     )
 
 
@@ -450,6 +457,7 @@ class AgentTurn(Base):
             unique=True,
             postgresql_where=sql_text("status IN ('PENDING','CLAIMED')"),
         ),
+        Index("ix_turn_conversation_settling_burst", "conversation_id", "settling_burst_id"),
     )
 
 
@@ -478,6 +486,48 @@ class TurnInputMessage(Base):
         ),
         CheckConstraint("sequence >= 1 AND ordinal >= 0", name="ck_turn_input_position"),
         Index("ix_turn_input_conversation_sequence", "conversation_id", "sequence"),
+    )
+
+
+class ExternalEffectPermit(Base):
+    """Immutable Conversation-owned permission for one opaque Business operation."""
+
+    __tablename__ = "external_effect_permits"
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    conversation_id: Mapped[UUID] = mapped_column(nullable=False)
+    turn_id: Mapped[UUID] = mapped_column(nullable=False)
+    origin_turn_id: Mapped[UUID] = mapped_column(nullable=False)
+    operation_namespace: Mapped[str] = mapped_column(String(64, collation="C"), nullable=False)
+    operation_id: Mapped[UUID] = mapped_column(nullable=False)
+    operation_fingerprint: Mapped[str] = mapped_column(CHAR(64), nullable=False)
+    request_fingerprint: Mapped[str] = mapped_column(CHAR(64), nullable=False)
+    agent_id: Mapped[UUID] = mapped_column(nullable=False)
+    authority_revision: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    authority_input_floor_sequence: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    split_input_floor_sequence: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    issued_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    __table_args__ = (
+        UniqueConstraint("id", "conversation_id", name="uq_effect_permit_id_conversation"),
+        UniqueConstraint("operation_namespace", "operation_id",
+                         name="uq_effect_permit_operation"),
+        ForeignKeyConstraint(["conversation_id"], ["conversations.id"],
+                             name="fk_effect_permit_conversation", ondelete="RESTRICT"),
+        ForeignKeyConstraint(["turn_id", "conversation_id"],
+                             ["agent_turns.id", "agent_turns.conversation_id"],
+                             name="fk_effect_permit_turn", ondelete="RESTRICT"),
+        ForeignKeyConstraint(["origin_turn_id", "conversation_id"],
+                             ["agent_turns.id", "agent_turns.conversation_id"],
+                             name="fk_effect_permit_origin_turn", ondelete="RESTRICT"),
+        CheckConstraint("operation_namespace = 'main-chota.ai-business.v1'",
+                        name="ck_effect_permit_namespace"),
+        CheckConstraint("operation_fingerprint ~ '^[0-9a-f]{64}$'",
+                        name="ck_effect_permit_operation_fingerprint"),
+        CheckConstraint("request_fingerprint ~ '^[0-9a-f]{64}$'",
+                        name="ck_effect_permit_request_fingerprint"),
+        CheckConstraint("authority_revision >= 0 AND authority_input_floor_sequence >= 0 "
+                        "AND split_input_floor_sequence >= 0",
+                        name="ck_effect_permit_floors"),
+        Index("ix_effect_permit_turn", "conversation_id", "turn_id", "issued_at"),
     )
 
 

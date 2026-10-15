@@ -336,6 +336,8 @@ async def test_settled_inputs_outside_window_form_later_turns(telegram_harness, 
 async def test_byte_bounded_burst_splits_maximal_prefix_and_later_work_progresses(
     telegram_harness, sql
 ):
+    from core.config import AuthPrincipal
+
     h = telegram_harness
     # Admissions are real HTTP transactions; allow the full 33-message setup to
     # finish inside max_wait so this test isolates byte splitting.
@@ -370,31 +372,87 @@ async def test_byte_bounded_burst_splits_maximal_prefix_and_later_work_progresse
     assert len(large_ids) == 33 and later_id is not None
     await _advance_to_due(sql)
 
-    port = DeterministicManagedPort()
-    worker = TelegramWorker(h["database"], settings, port)
-    assert await worker.run_once() is True
-    first = port.prepared[0].request
-    # The actual ManagedTurn v2 validator accepts 32 messages at the text byte
-    # cap; the 33rd canonical Message remains pending without changing identity.
-    assert len(first.selected_input_message_ids) == 32
-    assert first.selected_input_message_ids == tuple(large_ids[:32])
-    assert await worker.run_once() is True
-    second = port.prepared[1].request
-    assert second.selected_input_message_ids == (
-        large_ids[32],
+    business_token = secrets.token_urlsafe(32)
+    business = AuthPrincipal(
+        principal_id="projection-test-business-effect",
+        role="BUSINESS_EFFECT",
+        token=business_token,
+        grants=(settings.auth_principals[0].grants[0],),
     )
+    settings = settings.model_copy(update={
+        "auth_principals": (*settings.auth_principals, business),
+    })
+    _install_settings(h, settings)
+    headers = {"X-Service-Token": business_token}
+
+    async def assert_chunk_denied(expected_ids: tuple[UUID, ...]) -> None:
+        port = PausingManagedPort()
+        worker = TelegramWorker(h["database"], settings, port)
+        running = asyncio.create_task(worker.run_once())
+        try:
+            await asyncio.wait_for(port.started.wait(), timeout=8)
+            async with h["database"].session_factory() as session:
+                current = await session.scalar(select(AgentTurn).where(
+                    AgentTurn.status == "CLAIMED"))
+                conversation = (await session.get(Conversation, current.conversation_id)
+                                if current is not None else None)
+                selected_ids = (list((await session.scalars(select(
+                    TurnInputMessage.message_id).where(
+                        TurnInputMessage.turn_id == current.id
+                    ).order_by(TurnInputMessage.sequence))).all())
+                    if current is not None else [])
+            assert current is not None and conversation is not None
+            assert tuple(selected_ids) == expected_ids
+            context = {
+                "contract_version": 1,
+                "conversation_id": str(conversation.id),
+                "turn_id": str(current.id),
+                # Initial-intent WRITE_SAFE uses the selected Turn as origin.
+                "origin_turn_id": str(current.id),
+                "owner_id": conversation.owner_id,
+                "integration_id": str(conversation.integration_id),
+                "channel": conversation.channel,
+                "agent_id": str(settings.managed_ai_bindings[0].agent_id),
+                "authority_revision": current.authority_revision,
+                "managed_request_fingerprint": current.managed_request_fingerprint,
+            }
+            eligibility = await h["client"].post(
+                "/internal/v1/external-effect-eligibility", json=context, headers=headers,
+            )
+            assert eligibility.status_code == 200, eligibility.text
+            assert eligibility.json()["eligible"] is False
+            assert eligibility.json()["reason"] == "ORIGIN_INCOMPLETE"
+            permit = await h["client"].post(
+                "/internal/v1/external-effect-permits",
+                json={
+                    **context,
+                    "operation_namespace": "main-chota.ai-business.v1",
+                    "operation_id": str(uuid4()),
+                    "operation_fingerprint": "b" * 64,
+                },
+                headers=headers,
+            )
+            assert permit.status_code == 409, permit.text
+            assert permit.json()["detail"] == {
+                "code": "EXTERNAL_EFFECT_DENIED", "reason": "ORIGIN_INCOMPLETE"
+            }
+        finally:
+            port.release.set()
+        assert await running
+
+    # The byte-cap chunks are individually processable Turns, but neither
+    # represents the complete durable 33-message burst for authorization.
+    await assert_chunk_denied(tuple(large_ids[:32]))
+    await assert_chunk_denied((large_ids[32],))
+
     # Recreate the worker to model restart between the byte-split Turns. The
     # later due Conversation remains visible after the oversized candidate.
+    port = DeterministicManagedPort()
     restarted = TelegramWorker(h["database"], settings, port)
     assert await restarted.run_once() is True
-    third = port.prepared[2].request
+    third = port.prepared[0].request
     assert third.selected_input_message_ids == (later_id,)
     assert await restarted.run_once() is False
-    all_selected = [message_id for prepared in port.prepared
-                    for message_id in prepared.request.selected_input_message_ids]
-    assert len(all_selected) == 34
-    assert len(set(all_selected)) == 34
-    assert len(port.prepared) == 3
     async with h["database"].session_factory() as session, session.begin():
         rows = (await session.scalars(select(TurnInputMessage).order_by(
             TurnInputMessage.sequence))).all()
@@ -442,6 +500,387 @@ async def test_message_count_and_byte_limits_both_bound_a_257_message_burst(
         rows = (await session.scalars(select(TurnInputMessage).order_by(
             TurnInputMessage.sequence))).all()
     assert len(rows) == 257 and len({row.message_id for row in rows}) == 257
+
+
+@pytest.mark.asyncio
+async def test_latest_input_fence_catches_late_stamped_m2_m3_and_allows_m4(
+    telegram_harness, sql
+):
+    """Separate temporal bursts retain late revisions; only the latest input can authorize."""
+    from core.config import AuthPrincipal
+
+    h = telegram_harness
+    settings = _policy_settings(h["settings"], quiet_ms=10, max_wait_ms=30_000)
+    _install_settings(h, settings)
+    first = await telegram_admit(
+        h["client"], h["gateway_headers"], message_id=7, update_id=55,
+    )
+    assert first.status_code == 200
+    await _advance_to_due(sql, sequences=[1])
+
+    # Keep T1 in its real managed execution while M2/M3/M4 arrive in three
+    # separately settled temporal windows. No assistant boundary intervenes.
+    t1_port = PausingManagedPort()
+    t1_running = asyncio.create_task(
+        TelegramWorker(h["database"], settings, t1_port).run_once()
+    )
+    await asyncio.wait_for(t1_port.started.wait(), timeout=8)
+    async with h["database"].session_factory() as session:
+        t1 = await session.scalar(select(AgentTurn).where(AgentTurn.status == "CLAIMED"))
+        conversation = (await session.get(Conversation, t1.conversation_id)
+                        if t1 is not None else None)
+    assert t1 is not None and conversation is not None
+    assert (t1.input_first_sequence, t1.input_last_sequence) == (1, 1)
+
+    business_token = secrets.token_urlsafe(32)
+    business = AuthPrincipal(
+        principal_id="m234-test-business-effect",
+        role="BUSINESS_EFFECT",
+        token=business_token,
+        grants=(settings.auth_principals[0].grants[0],),
+    )
+    settings = settings.model_copy(update={
+        "auth_principals": (*settings.auth_principals, business),
+    })
+    _install_settings(h, settings)
+    headers = {"X-Service-Token": business_token}
+    binding = settings.managed_ai_bindings[0]
+
+    def context_for(current, conv):
+        return {
+            "contract_version": 1,
+            "conversation_id": str(conv.id),
+            "turn_id": str(current.id),
+            "origin_turn_id": str(t1.id),
+            "owner_id": conv.owner_id,
+            "integration_id": str(conv.integration_id),
+            "channel": conv.channel,
+            "agent_id": str(binding.agent_id),
+            "authority_revision": current.authority_revision,
+            "managed_request_fingerprint": current.managed_request_fingerprint,
+        }
+
+    try:
+        admitted = []
+        for sequence in (2, 3, 4):
+            if sequence > 2:
+                await _advance_to_due(sql, sequences=[sequence - 1])
+            response = await telegram_admit(
+                h["client"], h["gateway_headers"],
+                message_id=100 + sequence, update_id=200 + sequence,
+                text_value=f"separate window M{sequence}",
+            )
+            assert response.status_code == 200, response.text
+            admitted.append(response)
+
+        await _advance_to_due(sql, sequences=[4])
+
+        async with sql.connect() as connection:
+            burst_ids = list((await connection.scalars(text(
+                "SELECT settling_burst_id FROM messages "
+                "WHERE conversation_id=:conversation AND sequence BETWEEN 2 AND 4 "
+                "ORDER BY sequence"
+            ), {"conversation": conversation.id})).all())
+        assert len(burst_ids) == 3 and len(set(burst_ids)) == 3
+
+        # T1's claimed marker is genuine, but a newly accepted customer input
+        # makes a fresh business permit stale while that execution is still live.
+        t1_context = context_for(t1, conversation)
+        t1_eligibility = await h["client"].post(
+            "/internal/v1/external-effect-eligibility", json=t1_context, headers=headers,
+        )
+        assert t1_eligibility.status_code == 200, t1_eligibility.text
+        assert t1_eligibility.json()["eligible"] is False
+        assert t1_eligibility.json()["reason"] == "INPUT_SUPERSEDED"
+        t1_request = {
+            **t1_context,
+            "operation_namespace": "main-chota.ai-business.v1",
+            "operation_id": str(uuid4()),
+            "operation_fingerprint": "1" * 64,
+        }
+        t1_denied = await h["client"].post(
+            "/internal/v1/external-effect-permits", json=t1_request, headers=headers,
+        )
+        assert t1_denied.status_code == 409, t1_denied.text
+        assert t1_denied.json()["detail"] == {
+            "code": "EXTERNAL_EFFECT_DENIED", "reason": "INPUT_SUPERSEDED"
+        }
+    finally:
+        t1_port.release.set()
+    assert await t1_running
+
+    for sequence in (2, 3, 4):
+        port = PausingManagedPort()
+        running = asyncio.create_task(TelegramWorker(h["database"], settings, port).run_once())
+        try:
+            await asyncio.wait_for(port.started.wait(), timeout=8)
+            async with h["database"].session_factory() as session:
+                current = await session.scalar(select(AgentTurn).where(
+                    AgentTurn.status == "CLAIMED"))
+                conv = (await session.get(Conversation, current.conversation_id)
+                        if current is not None else None)
+            assert current is not None and conv is not None
+            assert (current.input_first_sequence, current.input_last_sequence) == (
+                sequence, sequence
+            )
+            assert current.input_revision == conv.input_revision == 4
+            async with h["database"].session_factory() as session:
+                owned = list((await session.scalars(select(TurnInputMessage).where(
+                    TurnInputMessage.turn_id == current.id
+                ).order_by(TurnInputMessage.sequence))).all())
+                canonical = await session.scalar(select(Message.id).where(
+                    Message.conversation_id == conv.id,
+                    Message.sequence == sequence,
+                    Message.actor == "CUSTOMER",
+                    Message.direction == "INBOUND",
+                ))
+            assert len(owned) == 1 and owned[0].sequence == sequence
+            assert owned[0].message_id == canonical
+
+            context = context_for(current, conv)
+            eligibility = await h["client"].post(
+                "/internal/v1/external-effect-eligibility", json=context, headers=headers,
+            )
+            assert eligibility.status_code == 200, eligibility.text
+            if sequence in (2, 3):
+                assert eligibility.json()["eligible"] is False
+                assert eligibility.json()["reason"] == "INPUT_SUPERSEDED"
+                request = {
+                    **context,
+                    "operation_namespace": "main-chota.ai-business.v1",
+                    "operation_id": str(uuid4()),
+                    "operation_fingerprint": str(sequence) * 64,
+                }
+                denied = await h["client"].post(
+                    "/internal/v1/external-effect-permits", json=request, headers=headers,
+                )
+                assert denied.status_code == 409, denied.text
+                assert denied.json()["detail"] == {
+                    "code": "EXTERNAL_EFFECT_DENIED", "reason": "INPUT_SUPERSEDED"
+                }
+            else:
+                assert eligibility.json()["eligible"] is True, eligibility.json()
+                request = {
+                    **context,
+                    "operation_namespace": "main-chota.ai-business.v1",
+                    "operation_id": str(uuid4()),
+                    "operation_fingerprint": "4" * 64,
+                }
+                issued = await h["client"].post(
+                    "/internal/v1/external-effect-permits", json=request, headers=headers,
+                )
+                assert issued.status_code == 200, issued.text
+                assert issued.json()["replayed"] is False
+        finally:
+            port.release.set()
+        assert await running
+
+
+@pytest.mark.asyncio
+async def test_split_burst_chunks_are_ineligible_and_later_turn_reports_split_floor(
+    telegram_harness, sql, test_database_clock, database_url
+):
+    """Actual settled-burst membership prevents authorization across byte/count splits."""
+    from core.config import AuthPrincipal
+
+    h = telegram_harness
+    # Complete an immediate T0 before enabling settling. Its delayed but
+    # provider-accepted response can then interleave canonical AGENT history
+    # between members of the next settling burst.
+    first = await telegram_admit(
+        h["client"], h["gateway_headers"], message_id=7, update_id=55,
+    )
+    assert first.status_code == 200
+    origin_worker = TelegramWorker(
+        h["database"], h["settings"], DeterministicManagedPort()
+    )
+    assert await origin_worker.run_once()
+    async with h["database"].session_factory() as session:
+        origin = await session.scalar(select(AgentTurn))
+    assert origin is not None and origin.status == "COMPLETED"
+
+    settings = _policy_settings(h["settings"], quiet_ms=10, max_wait_ms=30_000)
+    _install_settings(h, settings)
+    first_split = await telegram_admit(
+        h["client"], h["gateway_headers"], message_id=1000, update_id=2000,
+        text_value="first split input",
+    )
+    assert first_split.status_code == 200
+
+    binding = settings.managed_ai_bindings[0]
+    work = await h["client"].post(
+        "/internal/v1/telegram/responses/work",
+        json={"owner_id": binding.owner_id,
+              "integration_id": str(binding.integration_id),
+              "agent_id": str(binding.agent_id), "bot_id": 999},
+        headers=h["gateway_headers"],
+    )
+    assert work.status_code == 200, work.text
+    assert len(work.json()["items"]) == 1
+    item = work.json()["items"][0]
+    assert item["turn_id"] == str(origin.id)
+    identity = {key: item[key] for key in (
+        "owner_id", "integration_id", "agent_id", "provider_thread_id", "provider_event_id",
+    )}
+    begin_body = {**identity, "response_attempt_id": item["response_attempt_id"]}
+    begun = await h["client"].post(
+        "/internal/v1/telegram/responses/begin", json=begin_body,
+        headers=h["gateway_headers"],
+    )
+    assert begun.status_code == 200 and begun.json()["send"] is True
+    completed = await h["client"].post(
+        "/internal/v1/telegram/responses/complete",
+        json={**begin_body, "outcome": "PROVIDER_ACCEPTED",
+              "provider_message_id": "interleaved-agent-history"},
+        headers=h["gateway_headers"],
+    )
+    assert completed.status_code == 200, completed.text
+
+    # 258 CUSTOMER members share one burst. The real canonical AGENT message
+    # occupies sequence 3, so selection first stops after sequence 2, then
+    # reaches the 256-message cap and finally leaves one residual.
+    for index in range(257):
+        response = await telegram_admit(
+            h["client"], h["gateway_headers"], message_id=1001 + index,
+            update_id=2001 + index, text_value="split input",
+        )
+        assert response.status_code == 200
+    await _advance_to_due(sql)
+
+    business_token = secrets.token_urlsafe(32)
+    source_grant = settings.auth_principals[0].grants[0]
+    business = AuthPrincipal(
+        principal_id="split-test-business-effect",
+        role="BUSINESS_EFFECT",
+        token=business_token,
+        grants=(source_grant,),
+    )
+    settings = settings.model_copy(update={
+        "auth_principals": (*settings.auth_principals, business),
+    })
+    _install_settings(h, settings)
+    headers = {"X-Service-Token": business_token}
+
+    async def assert_denied_chunk(
+        expected_first: int, expected_last: int, *, worker_database=None,
+    ) -> None:
+        port = PausingManagedPort()
+        worker = TelegramWorker(worker_database or h["database"], settings, port)
+        running = asyncio.create_task(worker.run_once())
+        try:
+            await asyncio.wait_for(port.started.wait(), timeout=8)
+            async with h["database"].session_factory() as session:
+                current = await session.scalar(select(AgentTurn).where(
+                    AgentTurn.status == "CLAIMED"))
+                conversation = (await session.get(Conversation, current.conversation_id)
+                                if current is not None else None)
+            assert current is not None and conversation is not None
+            assert (current.input_first_sequence, current.input_last_sequence) == (
+                expected_first, expected_last
+            )
+            context = {
+                "contract_version": 1,
+                "conversation_id": str(conversation.id),
+                "turn_id": str(current.id),
+                "origin_turn_id": str(origin.id),
+                "owner_id": conversation.owner_id,
+                "integration_id": str(conversation.integration_id),
+                "channel": conversation.channel,
+                "agent_id": str(binding.agent_id),
+                "authority_revision": current.authority_revision,
+                "managed_request_fingerprint": current.managed_request_fingerprint,
+            }
+            eligibility = await h["client"].post(
+                "/internal/v1/external-effect-eligibility", json=context, headers=headers,
+            )
+            assert eligibility.status_code == 200, eligibility.text
+            assert eligibility.json()["eligible"] is False
+            assert eligibility.json()["reason"] == "INPUT_INCOMPLETE"
+            request = {
+                **context,
+                "operation_namespace": "main-chota.ai-business.v1",
+                "operation_id": str(uuid4()),
+                "operation_fingerprint": "e" * 64,
+            }
+            denied = await h["client"].post(
+                "/internal/v1/external-effect-permits", json=request, headers=headers,
+            )
+            assert denied.status_code == 409, denied.text
+            assert denied.json()["detail"] == {
+                "code": "EXTERNAL_EFFECT_DENIED", "reason": "INPUT_INCOMPLETE"
+            }
+        finally:
+            port.release.set()
+        assert await running
+
+    # Interleaved AGENT history breaks the bounded contiguous range; the rest
+    # reaches the 256-member cap and leaves a residual. Every chunk is partial.
+    await assert_denied_chunk(2, 2)
+    await assert_denied_chunk(4, 259)
+
+    # A restarted worker with a fresh database pool reconstructs the final
+    # residual from durable ownership and still denies it.
+    from db.database import Database
+    restarted_database = Database(database_url)
+    try:
+        await assert_denied_chunk(260, 260, worker_database=restarted_database)
+    finally:
+        await restarted_database.dispose()
+
+    # A later complete input is selected and runnable, but the durable partial
+    # split between origin and current is still reported as an intervening floor.
+    later = await telegram_admit(
+        h["client"], h["gateway_headers"], message_id=5000, update_id=6000,
+        text_value="fresh after split",
+    )
+    assert later.status_code == 200
+    await _advance_to_due(sql)
+    port = PausingManagedPort()
+    worker = TelegramWorker(h["database"], settings, port)
+    running = asyncio.create_task(worker.run_once())
+    try:
+        await asyncio.wait_for(port.started.wait(), timeout=8)
+        async with h["database"].session_factory() as session:
+            current = await session.scalar(select(AgentTurn).where(
+                AgentTurn.status == "CLAIMED"))
+            conversation = (await session.get(Conversation, current.conversation_id)
+                            if current is not None else None)
+        assert current is not None and conversation is not None
+        context = {
+            "contract_version": 1,
+            "conversation_id": str(conversation.id),
+            "turn_id": str(current.id),
+            "origin_turn_id": str(origin.id),
+            "owner_id": conversation.owner_id,
+            "integration_id": str(conversation.integration_id),
+            "channel": conversation.channel,
+            "agent_id": str(binding.agent_id),
+            "authority_revision": current.authority_revision,
+            "managed_request_fingerprint": current.managed_request_fingerprint,
+        }
+        eligibility = await h["client"].post(
+            "/internal/v1/external-effect-eligibility", json=context, headers=headers,
+        )
+        assert eligibility.status_code == 200, eligibility.text
+        assert eligibility.json()["eligible"] is False
+        assert eligibility.json()["reason"] == "INTERVENING_SPLIT"
+        assert eligibility.json()["split_input_floor_sequence"] == 260
+        request = {
+            **context,
+            "operation_namespace": "main-chota.ai-business.v1",
+            "operation_id": str(uuid4()),
+            "operation_fingerprint": "f" * 64,
+        }
+        denied = await h["client"].post(
+            "/internal/v1/external-effect-permits", json=request, headers=headers,
+        )
+        assert denied.status_code == 409, denied.text
+        assert denied.json()["detail"] == {
+            "code": "EXTERNAL_EFFECT_DENIED", "reason": "INTERVENING_SPLIT"
+        }
+    finally:
+        port.release.set()
+    assert await running
 
 
 @pytest.mark.asyncio
