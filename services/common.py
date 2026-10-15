@@ -2,17 +2,42 @@
 
 import hashlib
 import json
+from contextvars import ContextVar, Token
 from datetime import datetime
+from typing import Any
 from uuid import UUID
 
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, exists, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 from sqlalchemy.sql.elements import ColumnElement
 
 from core.errors import DomainError
-from models import AgentTurn, Conversation, DeliveryAttempt
+from models import AgentTurn, Conversation, DeliveryAttempt, Message, TurnInputMessage
 from schemas.contracts import ErrorCode, Principal
+
+_TEST_DATABASE_CLOCK: ContextVar[datetime | None] = ContextVar(
+    "conversation_test_database_clock", default=None
+)
+
+
+def set_test_database_clock(value: datetime) -> Token[datetime | None]:
+    """Install a deterministic clock for the current test/process context."""
+    return _TEST_DATABASE_CLOCK.set(value)
+
+
+def reset_test_database_clock(token: Token[datetime | None]) -> None:
+    _TEST_DATABASE_CLOCK.reset(token)
+
+
+def advance_test_database_clock(value: datetime) -> None:
+    """Advance the explicit test clock; production contexts keep using PostgreSQL."""
+    _TEST_DATABASE_CLOCK.set(value)
+
+
+def current_test_database_clock() -> datetime | None:
+    return _TEST_DATABASE_CLOCK.get()
 
 
 def scope_filter(principal: Principal) -> ColumnElement[bool]:
@@ -27,6 +52,19 @@ def scope_filter(principal: Principal) -> ColumnElement[bool]:
             for grant in principal.grants
         )
     )
+
+
+def message_is_consumed(message: Any = Message) -> ColumnElement[bool]:
+    """Alias-safe global ownership across explicit mappings and retained Turn ranges."""
+    input_owner = aliased(TurnInputMessage)
+    frozen_turn = aliased(AgentTurn)
+    return exists(select(1).select_from(input_owner).where(
+        input_owner.message_id == message.id
+    )) | exists(select(1).select_from(frozen_turn).where(
+        frozen_turn.conversation_id == message.conversation_id,
+        message.sequence >= frozen_turn.input_first_sequence,
+        message.sequence <= frozen_turn.input_last_sequence,
+    ))
 
 
 async def authorized_conversation(
@@ -93,6 +131,9 @@ async def locked_delivery(
 
 async def db_clock(session: AsyncSession) -> datetime:
     # Callers sample only after their final relevant lock has been acquired.
+    test_time = _TEST_DATABASE_CLOCK.get()
+    if test_time is not None:
+        return test_time
     value = await session.scalar(select(func.clock_timestamp()))
     if not isinstance(value, datetime):
         raise RuntimeError("Database clock unavailable")

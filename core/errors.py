@@ -15,6 +15,7 @@ _CONFLICT_MESSAGES = {
     ErrorCode.TURN_SELECTION_CONFLICT: "Turn selection identity has different content.",
     ErrorCode.ACTIVE_TURN_EXISTS: "An active turn already exists.",
     ErrorCode.INPUT_REVISION_CONFLICT: "Input revision is stale.",
+    ErrorCode.SETTLING_REQUIRED: "Settling coordinator must freeze this input.",
     ErrorCode.AUTHORITY_REVISION_CONFLICT: "Authority revision is stale.",
     ErrorCode.CONTROL_MODE_CONFLICT: "Current control mode does not allow this operation.",
     ErrorCode.INVALID_INPUT_BOUNDARY: "Input boundary is unavailable.",

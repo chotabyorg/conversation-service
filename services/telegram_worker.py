@@ -13,6 +13,7 @@ from core.errors import DomainError
 from core.logging import logger
 from db.database import Database
 from schemas.contracts import (
+    Channel,
     ErrorCode,
     TurnClaim,
     TurnExecute,
@@ -22,6 +23,7 @@ from schemas.contracts import (
 )
 from services import managed_execution, telegram, turns
 from services.managed_client import ManagedAIPort
+from services.settling import select_settled_turn
 
 
 class TelegramWorker:
@@ -49,7 +51,13 @@ class TelegramWorker:
                 or self.principal is None):
             self.last_poll = time.monotonic()
             return False
-        turn_id = await telegram.select_immediate(self.database, self.principal, self.settings)
+        turn_id = await select_settled_turn(
+            self.database, self.principal, self.settings, (Channel.TELEGRAM,)
+        )
+        if turn_id is None:
+            turn_id = await telegram.select_immediate(
+                self.database, self.principal, self.settings
+            )
         self.last_poll = time.monotonic()
         if turn_id is None or self.stop_requested.is_set():
             return False

@@ -22,7 +22,7 @@ BOOTSTRAP = Path(__file__).with_name("runtime_bootstrap.py")
 
 
 def private_json(path, value):
-    path.write_text(json.dumps(value))
+    path.write_text(json.dumps(value, default=str))
     path.chmod(0o600)
 
 
@@ -75,6 +75,21 @@ class WebsiteHarness:
     processes: dict = field(default_factory=dict, repr=False)
     handles: list = field(default_factory=list, repr=False)
     replies: dict = field(default_factory=dict)
+    settling_enabled: bool = False
+    settling_quiet_window_ms: int = 300
+    settling_max_wait_ms: int = 1200
+    multiple_scopes: bool = False
+
+    def widget_scopes(self):
+        scopes = [
+            ("widget", self.ids["owner"], self.ids["integration"]),
+            ("other_widget", self.ids["owner"], self.ids["other_integration"]),
+        ]
+        if self.multiple_scopes:
+            scopes.append(("third_widget", self.ids["owner2"], self.ids["integration2"]))
+        return [dict(widget_key=self.tokens[token], owner_id=owner,
+                     integration_id=integration, agent_id=self.ids["agent"])
+                for token, owner, integration in scopes]
 
     def url(self, name):
         return f"http://127.0.0.1:{self.ports[name]}"
@@ -95,15 +110,21 @@ class WebsiteHarness:
         python = self.website_python if name.startswith("website") else Path(sys.executable)
         env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "PYTHONPATH": str(repo),
                "PYTHONUNBUFFERED": "1", "PYTHONDONTWRITEBYTECODE": "1"}
-        grant = {"owner_id": self.ids["owner"], "integration_id": self.ids["integration"],
-                 "channel": "WEBSITE_WIDGET", "provider_namespace":
-                 "main-chota.website-widget.v1"}
-        binding = {key: self.ids[key] for key in ("owner", "integration", "agent")}
-        binding = {key + "_id": value for key, value in binding.items()}
+        scopes = self.widget_scopes()
+        grants = [{"owner_id": item["owner_id"], "integration_id": item["integration_id"],
+                   "channel": "WEBSITE_WIDGET", "provider_namespace":
+                   "main-chota.website-widget.v1"} for item in scopes]
+        bindings = [{"owner_id": item["owner_id"], "integration_id": item["integration_id"],
+                     "agent_id": item["agent_id"]} for item in scopes]
         if name.startswith("website"):
             sessions = [self.ids["session"], self.ids["session2"]]
-            policy = {self.ids["integration"]: {"mode": "SESSION_ALLOWLIST",
-                      "expected_agent_id": self.ids["agent"], "session_ids": sessions}}
+            scope_integrations = ([item["integration_id"] for item in scopes]
+                                  if self.multiple_scopes else [self.ids["integration"]])
+            guard_values = {integration: self.ids["agent"]
+                            for integration in scope_integrations}
+            policy = {integration: {"mode": "SESSION_ALLOWLIST",
+                      "expected_agent_id": self.ids["agent"], "session_ids": sessions}
+                      for integration in scope_integrations}
             env.update({"CONTROL_PLANE_URL": self.url("fake"),
                         "INTERNAL_API_TOKEN": self.tokens["cp"],
                         "AI_AGENT_SERVICE_URL": self.url("fake"),
@@ -112,9 +133,9 @@ class WebsiteHarness:
                         "CONVERSATION_S2S_TOKEN": self.tokens["website"],
                         "CONVERSATION_RESULT_WAIT_SECONDS": "4",
                         "CONVERSATION_RESULT_POLL_SECONDS": "0.05",
-                        "CONVERSATION_REQUEST_TIMEOUT_SECONDS": "1",
-                        "MANAGED_WEBSITE_GUARDED_INTEGRATIONS": json.dumps({
-                            self.ids["integration"]: self.ids["agent"]}),
+                        "CONVERSATION_REQUEST_TIMEOUT_SECONDS":
+                            "10" if self.settling_enabled else "1",
+                        "MANAGED_WEBSITE_GUARDED_INTEGRATIONS": json.dumps(guard_values),
                         "MANAGED_WEBSITE_COHORTS": json.dumps(policy if cohort else {}),
                         "HOST": "127.0.0.1", "PORT": str(self.ports[name]),
                         "ALLOWED_ORIGINS": "https://fixture.example", "LOG_LEVEL": "INFO"})
@@ -122,21 +143,30 @@ class WebsiteHarness:
             env.update({"DATABASE_URL": self.database_url,
                         "CONVERSATION_AUTH_PRINCIPALS": json.dumps([
                             {"principal_id": "fixture-website", "role": "WEBSITE",
-                             "token": self.tokens["website"], "grants": [grant]},
+                             "token": self.tokens["website"], "grants": grants},
                             {"principal_id": "fixture-processing", "role": "PROCESSING",
-                             "token": self.tokens["processing"], "grants": [grant]}]),
-                        "WEBSITE_BINDINGS": json.dumps([binding]),
+                             "token": self.tokens["processing"], "grants": grants}]),
+                        "WEBSITE_BINDINGS": json.dumps(bindings),
                         "MANAGED_AI_BASE_URL": self.url("fake"),
-                        "MANAGED_AI_BINDINGS": json.dumps([dict(binding,
-                            channel="WEBSITE_WIDGET", service_token=self.tokens["managed"])]),
+                        "MANAGED_AI_BINDINGS": json.dumps([
+                            dict(binding, channel="WEBSITE_WIDGET",
+                                 service_token=self.tokens["managed"])
+                            for binding in bindings]),
                         "WEBSITE_WORKER_ENABLED": "true",
                         "WEBSITE_WORKER_PRINCIPAL_ID": "fixture-processing",
                         "WEBSITE_WORKER_LEASE_SECONDS": "5",
                         "WEBSITE_WORKER_POLL_SECONDS": "0.1",
                         "WEBSITE_WORKER_HEALTH_PORT": str(self.ports[name]), "LOG_LEVEL": "INFO"})
-        widgets = {self.tokens["widget"]: binding, self.tokens["other_widget"]: {
-            "owner_id": self.ids["owner"], "integration_id": self.ids["other_integration"],
-            "agent_id": self.ids["agent"]}}
+            if self.settling_enabled:
+                env["TURN_SETTLING_POLICIES"] = json.dumps([{
+                    "version": "website-process-v1",
+                    "channel": "WEBSITE_WIDGET",
+                    "integration_id": self.ids["integration"],
+                    "quiet_window_ms": self.settling_quiet_window_ms,
+                    "max_wait_ms": self.settling_max_wait_ms,
+                }])
+        widgets = {item["widget_key"]: {key: item[key] for key in
+                   ("owner_id", "integration_id", "agent_id")} for item in scopes}
         config_path = self.root / (name + "-bootstrap.json")
         config = {"name": name, "state_dir": str(self.root), "port": self.ports[name],
                   "allowlist": [["127.0.0.1", self.ports[key]] for key in self.ports] +
@@ -176,15 +206,16 @@ class WebsiteHarness:
         self.start(name, **options)
         await self.wait_ready(name)
 
-    async def chat(self, body, website="website", other=False):
+    async def chat(self, body, website="website", other=False, widget=None):
+        widget_key = widget or ("other_widget" if other else "widget")
         return await self.client.post(self.url(website) + "/v1/chat", json=body, headers={
-            "X-Widget-Key": self.tokens["other_widget" if other else "widget"],
+            "X-Widget-Key": self.tokens[widget_key],
             "Origin": "https://fixture.example"})
 
-    async def eventual_chat(self, body, status=200, website="website"):
+    async def eventual_chat(self, body, status=200, website="website", widget=None):
         deadline = asyncio.get_running_loop().time() + 18
         while asyncio.get_running_loop().time() < deadline:
-            response = await self.chat(body, website)
+            response = await self.chat(body, website, widget=widget)
             if response.status_code == status:
                 return response
             assert response.status_code == 503, response.text
@@ -218,6 +249,77 @@ class WebsiteHarness:
         assert len(values) == 1
         return values[0]
 
+    async def diagnostic_snapshot(self, label, message_id, *, extra=None):
+        """Persist safe process/DB state before fixture teardown destroys the DB."""
+        try:
+            pg_activity = await self.rows(
+                "SELECT pid,application_name,state,wait_event_type,wait_event,"
+                "pg_blocking_pids(pid) AS blocking_pids,"
+                "clock_timestamp()-query_start AS query_age,left(query,200) AS query "
+                "FROM pg_stat_activity WHERE datname=current_database() ORDER BY pid"
+            )
+        except Exception as exc:  # Diagnostics must not change test behavior.
+            pg_activity = [{"error_type": type(exc).__name__}]
+        processes = {}
+        for name, process in self.processes.items():
+            sample = {"pid": process.pid, "alive": process.poll() is None,
+                      "returncode": process.returncode}
+            if process.poll() is None:
+                try:
+                    sample["cpu_percent"] = subprocess.run(
+                        ["ps", "-o", "%cpu=", "-p", str(process.pid)],
+                        capture_output=True, text=True, timeout=1, check=False,
+                    ).stdout.strip()
+                except (OSError, subprocess.TimeoutExpired):
+                    sample["cpu_percent"] = None
+            processes[name] = sample
+        admissions = await self.rows(
+            "SELECT id,owner_id,integration_id,agent_id,session_id,message_id,route,"
+            "conversation_id,canonical_message_id FROM website_admissions "
+            "WHERE message_id=:id ORDER BY created_at,id", id=message_id,
+        )
+        conversations = sorted({str(row["conversation_id"]) for row in admissions
+                                if row["conversation_id"] is not None})
+        snapshot = {"label": label, "message_id": message_id, "admissions": admissions,
+                    "managed_observations": self.observations(), "pg_activity": pg_activity,
+                    "processes": processes, "extra": extra or {}}
+        if conversations:
+            conversation_id = conversations[0]
+            snapshot["conversation_id"] = conversation_id
+            snapshot["turns"] = await self.rows(
+                "SELECT id,status,failure_code,claim_epoch,managed_dispatch_epoch,draft_text,"
+                "operation_refs,settling_revision,created_at FROM agent_turns "
+                "WHERE conversation_id=:id ORDER BY created_at,id", id=conversation_id,
+            )
+            snapshot["deliveries"] = await self.rows(
+                "SELECT id,source_turn_id,status,revision,error_code,"
+                "expected_settling_revision,fenced_settling_revision,created_at,updated_at "
+                "FROM delivery_attempts WHERE conversation_id=:id ORDER BY created_at,id",
+                id=conversation_id,
+            )
+            snapshot["response_attempts"] = await self.rows(
+                "SELECT id,admission_id,delivery_id,send_authorized,outcome,created_at,finished_at "
+                "FROM website_response_attempts WHERE conversation_id=:id "
+                "ORDER BY created_at,id", id=conversation_id,
+            )
+            snapshot["reconciliations"] = await self.rows(
+                "SELECT id,delivery_attempt_id,reconciliation_key,"
+                "expected_revision,result_revision,status,"
+                "expected_settling_revision,result_settling_revision,accepted_at "
+                "FROM delivery_reconciliations WHERE conversation_id=:id "
+                "ORDER BY accepted_at,id", id=conversation_id,
+            )
+            snapshot["messages"] = await self.rows(
+                "SELECT id,sequence,actor,direction,content_type,source_agent_turn_id,text "
+                "FROM messages WHERE conversation_id=:id ORDER BY sequence,id",
+                id=conversation_id,
+            )
+        target = self.root / "diagnostic-snapshots.json"
+        values = json.loads(target.read_text()) if target.exists() else []
+        values.append(snapshot)
+        private_json(target, values)
+        return snapshot
+
     async def close(self):
         for name in list(self.processes):
             self.kill(name)
@@ -233,9 +335,11 @@ async def wh(sql, database_url, website_inputs, process_ports, tmp_path):
     async with sql.begin() as connection:
         await connection.execute(text("TRUNCATE website_admissions CASCADE"))
     ids = {name: str(uuid4()) for name in (
-        "owner", "integration", "other_integration", "agent", "session", "session2")}
+        "owner", "owner2", "integration", "other_integration", "integration2",
+        "agent", "session", "session2")}
     tokens = {name: secrets.token_urlsafe(32) for name in (
-        "widget", "other_widget", "cp", "legacy", "managed", "website", "processing")}
+        "widget", "other_widget", "third_widget", "cp", "legacy", "managed",
+        "website", "processing")}
     private_json(tmp_path / "observations.json", {
         "managed": [], "effects": [], "legacy": [], "evidence": []})
     client = httpx.AsyncClient(timeout=20, trust_env=False)

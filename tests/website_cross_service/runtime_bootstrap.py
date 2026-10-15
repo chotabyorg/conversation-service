@@ -78,6 +78,9 @@ def fixture_app(config):
 
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
     state_path = Path(config["state_dir"], "observations.json")
+    managed_release = asyncio.Event()
+    managed_release.set()
+    managed_entered = asyncio.Event()
 
     def record(kind, value):
         state = json.loads(state_path.read_text())
@@ -87,6 +90,34 @@ def fixture_app(config):
     @app.get("/health")
     async def health():
         return {"status": "ok"}
+
+    @app.post("/test/managed/block")
+    async def block_managed():
+        managed_release.clear()
+        managed_entered.clear()
+        return {"blocked": True}
+
+    @app.post("/test/managed/release")
+    async def release_managed():
+        managed_release.set()
+        return {"released": True}
+
+    @app.get("/test/managed/entered")
+    async def managed_was_entered():
+        return {"entered": managed_entered.is_set()}
+
+    @app.post("/test/replies")
+    async def set_replies(request: Request):
+        from fastapi.responses import JSONResponse
+
+        value = await request.json()
+        if not isinstance(value, dict) or not all(
+            isinstance(key, str) and isinstance(reply, str)
+            for key, reply in value.items()
+        ):
+            return JSONResponse(status_code=400, content={"error": "invalid_replies"})
+        config["replies"].update(value)
+        return {"updated": len(value)}
 
     @app.get("/v1/internal/integrations")
     async def integrations():
@@ -121,6 +152,8 @@ def fixture_app(config):
             "messages",
         )})
         record("effects", {"turn_id": value["turn_id"], "operation_id": operation_id})
+        managed_entered.set()
+        await managed_release.wait()
         await asyncio.sleep(0.15)
         echo = {key: value[key] for key in (
             "contract_version", "conversation_id", "turn_id", "agent_id", "input_revision",

@@ -57,6 +57,7 @@ async def test_migrated_catalog_constraints_indexes_utc_and_exact_collation(h, s
         "uq_inbound_event_id_conversation",
         "fk_inbound_event_conversation_scope",
         "uq_message_sequence",
+        "uq_message_identity_sequence",
         "uq_message_source_event",
         "fk_message_source_event_conversation",
         "ck_message_source_actor",
@@ -121,10 +122,13 @@ async def test_migrated_catalog_constraints_indexes_utc_and_exact_collation(h, s
             "telegram_admissions",
             "telegram_immediate_turns",
             "telegram_response_attempts",
+            "telegram_provider_accounts",
+            "turn_input_messages",
+            "settling_bursts",
         }
         assert (
             await connection.scalar(text("SELECT version_num FROM alembic_version"))
-            == "0005_telegram_canary"
+            == "0006_turn_settling"
         )
         timestamps = (
             (
@@ -259,6 +263,99 @@ async def test_named_unique_and_composite_foreign_key_negative_writes(h, sql):
     )
 
 
+async def test_turn_input_message_foreign_key_binds_exact_id_and_sequence(h, sql):
+    first = await h.ingest()
+    await h.ingest()
+    third = await h.ingest()
+    first_turn, _ = await h.select(third, input_first_sequence=1, input_last_sequence=1)
+    claim = await h.claim(first_turn)
+    assert (await h.call(
+        "POST", f"/turns/{first_turn['id']}/complete",
+        dict(h.proof(claim), outcome="NO_RESPONSE"),
+    )).status_code == 200
+    second_turn, _ = await h.select(third, input_first_sequence=2, input_last_sequence=2)
+    claim = await h.claim(second_turn)
+    assert (await h.call(
+        "POST", f"/turns/{second_turn['id']}/complete",
+        dict(h.proof(claim), outcome="NO_RESPONSE"),
+    )).status_code == 200
+    await violation(
+        sql,
+        "INSERT INTO turn_input_messages(message_id,conversation_id,turn_id,sequence,ordinal) "
+        "VALUES(:message_id,:conversation_id,:turn_id,1,1)",
+        dict(message_id=third["message"]["id"],
+             conversation_id=first["conversation"]["id"], turn_id=second_turn["id"]),
+        "23503", "fk_turn_input_exact_message",
+    )
+
+
+async def test_goal5_settling_checks_reject_malformed_raw_sql(h, sql):
+    accepted = await h.ingest()
+    # Membership is intentionally immutable on UPDATE, so clone the canonical
+    # inbound row and make malformed snapshots on INSERT to exercise the
+    # named CHECKs themselves rather than the immutability trigger.
+    async with sql.connect() as connection:
+        columns = list((await connection.execute(text(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema='public' AND table_name='messages' "
+            "ORDER BY ordinal_position"
+        ))).scalars())
+    burst_id = uuid4()
+    async with sql.begin() as connection:
+        await connection.execute(text(
+            "INSERT INTO settling_bursts "
+            "(id,conversation_id,policy_version,quiet_window_ms,max_wait_ms,"
+            "opened_at,max_cutoff_at,last_input_at,tail_sequence,ready_at) "
+            "VALUES (:id,:conversation,'telegram-v1',100,1000,clock_timestamp(),"
+            "clock_timestamp()+interval '1 second',clock_timestamp(),1,"
+            "clock_timestamp()+interval '100 milliseconds')"
+        ), {"id": str(burst_id), "conversation": accepted["conversation"]["id"]})
+    overrides = {
+        "id": ":new_id",
+        "sequence": "sequence + 1000000",
+        "settling_policy_version": "'telegram-v1'",
+        "settling_quiet_window_ms": "0",
+        "settling_max_wait_ms": "1000",
+        "settling_burst_id": ":burst_id",
+        "source_inbound_event_id": "NULL",
+    }
+    expressions = [overrides.get(column, column) for column in columns]
+    await violation(
+        sql,
+        "INSERT INTO messages (" + ",".join(columns) + ") SELECT "
+        + ",".join(expressions) + " FROM messages WHERE id=:id",
+        {"id": accepted["message"]["id"], "new_id": str(uuid4()),
+         "burst_id": str(burst_id)},
+        "23514", "ck_message_settling_snapshot",
+    )
+    null_expressions = [
+        "NULL" if column == "settling_quiet_window_ms" else expression
+        for column, expression in zip(columns, expressions, strict=True)
+    ]
+    await violation(
+        sql,
+        "INSERT INTO messages (" + ",".join(columns) + ") SELECT "
+        + ",".join(null_expressions) + " FROM messages WHERE id=:id",
+        {"id": accepted["message"]["id"], "new_id": str(uuid4()),
+         "burst_id": str(burst_id)},
+        "23514", "ck_message_settling_burst_shape",
+    )
+    _, attempt, _ = await h.delivery()
+    await violation(
+        sql,
+        "UPDATE delivery_attempts SET expected_settling_revision=NULL, "
+        "fenced_settling_revision=0 WHERE id=:id",
+        {"id": attempt["id"]}, "23514", "ck_delivery_settling_fence",
+    )
+    await h.reconcile(attempt, "DISPATCH_REQUESTED")
+    await violation(
+        sql,
+        "UPDATE delivery_reconciliations SET expected_settling_revision=0, "
+        "result_settling_revision=NULL WHERE delivery_attempt_id=:id",
+        {"id": attempt["id"]}, "23514", "ck_reconciliation_settling_fence",
+    )
+
+
 async def test_missing_or_wrong_revision_and_missing_table_are_not_ready(h, sql):
     async with sql.begin() as connection:
         await connection.execute(
@@ -272,7 +369,7 @@ async def test_missing_or_wrong_revision_and_missing_table_are_not_ready(h, sql)
     finally:
         async with sql.begin() as connection:
             await connection.execute(
-                text("UPDATE alembic_version SET version_num='0005_telegram_canary'")
+                text("UPDATE alembic_version SET version_num='0006_turn_settling'")
             )
     async with sql.begin() as connection:
         await connection.execute(

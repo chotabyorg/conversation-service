@@ -12,12 +12,17 @@ public API, webhook, deploy workflow or GitOps service resources.
 
 | Entity | Foundation ownership |
 | --- | --- |
-| Conversation | Stable UUID, exact owner/integration/channel/thread identity, local sequence/input counters, control mode and authority revision |
+| Conversation | Stable UUID, exact owner/integration/channel/thread identity, local sequence/input/settling counters, control mode and authority revision |
 | InboundEvent | Scoped normalized immutable provider event, deterministic server fingerprint, accepted receipt and replay/conflict proof |
-| Message | Canonical text communication in durable Conversation-local order; one Message per accepted inbound event; eligible Website drafts have a unique source Turn |
-| AgentTurn | Frozen selected input/context, one active logical slot, stable UUID, fenced lease, immutable completed draft/failure |
-| DeliveryAttempt | One journal intent per completed draft, explicit delivery evidence state, CAS revision and provider identifier references |
-| DeliveryReconciliation | Immutable update identity/fingerprint and original applied revision, preserving old-key replay/conflict evidence |
+| Message | Canonical text communication in durable Conversation-local order; one Message per accepted inbound event; immutable optional settling-burst membership |
+| SettlingBurst | Conversation-local first-policy snapshot, member tail, original maximum cutoff, ready time and irreversible close time |
+| AgentTurn | Frozen selected input/context and optional settling fence, one active logical slot, stable UUID, fenced lease, immutable completed draft/failure |
+| TurnInputMessage | Durable one-time assignment of each canonical inbound Message to a Turn, preserving sequence and ordinal |
+| DeliveryAttempt | One journal intent per completed draft, explicit delivery/supersede evidence state, CAS revision and provider identifier references |
+| DeliveryReconciliation | Immutable update identity/fingerprint, input-fence evidence and original applied revision, preserving old-key replay/conflict evidence |
+| TelegramAdmission | Immutable managed/legacy routing receipt and exact provider identity for each eligible Telegram event |
+| TelegramProviderAccount | Immutable BOUND or historical CONFLICT bot identity per owner/integration |
+| WebsiteAdmission / WebsiteResponseAttempt | Immutable routing receipt and per-admission socket-write authorization/evidence |
 
 Owner is an exact opaque Control Plane subject string rather than AI's UUID user
 model. Integration is Control Plane's UUID, independent of agent identity.
@@ -38,10 +43,13 @@ short READ COMMITTED transactions with independent AsyncSessions. The lock order
 is Conversation then Turn/Delivery then reconciliation. DB uniqueness and FKs are
 defenses independent of in-process code; no Python lock participates in safety.
 
-The immutable completed Turn draft is the foundation's future outbound-intent
-relation. Completing a Turn, creating a delivery or journaling dispatch does not
-create an outbound Message and does not mean that a provider was called. Goal4A.1 adds only the explicit Website [write/history policy](history-projection.md).
-Input freshness/supersede remain outside this immediate policy.
+The immutable completed Turn draft is the foundation's outbound-intent relation.
+Goal5 checks settling freshness only for retained SETTLING Turns, plus existing
+control and authority rules, before a managed Telegram or Website adapter can
+write. IMMEDIATE Turns are not superseded solely because a later input arrived.
+`SUPERSEDED` records a stale communication outcome; it does not roll back
+retained operation references or Business effects. Website history promotion
+still follows the explicit [write/history policy](history-projection.md).
 
 Bounded operation references identify AI-owned operations only. They carry no
 business request, receipt or reasoning. Conversation coordination **does not own

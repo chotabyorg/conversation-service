@@ -13,7 +13,7 @@ gateway change or provider send. The managed executor is described in
 | GET `/conversations/{id}` | UUID | ConversationRead through granted scope |
 | GET `/conversations/{id}/messages` | after_sequence integer 0..BIGINT_MAX default0; limit1..100 default50 | MessagePage, ascending sequence; next_after_sequence is last returned when another row exists, otherwise null; validates scope even for empty page |
 | GET `/messages/{id}` | UUID | MessageRead through granted parent |
-| POST `/conversations/{id}/turns` | selection_key UUID, input_first_sequence, input_last_sequence, expected_input_revision, expected_authority_revision | TurnResult; new 201, same-key exact selection replay 200 even after history/control/terminal change; changed payload TURN_SELECTION_CONFLICT |
+| POST `/conversations/{id}/turns` | selection_key UUID, input_first_sequence, input_last_sequence, expected_input_revision, expected_authority_revision | TurnResult; new 201, same-key exact selection replay 200 even after history/control/terminal change; changed payload TURN_SELECTION_CONFLICT; policy-bound inbound requires the settling coordinator (`SETTLING_REQUIRED`) |
 | GET `/turns/{id}` | UUID | TurnRead without claim secret/digest/fingerprints |
 | POST `/turns/{id}/claim` | worker_ref, lease_seconds1..300 | TurnClaimResult with raw claim_token only here; 200. Not idempotent: lost response recovers same Turn after lease expiry |
 | POST `/turns/{id}/renew` | claim_epoch, claim_token, lease_seconds | TurnRead; live winning proof extends expiry without changing epoch/token; no secret echo |
@@ -31,7 +31,7 @@ Message edit or generic outbound append exists. Website response completion adds
 canonical assistant history only under the [explicit write policy](history-projection.md).
 
 `GET /health` returns `{status:"ok",service:"conversation-service"}`.
-`GET /ready` returns ready200 only when DB query, migration `0005_telegram_canary` and
+`GET /ready` returns ready200 only when DB query, migration `0006_turn_settling` and
 required Conversation, Website and Telegram journal queries succeed; otherwise not_ready503. These are the only
 unauthenticated routes. `GET /internal/openapi.json` requires the service header.
 Default `/docs`, `/redoc`, `/openapi.json` are disabled. The fetched schema provides
@@ -61,7 +61,10 @@ otherwise the service generates UUID4 and includes X-Request-ID in the response.
 
 DRAFT_READY requires draft_text; NO_RESPONSE requires null. Input first must not
 exceed last. Reconciliation expected_authority_revision is required exactly for
-DISPATCH_REQUESTED and forbidden otherwise. error_code is allowed only for
+DISPATCH_REQUESTED and forbidden otherwise. Settling evidence is an optional
+paired `expected_settling_revision` / `result_settling_revision`; the latter cannot
+be less than the former. `SUPERSEDED` is terminal communication evidence for a
+stale draft and never authorizes a provider send. error_code is allowed only for
 FAILED/UNKNOWN/PARTIAL/INTERRUPTED. Failure codes are PROCESSING_ERROR, TIMEOUT,
 INVALID_RESULT, EXECUTION_UNKNOWN; delivery errors are PROVIDER_REJECTED, TRANSPORT_ERROR, TIMEOUT,
 INTERRUPTED, UNSPECIFIED. No arbitrary diagnostic error string is accepted.
@@ -89,7 +92,7 @@ it never includes input/context, rejected values, tokens, SQL or exception text.
 | --- | --- |
 | 401 | UNAUTHENTICATED |
 | 404 | NOT_FOUND |
-| 409 | EVENT_CONFLICT, TURN_SELECTION_CONFLICT, ACTIVE_TURN_EXISTS, INPUT_REVISION_CONFLICT, AUTHORITY_REVISION_CONFLICT, CONTROL_MODE_CONFLICT, INVALID_INPUT_BOUNDARY, TURN_TERMINAL, LEASE_HELD, LEASE_EXPIRED, STALE_CLAIM, TERMINAL_RESULT_CONFLICT, NO_DRAFT, DELIVERY_IDENTITY_CONFLICT, DELIVERY_INTENT_EXISTS, DELIVERY_RECONCILIATION_CONFLICT, DELIVERY_REVISION_CONFLICT, INVALID_DELIVERY_TRANSITION, DELIVERY_REFERENCE_CONFLICT |
+| 409 | EVENT_CONFLICT, TURN_SELECTION_CONFLICT, ACTIVE_TURN_EXISTS, INPUT_REVISION_CONFLICT, SETTLING_REQUIRED, AUTHORITY_REVISION_CONFLICT, CONTROL_MODE_CONFLICT, INVALID_INPUT_BOUNDARY, TURN_TERMINAL, LEASE_HELD, LEASE_EXPIRED, STALE_CLAIM, TERMINAL_RESULT_CONFLICT, NO_DRAFT, DELIVERY_IDENTITY_CONFLICT, DELIVERY_INTENT_EXISTS, DELIVERY_RECONCILIATION_CONFLICT, DELIVERY_REVISION_CONFLICT, INVALID_DELIVERY_TRANSITION, DELIVERY_REFERENCE_CONFLICT |
 | 413 | PAYLOAD_TOO_LARGE |
 | 422 | VALIDATION_ERROR |
 | 503 | SERVICE_UNAVAILABLE (bounded DB unavailability/timeout) |
@@ -113,7 +116,24 @@ FIFO coordination and socket-only evidence. New private routes are POST
 PROCESSING credentials and exact current bindings. Existing foundation routes and
 managed v1 contracts remain compatible for FULL principals.
 
-## Goal4B narrow Telegram adapter
+| Method/path | Request | Response and retry behavior |
+| --- | --- | --- |
+| POST `/website/admissions` | trusted Website identity, text, desired route | `{route,admission_id,replayed}`; MANAGED commits the canonical inbound event/message; LEGACY retains routing only |
+| POST `/website/results` | five identity fields | retained execution state and draft; polling owns no worker cancellation |
+| POST `/website/responses/begin` | five identity fields plus `response_attempt_id`; request has no `admission_id` | `{action:SEND|REPLAY_COMPLETED|DENY,response_attempt_id,replay_source_attempt_id,draft_text,send,replayed,denial_reason}` with the action truth table below |
+| POST `/website/responses/complete` | same request identity plus `WRITE_COMPLETED|WRITE_FAILED|UNKNOWN` | `{response_attempt_id,outcome,replayed}`; only an exact authorized attempt may complete or provide late evidence |
+
+Current v2 `response_attempt_id` is
+`uuid5(NAMESPACE_URL, "main-chota.website-widget-response.v2:" + str(admission_id))`;
+the public `message_id` remains unchanged. Historical v1 UUID4 attempts remain
+scoped to their original admission and delivery. `SEND` has
+`send=true` and no replay source or denial. `REPLAY_COMPLETED` has `send=false`,
+`replayed=true`, and an actual same-admission successful source ID. `DENY` has
+`send=false` and a closed denial reason. Every v2 begin checks for eligible
+historical success before returning a persisted denial, including denial rows
+created earlier. It leaves that denied row unchanged and creates no new write.
+
+## Telegram provider adapter and Goal5 coordination
 
 The private `/internal/v1/telegram/*` POST routes accept only exact TELEGRAM grants
 under namespace `main-chota.telegram.v1`, the configured `{owner_id,
@@ -125,10 +145,30 @@ remain addressable.
 
 | Method/path | Request | Response and retry behavior |
 | --- | --- | --- |
-| POST `/telegram/admissions` | trusted identity, private-chat `chat_id`, positive `message_id`, `sender_id`, `bot_id`, nonnegative `update_id`, text, desired_route MANAGED/LEGACY | frozen route/admission ID; MANAGED atomically creates the generic canonical inbound Event/Message; exact replay returns same admission; conflicting immutable payload EVENT_CONFLICT |
-| POST `/telegram/results` | exact trusted and provider identity | PENDING, DRAFT_READY, NO_RESPONSE, FAILED or UNKNOWN retained Turn result; MANAGED replay never calls legacy AI |
-| POST `/telegram/responses/begin` | same identity and stable response_attempt_id | creates one durable DISPATCH_REQUESTED intent before send and returns send=true once; replay returns send=false; an unresolved previous intent becomes UNKNOWN and is never reissued |
-| POST `/telegram/responses/complete` | response_attempt_id and PROVIDER_ACCEPTED with provider_message_id, FAILED/PROVIDER_REJECTED, or UNKNOWN with transport evidence | retains truthful provider status using the existing DeliveryAttempt journal; provider acceptance appends one canonical AGENT Message; no DELIVERED/READ claim |
+| POST `/telegram/admissions` | trusted provider identity, private-chat `chat_id`, positive `message_id`, `sender_id`, `bot_id`, nonnegative `update_id`, text, desired route | `{route,admission_id,replayed,bot_id,coordination_mode}`; MANAGED atomically creates the canonical Event/Message; exact replay returns the retained admission; conflicting immutable payload returns EVENT_CONFLICT |
+| POST `/telegram/results` | trusted identity; `bot_id` may be omitted on request | echoes retained identity and returns `admission_id`, resolved `bot_id`, `coordination_mode`, nullable `turn_id`, execution `state`, exhaustive `delivery_state`, and `progress_disposition` |
+| POST `/telegram/responses/work` | owner, integration, agent, and required positive `bot_id` | finite page of at most 100 fully correlated work items with admission/Turn/attempt IDs, draft, bot, and `work_kind=SEND_CANDIDATE|RECOVER_ONLY` |
+| POST `/telegram/responses/begin` | Telegram identity plus stable `response_attempt_id`; `bot_id` is optional; request does not accept `admission_id` | echoes resolved identity, `admission_id`, bot, attempt, draft, `work_kind`, `send`, and `replayed`; only an eligible SEND_CANDIDATE can return `send=true` |
+| POST `/telegram/responses/complete` | same request identity plus `PROVIDER_ACCEPTED` with provider message ID, `FAILED` with `PROVIDER_REJECTED`, or `UNKNOWN` with `TRANSPORT_ERROR|TIMEOUT` | echoes attempt/admission/bot and retained outcome; accepts exact authorized late facts; provider acceptance appends one canonical AGENT Message; no DELIVERED/READ claim |
+
+The first MANAGED admission binds one immutable bot per owner/integration. A
+different bot cannot create new MANAGED work. Historical mixed-bot MANAGED
+admissions migrate to a persisted `CONFLICT` account instead of selecting an
+arbitrary bot; conflict blocks new permission but does not erase exact prior
+recovery authority. `RECOVER_ONLY` identifies an already-authorized unresolved
+attempt/admission/bot. Begin returns `send=false`; gateway recovery must not call
+the provider. Correct late evidence remains recordable, and a wrong bot cannot
+trigger even the UNKNOWN transition.
+
+`coordination_mode` is `IMMEDIATE|SETTLING`; historical/policy-free admissions
+are IMMEDIATE. `progress_disposition` is `WAIT|TERMINAL|AUTHORITY_FENCED|ACCOUNT_CONFLICT`.
+It is observational, not a provider receipt: an IMMEDIATE waiter releases only
+after a fully correlated non-WAIT result, while SETTLING does not wait.
+`delivery_state` may be `NOT_STARTED`, `GENERATED`, `DISPATCH_REQUESTED`,
+`SUPERSEDED`, `PROVIDER_ACCEPTED`, `DELIVERED`, `READ`, `FAILED`, `UNKNOWN`,
+`PARTIAL`, or `INTERRUPTED`; PARTIAL and INTERRUPTED are not success. Revocation,
+missing runtime configuration, and HTTP status alone do not synthesize terminal
+progress.
 
 The provider event key is `b{bot_id}c{chat_id}m{message_id}`; `update_id`,
 sender identity and text are included in the immutable fingerprint. The canonical
@@ -136,3 +176,42 @@ thread is the decimal private `chat_id`, scoped by the generic tuple
 `(owner_id,integration_id,TELEGRAM,provider_thread_id)`. Group/non-text/anonymous
 messages stay on their preexisting unsupported/legacy path. See
 [Telegram canary](telegram-canary.md) for rollback and send semantics.
+
+## Goal5 durable settling and supersede
+
+`TURN_SETTLING_POLICIES` is optional private configuration. A channel-level policy
+may be overridden by an integration-specific policy. New canonical inbound
+Messages join a Conversation-scoped durable burst under the Conversation lock.
+The burst freezes its first policy/version and original maximum cutoff; every
+eligible member before its stored ready time extends quiet time, even if policy
+configuration is later removed or replaced. At the exact ready time or later,
+the old burst closes and a new input uses current policy or IMMEDIATE mode.
+Membership is independent of message adjacency, and generic/assistant Messages
+do not extend its lifetime.
+
+Telegram and Website workers run the shared Conversation-owned scheduler before
+their immediate compatibility path. Only a due, closed burst can be selected;
+one Turn receives its maximal serializer-valid contiguous prefix of at most 256
+members. Residual members retain the same burst and cutoff through restart.
+Membership and all TurnInputMessage ownership commit atomically. `POST
+/conversations/{id}/turns` returns `SETTLING_REQUIRED` if asked to bypass a
+policy-bound selection. Input ownership is shared across transports and all
+retained Turn ranges, including terminal Turns.
+
+Before a Telegram or Website provider/socket write, `responses/begin` locks the
+Conversation then the completed Turn and atomically records `DISPATCH_REQUESTED`
+or `SUPERSEDED`. The response includes `send`; false means no new write is
+authorized. Website responses also return `denial_reason` as `SUPERSEDED` or
+`DELIVERY_NOT_RETRYABLE`. Website v2 `response_attempt_id` is derived from the
+canonical `admission_id`; historical v1 UUID4/UUID5 identities remain valid only
+for their exact retained admission and delivery. Every v2 lookup checks for an
+eligible same-admission historical `WRITE_COMPLETED` source before honoring a
+persisted denial. It returns `REPLAY_COMPLETED` with the real source ID while
+leaving the denied requested row unchanged. A prior failed/unknown/denied
+identity alone never grants another send. Only an undispatched delivery can
+create a new `SEND`; only an authorized confirmed write may be replayed, subject
+to retained mode/control/authority rules. A stale draft retains its Turn and
+`operation_refs`, and its delivery cannot be reopened. An unfinished write is
+recorded as `UNKNOWN` on retry and is never blindly repeated. See
+[durable turn settling](turn-settling.md) for exact deadline, selection,
+restart, fairness, and issue #18 behavior.

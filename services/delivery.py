@@ -27,7 +27,8 @@ from services.common import (
 )
 
 TRANSITIONS: dict[str, frozenset[str]] = {
-    "GENERATED": frozenset({"DISPATCH_REQUESTED"}),
+    "GENERATED": frozenset({"DISPATCH_REQUESTED", "SUPERSEDED"}),
+    "SUPERSEDED": frozenset(),
     "DISPATCH_REQUESTED": frozenset(
         {
             "PROVIDER_ACCEPTED",
@@ -51,6 +52,21 @@ TRANSITIONS: dict[str, frozenset[str]] = {
     "READ": frozenset(),
     "FAILED": frozenset(),
 }
+
+
+def _reconciliation_fingerprint(delivery_attempt_id: UUID, request: DeliveryReconcile) -> str:
+    # These two fields were added in Goal5. Preserve every pre-existing optional
+    # field's historical null shape while omitting only absent Goal5 evidence.
+    payload = request.model_dump(mode="json")
+    if request.expected_settling_revision is None:
+        payload.pop("expected_settling_revision", None)
+    if request.result_settling_revision is None:
+        payload.pop("result_settling_revision", None)
+    return fingerprint({
+        "contract_version": 1,
+        "delivery_attempt_id": str(delivery_attempt_id),
+        **payload,
+    })
 
 
 async def create_delivery(
@@ -162,13 +178,7 @@ def merged_reference(current: str | None, reported: str | None) -> str | None:
 async def reconcile_delivery(
     database: Database, principal: Principal, delivery_attempt_id: UUID, request: DeliveryReconcile
 ) -> DeliveryReconcileResult:
-    digest = fingerprint(
-        {
-            "contract_version": 1,
-            "delivery_attempt_id": str(delivery_attempt_id),
-            **request.model_dump(mode="json"),
-        }
-    )
+    digest = _reconciliation_fingerprint(delivery_attempt_id, request)
     async with database.session_factory() as session, session.begin():
         conversation, attempt = await locked_delivery(session, principal, delivery_attempt_id)
         previous = await session.scalar(
@@ -214,8 +224,12 @@ async def reconcile_delivery(
             attempt.error_code = (
                 request.error_code.value if request.error_code is not None else None
             )
-            if status == "DISPATCH_REQUESTED" and attempt.dispatch_requested_at is None:
+            if status in {"DISPATCH_REQUESTED", "SUPERSEDED"} \
+                    and attempt.dispatch_requested_at is None:
                 attempt.dispatch_requested_at = clock
+            if request.expected_settling_revision is not None:
+                attempt.expected_settling_revision = request.expected_settling_revision
+                attempt.fenced_settling_revision = request.result_settling_revision
             if status == "PROVIDER_ACCEPTED" and attempt.provider_accepted_at is None:
                 attempt.provider_accepted_at = clock
             if status in ("DELIVERED", "READ") and attempt.delivered_at is None:
@@ -237,6 +251,8 @@ async def reconcile_delivery(
                     provider_occurred_at=request.provider_occurred_at,
                     error_code=request.error_code.value if request.error_code is not None else None,
                     expected_authority_revision=request.expected_authority_revision,
+                    expected_settling_revision=request.expected_settling_revision,
+                    result_settling_revision=request.result_settling_revision,
                     accepted_at=clock,
                 )
             )

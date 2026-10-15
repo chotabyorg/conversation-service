@@ -89,14 +89,8 @@ def run_telegram_gateway() -> None:
 
     api = TelegramAPIServer.from_base(os.environ["GOAL4B_TELEGRAM_API_BASE"])
 
-    class LocalAiohttpSession(AiohttpSession):
-        async def make_request(self, bot, method, timeout=None):
-            if method.__api_method__ == "sendChatAction":
-                timeout = 0.2
-            return await super().make_request(bot, method, timeout)
-
     def local_bot(*, token: str, default: object) -> Bot:
-        return Bot(token=token, session=LocalAiohttpSession(api=api), default=default)
+        return Bot(token=token, session=AiohttpSession(api=api), default=default)
 
     bot_manager.Bot = local_bot  # type: ignore[assignment]
     original_health = health_server.start_health_server

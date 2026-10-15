@@ -16,7 +16,9 @@ from sqlalchemy import func, select, text
 
 import services.telegram as telegram_service
 from models import AgentTurn, Conversation, TelegramAdmission, TelegramImmediateTurn
+from schemas.contracts import TurnClaim
 from schemas.managed import ManagedTurnResult, PreparedManagedRequest
+from services import turns
 from services.common import fingerprint
 from services.managed_client import ManagedAIPort
 from services.telegram import expected_response_attempt_id
@@ -30,10 +32,13 @@ NAMESPACE = "main-chota.telegram.v1"
 class DeterministicManagedPort(ManagedAIPort):
     def __init__(self) -> None:
         self.calls = 0
+        self.prepared: list[PreparedManagedRequest] = []
+        self.operation_refs: list[dict[str, str | None]] = []
 
     async def execute(self, prepared: PreparedManagedRequest, binding: Any,
                       request_id: str = "") -> ManagedTurnResult:
         self.calls += 1
+        self.prepared.append(prepared)
         request = prepared.request
         return ManagedTurnResult(
             contract_version=request.contract_version,
@@ -48,7 +53,7 @@ class DeterministicManagedPort(ManagedAIPort):
             status="DRAFT_READY",
             draft_text="Managed answer **bold**",
             error_code=None,
-            operation_refs=[],
+            operation_refs=self.operation_refs,
         )
 
     async def evidence(self, request: Any, binding: Any) -> Any:
@@ -291,6 +296,35 @@ async def test_candidate_keyset_scan_selects_eligible_row_in_mixed_first_page(
 
 
 @pytest.mark.asyncio
+async def test_unmarked_claimed_turn_is_discovered_after_pre_dispatch_crash(
+    telegram_harness, sql
+) -> None:
+    h = telegram_harness
+    accepted = await admit(h["client"], h["gateway_headers"])
+    assert accepted.status_code == 200, accepted.text
+    principal = _telegram_worker_principal(h)
+    selected = await telegram_service.select_immediate(
+        h["database"], principal, h["settings"]
+    )
+    assert selected is not None
+    claimed = await turns.claim_turn(
+        h["database"], principal, selected,
+        TurnClaim(worker_ref="crashed-before-marker", lease_seconds=5),
+    )
+    assert claimed.turn.status == "CLAIMED"
+    assert claimed.turn.managed_dispatch_epoch is None
+    async with sql.begin() as conn:
+        await conn.execute(text(
+            "UPDATE agent_turns SET lease_expires_at=clock_timestamp() "
+            "- interval '1 second' WHERE id=:id"
+        ), {"id": selected})
+
+    assert await telegram_service.select_immediate(
+        h["database"], principal, h["settings"]
+    ) == selected
+
+
+@pytest.mark.asyncio
 async def test_provider_identity_canonical_history_worker_turn_and_delivery(
     telegram_harness, sql
 ) -> None:
@@ -330,6 +364,16 @@ async def test_provider_identity_canonical_history_worker_turn_and_delivery(
     assert retained.status_code == 200
     assert retained.json()["state"] == "DRAFT_READY"
     assert retained.json()["draft_text"] == "Managed answer **bold**"
+    work_scope = h["settings"].managed_ai_bindings[0]
+    work = await h["client"].post(
+                                   "/internal/v1/telegram/responses/work",
+                                   json={"owner_id": work_scope.owner_id,
+                                         "integration_id": str(work_scope.integration_id),
+                                         "agent_id": str(work_scope.agent_id),
+                                         "bot_id": int(inbound()["bot_id"])},
+                                   headers=h["gateway_headers"])
+    assert work.status_code == 200
+    assert len(work.json()["items"]) == 2  # No-policy mode remains one Turn per Message.
 
     response_attempt_id = expected_response_attempt_id(UUID(first_body["admission_id"]))
     begin_body = {**identity, "response_attempt_id": str(response_attempt_id)}

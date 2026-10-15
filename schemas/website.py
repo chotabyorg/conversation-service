@@ -2,7 +2,7 @@
 from typing import Literal
 from uuid import UUID
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from schemas.contracts import Contract, OperationReference, OwnerId, TextContent
 
@@ -38,9 +38,30 @@ class WebsiteResponseBegin(WebsiteIdentity):
 
 
 class WebsiteResponseBegun(Contract):
+    action: Literal["SEND", "REPLAY_COMPLETED", "DENY"]
     response_attempt_id: UUID
+    replay_source_attempt_id: UUID | None = None
     draft_text: TextContent
+    send: bool
     replayed: bool
+    denial_reason: Literal["SUPERSEDED", "DELIVERY_NOT_RETRYABLE"] | None = None
+
+    @model_validator(mode="after")
+    def action_truth_table(self) -> "WebsiteResponseBegun":
+        if self.action == "SEND":
+            valid = (self.send and not self.replayed
+                     and self.replay_source_attempt_id is None
+                     and self.denial_reason is None)
+        elif self.action == "REPLAY_COMPLETED":
+            valid = (not self.send and self.replayed
+                     and self.replay_source_attempt_id is not None
+                     and self.denial_reason is None)
+        else:
+            valid = (not self.send and self.replay_source_attempt_id is None
+                     and self.denial_reason is not None)
+        if not valid:
+            raise ValueError("invalid Website response action")
+        return self
 
 
 class WebsiteResponseComplete(WebsiteResponseBegin):

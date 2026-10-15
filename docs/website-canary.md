@@ -69,8 +69,14 @@ bounded failure. A terminal Turn releases FIFO progression to the next Message.
 Goal4A.1 adds [canonical assistant history and frozen v2 windows](history-projection.md).
 New immediate Website Turns freeze a bounded contiguous absolute canonical suffix
 through their selected Message; retained and generic v1 Turns keep the full prefix.
-No grouping, debounce or supersede is introduced. Stable frontend message IDs and
-an independently approved routing gate remain required for activation.
+Goal5 runs the shared durable scheduler before immediate selection. With a
+matching optional policy, admissions join a persisted Conversation burst whose
+first policy and maximum cutoff survive policy changes and restarts. Due bursts
+are selected in contiguous serializer-valid chunks of at most 256 inputs, with
+residual members retaining the same burst. With no matching policy, the immediate
+path remains available. Settling freshness fences only SETTLING Turns; a later
+input alone does not supersede an IMMEDIATE draft. Stable frontend message IDs
+and an independently approved routing gate remain required for activation.
 
 ## Evidence recovery and transport honesty
 
@@ -86,15 +92,27 @@ reads late refs for a scoped terminal marked Website Turn. It does not enrich or
 rewrite immutable terminal fingerprints. API needs its distinct processing
 credential and read-only AI binding/egress when this operational query is enabled.
 
-`/responses/begin` accepts result identity plus a fresh `response_attempt_id` UUID
-per physical HTTP response. It returns `{response_attempt_id,draft_text,replayed}`
-after committing retained draft authority check, one generic Generated→Dispatch
-Requested delivery journal and per-response intent. Replay uses one immutable draft
-and one generic delivery; it never resets UNKNOWN to Dispatch Requested.
+`/responses/begin` accepts the five result identity fields and a stable
+`response_attempt_id`. The current v2 UUID is
+`uuid5(NAMESPACE_URL, "main-chota.website-widget-response.v2:" + str(admission_id))`;
+it uses the retained `admission_id`, not the public `message_id`, and remains
+stable across Gateway restarts. Historical v1 UUID4 attempts retain their
+original exact admission scope and authorization.
+The response action is `SEND`, `REPLAY_COMPLETED`, or `DENY`. `SEND` alone has
+`send=true`; `REPLAY_COMPLETED` includes the actual `replay_source_attempt_id`
+and never authorizes another socket write; `DENY` has a closed denial reason.
+Every v2 lookup first searches the same admission and delivery for an eligible
+authorized `WRITE_COMPLETED` source, even when that requested v2 row already
+stores a denial. Late historical success therefore returns the real source while
+leaving the denied row unchanged. Failed, unknown and denied identities alone
+never become sendable again; UNKNOWN is never reset to Dispatch Requested.
 
 `/responses/complete` accepts the same fields plus local outcome
-`WRITE_COMPLETED|WRITE_FAILED|UNKNOWN`, returns `{response_attempt_id,outcome,replayed}`.
-Each response outcome is immutable. Generic delivery transitions once to UNKNOWN
+`WRITE_COMPLETED|WRITE_FAILED|UNKNOWN`, returns
+`{response_attempt_id,outcome,replayed}`. Completion records facts for the exact
+previously authorized attempt; completion on a denied identity is rejected. Each
+response outcome is immutable except authorized late evidence may resolve
+UNKNOWN. Generic delivery transitions once to UNKNOWN
 with immutable reconciliation evidence; local socket completion never means browser
 acknowledgement, DELIVERED or READ. Unconfirmed intents after crash remain honest.
 Safe response replay can create fresh HTTP evidence with zero AI/business execution.

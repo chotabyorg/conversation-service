@@ -78,6 +78,46 @@ is STALE_CLAIM; changed status/result is TERMINAL_RESULT_CONFLICT. This acknowle
 an already committed result and gives no active work ownership. Terminal cannot
 be reclaimed. No token/digest appears in reads or finish/fail output/logging.
 
+## Durable settling and input ownership
+
+`SettlingBurst` is the durable mode and lifetime authority for a policy-bound
+Conversation run. Admission resolves policy under the Conversation lock and
+stores immutable first-member policy/version, opened time, maximum cutoff, tail
+sequence and current `ready_at`. Every eligible input strictly before that
+persisted ready time joins the same burst, including after policy removal or
+replacement, and resets quiet time without moving the original maximum cutoff.
+Equality closes the burst; the next input starts a new burst using current policy
+or immediate mode. Generic journal and assistant rows do not extend a burst.
+`Message.created_at` is not scheduling authority.
+
+After the stored ready time, the scheduler closes the burst at that logical time
+and selects its maximal production-serializer-valid contiguous prefix, up to 256
+inputs. Residual inputs keep their membership, cutoff and deadline through
+additional Turns and restarts. `turn_input_messages` records every selected
+Message and assignment atomically with its Turn. One shared alias-safe ownership
+predicate also treats coverage by any retained AgentTurn input range as consumed,
+for every status; exact selection replay is resolved before conflict checks.
+Direct creation, immediate selectors and settling selection use that same
+predicate. A later assignment failure rolls back the Turn and all earlier
+assignments; the actual `pk_turn_input_messages` error maps to
+`TURN_SELECTION_CONFLICT`.
+
+Candidate scanning uses bounded keyset pages of 100. Each candidate has an
+independent transaction and Conversation-first lock; typed malformed/projection
+errors roll back before scanning continues. The earliest pending inbound is a
+mode/FIFO barrier, including malformed or generic rows. Unknown database and
+programming errors remain visible. See [durable settling](turn-settling.md) for
+burst, scheduler, and recovery details.
+
+Every canonical inbound increments freshness counters. The Goal5 settling
+revision dispatch fence applies only to retained SETTLING Turns; IMMEDIATE Turns
+keep Goal4B control and authority checks and are not superseded solely by later
+input. For SETTLING, the adapter locks Conversation then Turn and compares the
+frozen revision with the current revision. It commits either a single
+`DISPATCH_REQUESTED` permission or terminal `SUPERSEDED` evidence. A superseded
+draft retains its completed Turn and operation references; an ambiguous
+already-started provider write remains `UNKNOWN` and is never blindly reissued.
+
 ## Control authority
 
 AGENT, HUMAN_PENDING and HUMAN are persisted skeleton states, without handoff UI
@@ -105,7 +145,8 @@ state/milestones/revision/evidence row commit atomically under locks.
 
 | From | Allowed different new states |
 | --- | --- |
-| GENERATED | DISPATCH_REQUESTED |
+| GENERATED | DISPATCH_REQUESTED, SUPERSEDED |
+| SUPERSEDED | No different target |
 | DISPATCH_REQUESTED | PROVIDER_ACCEPTED, DELIVERED, READ, FAILED, UNKNOWN, PARTIAL, INTERRUPTED |
 | PROVIDER_ACCEPTED | DELIVERED, READ, FAILED, UNKNOWN, PARTIAL, INTERRUPTED |
 | UNKNOWN | PROVIDER_ACCEPTED, DELIVERED, READ, FAILED, PARTIAL, INTERRUPTED |
@@ -132,9 +173,10 @@ omitted/null update keeps existing known reference. Positive current state clear
 safe error_code; prior negative evidence remains in reconciliation history.
 
 Website promotion follows the [explicit write policy](history-projection.md).
-Future provider adapters/retries, other outbound promotion, input freshness,
-supersede, settling and managed business safety require separate contracts. Goal 1
-retains evidence for them without implementing them.
+Goal5 settling/supersede and dispatch fencing are implemented for the existing
+managed Telegram and Website workers; other provider adapters must use the shared
+coordinator before adopting these semantics. Business-operation safety remains
+with Business Runtime.
 
 ## Managed processing uncertainty
 

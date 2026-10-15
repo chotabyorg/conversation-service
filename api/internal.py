@@ -42,8 +42,9 @@ async def ingest(
     response: Response,
     database: AppDatabase,
     principal: TrustedPrincipal,
+    settings: AppSettings,
 ) -> InboundEventResult:
-    result = await journal.ingest_event(database, principal, request)
+    result = await journal.ingest_event(database, principal, request, settings)
     response.status_code = 200 if result.replayed else 201
     logger.info(
         "",

@@ -6,6 +6,8 @@ from api.dependencies import AppDatabase, AppSettings, TrustedPrincipal
 from schemas.telegram import (
     TelegramAdmission,
     TelegramAdmissionResult,
+    TelegramDeliveryWork,
+    TelegramDeliveryWorkRequest,
     TelegramIdentity,
     TelegramResponseBegin,
     TelegramResponseBegun,
@@ -41,3 +43,10 @@ async def complete(request: TelegramResponseComplete, database: AppDatabase,
                    principal: TrustedPrincipal,
                    settings: AppSettings) -> TelegramResponseCompleted:
     return await telegram.complete_response(database, principal, request, settings)
+
+
+@router.post("/responses/work", response_model=TelegramDeliveryWork)
+async def response_work(request: TelegramDeliveryWorkRequest, database: AppDatabase,
+                        principal: TrustedPrincipal,
+                        settings: AppSettings) -> TelegramDeliveryWork:
+    return await telegram.delivery_work(database, principal, request, settings)

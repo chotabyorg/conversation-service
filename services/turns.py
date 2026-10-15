@@ -6,12 +6,13 @@ import secrets
 from datetime import timedelta
 from uuid import UUID, uuid4
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError
 
 from core.errors import DomainError
 from db.database import Database
-from models import AgentTurn, Conversation, Message
+from models import AgentTurn, Conversation, Message, TurnInputMessage
 from schemas.contracts import (
     ErrorCode,
     Principal,
@@ -29,6 +30,7 @@ from services.common import (
     db_clock,
     fingerprint,
     locked_turn,
+    message_is_consumed,
     scope_filter,
     unique_violation,
 )
@@ -73,6 +75,17 @@ async def create_turn(
                     <= conversation.last_message_sequence
                 ):
                     raise DomainError(ErrorCode.INVALID_INPUT_BOUNDARY)
+                settling_input = await session.scalar(select(Message.id).where(
+                    Message.conversation_id == conversation.id,
+                    Message.sequence >= request.input_first_sequence,
+                    Message.sequence <= request.input_last_sequence,
+                    Message.actor == "CUSTOMER",
+                    Message.direction == "INBOUND",
+                    or_(Message.settling_policy_version.is_not(None),
+                        Message.settling_burst_id.is_not(None)),
+                ).limit(1))
+                if settling_input is not None:
+                    raise DomainError(ErrorCode.SETTLING_REQUIRED)
                 endpoints = set(
                     (
                         await session.scalars(
@@ -103,6 +116,16 @@ async def create_turn(
                 )
                 if active_id is not None:
                     raise DomainError(ErrorCode.ACTIVE_TURN_EXISTS)
+                covered_by_retained_turn = await session.scalar(select(Message.id).where(
+                    Message.conversation_id == conversation.id,
+                    Message.sequence >= request.input_first_sequence,
+                    Message.sequence <= request.input_last_sequence,
+                    Message.actor == "CUSTOMER",
+                    Message.direction == "INBOUND",
+                    message_is_consumed(),
+                ).limit(1))
+                if covered_by_retained_turn is not None:
+                    raise DomainError(ErrorCode.TURN_SELECTION_CONFLICT)
                 turn = AgentTurn(
                     id=uuid4(),
                     conversation_id=conversation.id,
@@ -113,6 +136,7 @@ async def create_turn(
                     context_last_sequence=conversation.last_message_sequence,
                     input_revision=conversation.input_revision,
                     authority_revision=conversation.authority_revision,
+                    settling_revision=conversation.settling_revision,
                     status="PENDING",
                     claim_epoch=0,
                     operation_refs=[],
@@ -120,11 +144,27 @@ async def create_turn(
                 )
                 session.add(turn)
                 await session.flush()
+                selected_messages = (await session.execute(select(
+                    Message.id, Message.sequence,
+                ).where(
+                    Message.conversation_id == conversation.id,
+                    Message.sequence >= request.input_first_sequence,
+                    Message.sequence <= request.input_last_sequence,
+                    Message.actor == "CUSTOMER",
+                    Message.direction == "INBOUND",
+                ).order_by(Message.sequence))).all()
+                for ordinal, (message_id, sequence) in enumerate(selected_messages):
+                    await session.execute(insert(TurnInputMessage).values(
+                        message_id=message_id, conversation_id=conversation.id,
+                        turn_id=turn.id, sequence=sequence, ordinal=ordinal,
+                    ))
                 result = TurnResult(turn=TurnRead.model_validate(turn), replayed=False)
     except IntegrityError as exc:
         # session.begin has rolled back before translating a recognized durable fence.
         if unique_violation(exc, "uq_turn_one_active"):
             raise DomainError(ErrorCode.ACTIVE_TURN_EXISTS) from None
+        if unique_violation(exc, "pk_turn_input_messages"):
+            raise DomainError(ErrorCode.TURN_SELECTION_CONFLICT) from None
         raise
     return result
 
@@ -149,7 +189,9 @@ async def claim_turn(
         clock = await db_clock(session)
         if turn.status in ("COMPLETED", "FAILED"):
             raise DomainError(ErrorCode.TURN_TERMINAL)
-        if conversation.control_mode != "AGENT":
+        # Once a managed request has been durably marked, recovery is about
+        # resolving that exact uncertainty, not authorizing a new AI dispatch.
+        if conversation.control_mode != "AGENT" and turn.managed_dispatch_epoch is None:
             raise DomainError(ErrorCode.CONTROL_MODE_CONFLICT)
         if turn.status == "CLAIMED" and (
             turn.lease_expires_at is None or turn.lease_expires_at > clock

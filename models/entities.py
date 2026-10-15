@@ -26,7 +26,7 @@ OWNER_BOUNDS = (
     "char_length(owner_id) BETWEEN 1 AND 255 AND octet_length(owner_id) <= 1020 AND owner_id <> '*'"
 )
 DELIVERY_STATES = (
-    "'GENERATED','DISPATCH_REQUESTED','PROVIDER_ACCEPTED','DELIVERED','"
+    "'GENERATED','DISPATCH_REQUESTED','SUPERSEDED','PROVIDER_ACCEPTED','DELIVERED','"
     "READ','FAILED','UNKNOWN','PARTIAL','INTERRUPTED'"
 )
 ERROR_STATES = "'FAILED','UNKNOWN','PARTIAL','INTERRUPTED'"
@@ -107,6 +107,9 @@ class Conversation(Base):
         BigInteger, default=0, server_default=sql_text("0")
     )
     input_revision: Mapped[int] = mapped_column(BigInteger, default=0, server_default=sql_text("0"))
+    settling_revision: Mapped[int] = mapped_column(
+        BigInteger, default=0, server_default=sql_text("0")
+    )
     control_mode: Mapped[str] = mapped_column(
         String(16), default="AGENT", server_default=sql_text("'AGENT'")
     )
@@ -144,7 +147,7 @@ class Conversation(Base):
         ),
         CheckConstraint(
             (
-                "last_message_sequence >= 0 AND input_revision >= 0 AND "
+                "last_message_sequence >= 0 AND input_revision >= 0 AND settling_revision >= 0 AND "
                 "input_revision <= last_message_sequence AND authority_revision >= "
                 "0"
             ),
@@ -215,6 +218,12 @@ class Message(Base):
     id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
     conversation_id: Mapped[UUID] = mapped_column(nullable=False)
     sequence: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    input_revision: Mapped[int | None] = mapped_column(BigInteger)
+    settling_revision: Mapped[int | None] = mapped_column(BigInteger)
+    settling_policy_version: Mapped[str | None] = mapped_column(String(64, collation="C"))
+    settling_quiet_window_ms: Mapped[int | None] = mapped_column(BigInteger)
+    settling_max_wait_ms: Mapped[int | None] = mapped_column(BigInteger)
+    settling_burst_id: Mapped[UUID | None] = mapped_column()
     actor: Mapped[str] = mapped_column(String(16), nullable=False)
     direction: Mapped[str] = mapped_column(String(16), nullable=False)
     content_type: Mapped[str] = mapped_column(
@@ -231,6 +240,8 @@ class Message(Base):
         UniqueConstraint("source_inbound_event_id", name="uq_message_source_event"),
         UniqueConstraint("source_agent_turn_id", name="uq_message_source_agent_turn"),
         UniqueConstraint("id", "conversation_id", name="uq_message_id_conversation"),
+        UniqueConstraint("id", "conversation_id", "sequence",
+                         name="uq_message_identity_sequence"),
         ForeignKeyConstraint(
             ["conversation_id"],
             ["conversations.id"],
@@ -244,6 +255,32 @@ class Message(Base):
             ondelete="RESTRICT",
         ),
         CheckConstraint("sequence >= 1", name="ck_message_sequence"),
+        CheckConstraint(
+            "(settling_burst_id IS NULL AND settling_policy_version IS NULL "
+            "AND settling_quiet_window_ms IS NULL AND settling_max_wait_ms IS NULL) OR "
+            "(settling_burst_id IS NOT NULL AND settling_policy_version IS NOT NULL "
+            "AND settling_quiet_window_ms IS NOT NULL AND settling_max_wait_ms IS NOT NULL "
+            "AND settling_policy_version ~ '^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$' "
+            "AND settling_quiet_window_ms >= 1 AND settling_max_wait_ms >= "
+            "settling_quiet_window_ms)",
+            name="ck_message_settling_snapshot",
+        ),
+        ForeignKeyConstraint(
+            ["settling_burst_id", "conversation_id"],
+            ["settling_bursts.id", "settling_bursts.conversation_id"],
+            name="fk_message_settling_burst_conversation",
+            ondelete="RESTRICT",
+        ),
+        CheckConstraint(
+            "(settling_burst_id IS NULL AND settling_policy_version IS NULL "
+            "AND settling_quiet_window_ms IS NULL AND settling_max_wait_ms IS NULL) OR "
+            "(settling_burst_id IS NOT NULL AND actor='CUSTOMER' AND direction='INBOUND' "
+            "AND settling_policy_version IS NOT NULL AND settling_quiet_window_ms IS NOT NULL "
+            "AND settling_max_wait_ms IS NOT NULL AND input_revision IS NOT NULL "
+            "AND input_revision >= 1 AND settling_revision IS NOT NULL "
+            "AND settling_revision >= 0)",
+            name="ck_message_settling_burst_shape",
+        ),
         ForeignKeyConstraint(
             ["source_agent_turn_id", "conversation_id"],
             ["agent_turns.id", "agent_turns.conversation_id"],
@@ -266,6 +303,40 @@ class Message(Base):
     )
 
 
+class SettlingBurst(Base):
+    """Immutable policy snapshot and durable lifetime for one Conversation burst."""
+
+    __tablename__ = "settling_bursts"
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    conversation_id: Mapped[UUID] = mapped_column(nullable=False)
+    policy_version: Mapped[str] = mapped_column(String(64, collation="C"), nullable=False)
+    quiet_window_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    max_wait_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    opened_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    max_cutoff_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_input_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    tail_sequence: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    ready_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    __table_args__ = (
+        UniqueConstraint("id", "conversation_id", name="uq_settling_burst_id_conversation"),
+        ForeignKeyConstraint(["conversation_id"], ["conversations.id"],
+                             name="fk_settling_burst_conversation", ondelete="RESTRICT"),
+        CheckConstraint(
+            "policy_version ~ '^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$' "
+            "AND quiet_window_ms >= 1 AND max_wait_ms >= quiet_window_ms "
+            "AND tail_sequence >= 1 AND max_cutoff_at > opened_at "
+            "AND last_input_at >= opened_at AND ready_at >= last_input_at "
+            "AND ready_at <= max_cutoff_at "
+            "AND (closed_at IS NULL OR closed_at = ready_at)",
+            name="ck_settling_burst_shape",
+        ),
+        Index("uq_settling_burst_open", "conversation_id", unique=True,
+              postgresql_where=sql_text("closed_at IS NULL")),
+        Index("ix_settling_burst_due", "ready_at", "conversation_id"),
+    )
+
+
 class AgentTurn(Base):
     __tablename__ = "agent_turns"
     id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
@@ -277,6 +348,10 @@ class AgentTurn(Base):
     context_last_sequence: Mapped[int] = mapped_column(BigInteger, nullable=False)
     input_revision: Mapped[int] = mapped_column(BigInteger, nullable=False)
     authority_revision: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    settling_revision: Mapped[int] = mapped_column(
+        BigInteger, default=0, server_default=sql_text("0")
+    )
+    settling_burst_id: Mapped[UUID | None] = mapped_column()
     status: Mapped[str] = mapped_column(
         String(16), default="PENDING", server_default=sql_text("'PENDING'")
     )
@@ -335,6 +410,12 @@ class AgentTurn(Base):
             name="fk_turn_context_last",
             ondelete="RESTRICT",
         ),
+        ForeignKeyConstraint(
+            ["settling_burst_id", "conversation_id"],
+            ["settling_bursts.id", "settling_bursts.conversation_id"],
+            name="fk_turn_settling_burst_conversation",
+            ondelete="RESTRICT",
+        ),
         CheckConstraint(
             (
                 "input_first_sequence >= 1 AND input_first_sequence <= "
@@ -347,6 +428,7 @@ class AgentTurn(Base):
         CheckConstraint(
             "status IN ('PENDING','CLAIMED','COMPLETED','FAILED')", name="ck_turn_status"
         ),
+        CheckConstraint("settling_revision >= 0", name="ck_turn_settling_revision"),
         CheckConstraint("claim_epoch >= 0", name="ck_turn_epoch"),
         CheckConstraint(digest_check("creation_fingerprint"), name="ck_turn_creation_fingerprint"),
         CheckConstraint(digest_check("claim_token_digest"), name="ck_turn_claim_digest"),
@@ -371,6 +453,34 @@ class AgentTurn(Base):
     )
 
 
+class TurnInputMessage(Base):
+    """Canonical inbound messages frozen into a Turn; also the durable consumed marker."""
+
+    __tablename__ = "turn_input_messages"
+    message_id: Mapped[UUID] = mapped_column(primary_key=True)
+    conversation_id: Mapped[UUID] = mapped_column(nullable=False)
+    turn_id: Mapped[UUID] = mapped_column(nullable=False)
+    sequence: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    ordinal: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    __table_args__ = (
+        UniqueConstraint("turn_id", "sequence", name="uq_turn_input_sequence"),
+        ForeignKeyConstraint(
+            ["message_id", "conversation_id", "sequence"],
+            ["messages.id", "messages.conversation_id", "messages.sequence"],
+            name="fk_turn_input_exact_message",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["turn_id", "conversation_id"],
+            ["agent_turns.id", "agent_turns.conversation_id"],
+            name="fk_turn_input_turn_conversation",
+            ondelete="RESTRICT",
+        ),
+        CheckConstraint("sequence >= 1 AND ordinal >= 0", name="ck_turn_input_position"),
+        Index("ix_turn_input_conversation_sequence", "conversation_id", "sequence"),
+    )
+
+
 class DeliveryAttempt(Base):
     __tablename__ = "delivery_attempts"
     id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
@@ -379,6 +489,8 @@ class DeliveryAttempt(Base):
     source_turn_id: Mapped[UUID] = mapped_column(nullable=False)
     creation_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
     authority_revision: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    expected_settling_revision: Mapped[int | None] = mapped_column(BigInteger)
+    fenced_settling_revision: Mapped[int | None] = mapped_column(BigInteger)
     status: Mapped[str] = mapped_column(
         String(32), default="GENERATED", server_default=sql_text("'GENERATED'")
     )
@@ -415,6 +527,13 @@ class DeliveryAttempt(Base):
         CheckConstraint(f"status IN ({DELIVERY_STATES})", name="ck_delivery_status"),
         CheckConstraint("revision >= 0 AND authority_revision >= 0", name="ck_delivery_revisions"),
         CheckConstraint(
+            "(expected_settling_revision IS NULL AND fenced_settling_revision IS NULL) OR "
+            "(expected_settling_revision IS NOT NULL AND expected_settling_revision >= 0 "
+            "AND (fenced_settling_revision IS NULL OR (fenced_settling_revision IS NOT NULL "
+            "AND fenced_settling_revision >= expected_settling_revision)))",
+            name="ck_delivery_settling_fence",
+        ),
+        CheckConstraint(
             digest_check("creation_fingerprint"), name="ck_delivery_creation_fingerprint"
         ),
         CheckConstraint(
@@ -444,6 +563,8 @@ class DeliveryReconciliation(Base):
     provider_occurred_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     error_code: Mapped[str | None] = mapped_column(String(32))
     expected_authority_revision: Mapped[int | None] = mapped_column(BigInteger)
+    expected_settling_revision: Mapped[int | None] = mapped_column(BigInteger)
+    result_settling_revision: Mapped[int | None] = mapped_column(BigInteger)
     accepted_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=sql_text("clock_timestamp()")
     )
@@ -491,6 +612,13 @@ class DeliveryReconciliation(Base):
                 "'DISPATCH_REQUESTED' AND expected_authority_revision IS NULL)"
             ),
             name="ck_reconciliation_authority",
+        ),
+        CheckConstraint(
+            "(expected_settling_revision IS NULL AND result_settling_revision IS NULL) OR "
+            "(expected_settling_revision IS NOT NULL AND result_settling_revision IS NOT NULL "
+            "AND expected_settling_revision >= 0 AND result_settling_revision >= "
+            "expected_settling_revision)",
+            name="ck_reconciliation_settling_fence",
         ),
     )
 
@@ -541,7 +669,7 @@ class WebsiteImmediateTurn(Base):
     __tablename__ = "website_immediate_turns"
     message_id: Mapped[UUID] = mapped_column(primary_key=True)
     conversation_id: Mapped[UUID] = mapped_column(nullable=False)
-    turn_id: Mapped[UUID] = mapped_column(nullable=False, unique=True)
+    turn_id: Mapped[UUID] = mapped_column(nullable=False)
     __table_args__ = (
         ForeignKeyConstraint(["message_id"], ["website_admissions.canonical_message_id"],
                              ondelete="RESTRICT"),
@@ -560,6 +688,9 @@ class WebsiteResponseAttempt(Base):
     admission_id: Mapped[UUID] = mapped_column(nullable=False)
     delivery_id: Mapped[UUID] = mapped_column(nullable=False)
     conversation_id: Mapped[UUID] = mapped_column(nullable=False)
+    send_authorized: Mapped[bool] = mapped_column(
+        nullable=False, default=False, server_default=sql_text("false")
+    )
     outcome: Mapped[str | None] = mapped_column(String(32))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=sql_text("clock_timestamp()")
@@ -637,11 +768,29 @@ class TelegramAdmission(Base):
     )
 
 
+class TelegramProviderAccount(Base):
+    """Immutable provider-account pin for a managed Telegram integration."""
+
+    __tablename__ = "telegram_provider_accounts"
+    owner_id: Mapped[str] = mapped_column(String(255, collation="C"), primary_key=True)
+    integration_id: Mapped[UUID] = mapped_column(primary_key=True)
+    state: Mapped[str] = mapped_column(String(16), nullable=False)
+    bot_id: Mapped[str | None] = mapped_column(String(64, collation="C"))
+    __table_args__ = (
+        CheckConstraint(
+            "(state='BOUND' AND bot_id IS NOT NULL "
+            "AND bot_id ~ '^[1-9][0-9]{0,18}$') OR "
+            "(state='CONFLICT' AND bot_id IS NULL)",
+            name="ck_telegram_provider_account_shape",
+        ),
+    )
+
+
 class TelegramImmediateTurn(Base):
     __tablename__ = "telegram_immediate_turns"
     message_id: Mapped[UUID] = mapped_column(primary_key=True)
     conversation_id: Mapped[UUID] = mapped_column(nullable=False)
-    turn_id: Mapped[UUID] = mapped_column(nullable=False, unique=True)
+    turn_id: Mapped[UUID] = mapped_column(nullable=False)
     __table_args__ = (
         ForeignKeyConstraint(["message_id"], ["telegram_admissions.canonical_message_id"],
                              ondelete="RESTRICT"),
@@ -660,6 +809,9 @@ class TelegramResponseAttempt(Base):
     admission_id: Mapped[UUID] = mapped_column(nullable=False)
     delivery_id: Mapped[UUID] = mapped_column(nullable=False)
     conversation_id: Mapped[UUID] = mapped_column(nullable=False)
+    send_authorized: Mapped[bool] = mapped_column(
+        nullable=False, default=False, server_default=sql_text("false")
+    )
     outcome: Mapped[str | None] = mapped_column(String(32))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=sql_text("clock_timestamp()")
