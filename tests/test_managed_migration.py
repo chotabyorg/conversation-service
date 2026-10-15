@@ -79,6 +79,11 @@ PRE_GOAL5_COLUMNS = {
     for table in TABLES
 }
 PRE_GOAL5_COLUMNS["messages"] = PRE_GOAL5_COLUMNS["messages"] | {"input_revision"}
+# Authority floors were introduced in 0008 and must be omitted both from the
+# populated-0001 fixture projection and from cross-revision equality checks.
+PRE_GOAL5_COLUMNS["conversations"] = (
+    PRE_GOAL5_COLUMNS["conversations"] | {"authority_input_floor_sequence"}
+)
 GOAL5_TABLES = (
     *TABLES,
     "turn_input_messages",
@@ -151,7 +156,7 @@ async def goal4b_rows(sql):
     """Project retained facts onto the exact 0005 schema before comparing an upgrade."""
     result = {}
     omitted = {table: set() for table in GOAL4B_TABLES}
-    omitted["conversations"].update({"settling_revision"})
+    omitted["conversations"].update({"settling_revision", "authority_input_floor_sequence"})
     omitted["messages"].update({
         "input_revision", "settling_revision", "settling_policy_version",
         "settling_quiet_window_ms", "settling_max_wait_ms", "settling_burst_id",
@@ -837,3 +842,52 @@ async def test_marker_cannot_exist_on_pending_and_exact_catalog_columns(h, sql):
             )
         )
         assert "EXECUTION_UNKNOWN" in constraint
+
+
+async def test_0008_backfills_and_retains_nonzero_authority_input_floor(h, sql, database_url):
+    accepted = await h.ingest(provider_thread_id="authority-floor-backfill")
+    await h.ingest(provider_thread_id="authority-floor-backfill", text="later input")
+    conversation_id = accepted["conversation"]["id"]
+    await h.database.dispose()
+    migrate(database_url, "downgrade", "0007_voice_bridge")
+    async with sql.begin() as connection:
+        await connection.execute(text(
+            "UPDATE conversations SET authority_revision=2 "
+            "WHERE id=:id"
+        ), {"id": conversation_id})
+    migrate(database_url, "upgrade", "head")
+    assert await h.database.ready()
+    async with sql.connect() as connection:
+        floor, tail = (await connection.execute(text(
+            "SELECT authority_input_floor_sequence,last_message_sequence "
+            "FROM conversations WHERE id=:id"
+        ), {"id": conversation_id})).one()
+    assert floor == tail == 2
+
+    rejected = migrate(database_url, "downgrade", "0007_voice_bridge", expected=1)
+    assert "Business effect authority evidence is retained" in rejected.stderr
+    assert await h.database.ready()
+    async with sql.connect() as connection:
+        retained = await connection.scalar(text(
+            "SELECT authority_input_floor_sequence FROM conversations WHERE id=:id"
+        ), {"id": conversation_id})
+    assert retained == 2
+
+
+async def test_0008_downgrade_refuses_retained_immutable_permit(h, sql, database_url):
+    from tests.test_external_effects import claim_and_stamp, context_for, permit_request
+
+    accepted = await h.ingest(provider_thread_id="permit-downgrade-fence")
+    turn, _ = await h.select(accepted, input_first_sequence=1, input_last_sequence=1)
+    await claim_and_stamp(h, sql, turn)
+    context = context_for(accepted["conversation"], turn, turn)
+    issued = await h.call("POST", "/external-effect-permits", permit_request(context))
+    assert issued.status_code == 200, issued.text
+    await h.database.dispose()
+
+    rejected = migrate(database_url, "downgrade", "0007_voice_bridge", expected=1)
+    assert "Business effect authority evidence is retained" in rejected.stderr
+    assert await h.database.ready()
+    async with sql.connect() as connection:
+        count = await connection.scalar(text("SELECT count(*) FROM external_effect_permits"))
+    assert count == 1

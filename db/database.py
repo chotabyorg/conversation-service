@@ -50,7 +50,7 @@ class Database:
     async def dispose(self) -> None:
         await self.engine.dispose()
 
-    async def ready(self, expected_revision: str = "0007_voice_bridge") -> bool:
+    async def ready(self, expected_revision: str = "0008_business_effect_permits") -> bool:
         try:
             async with self.engine.connect() as connection:
                 if await connection.scalar(text("SELECT 1")) != 1:
@@ -70,10 +70,17 @@ class Database:
                 ))
                 await connection.execute(
                     text(
-                        "SELECT id, last_message_sequence, authority_revision, settling_revision "
+                        "SELECT id, last_message_sequence, authority_revision, "
+                        "authority_input_floor_sequence, settling_revision "
                         "FROM conversations LIMIT 1"
                     )
                 )
+                await connection.execute(text(
+                    "SELECT id,conversation_id,turn_id,origin_turn_id,operation_namespace,"
+                    "operation_id,operation_fingerprint,request_fingerprint,agent_id,"
+                    "authority_revision,authority_input_floor_sequence,split_input_floor_sequence "
+                    "FROM external_effect_permits LIMIT 1"
+                ))
                 await connection.execute(text(
                     "SELECT id,input_revision,settling_revision,settling_policy_version,"
                     "settling_quiet_window_ms,settling_max_wait_ms FROM messages LIMIT 1"

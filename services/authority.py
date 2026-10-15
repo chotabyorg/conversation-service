@@ -4,8 +4,16 @@ from uuid import UUID
 
 from core.errors import DomainError
 from db.database import Database
+from models import Conversation
 from schemas.contracts import ControlTransition, ConversationRead, ErrorCode, Principal
 from services.common import authorized_conversation, db_clock
+
+
+def advance_authority(conversation: Conversation) -> None:
+    """Advance authority and fence all input accepted in the previous epoch."""
+    # The locked Conversation row is deliberately the single authority/freshness lock.
+    conversation.authority_revision += 1
+    conversation.authority_input_floor_sequence = conversation.last_message_sequence
 
 
 async def transition_control(
@@ -15,7 +23,7 @@ async def transition_control(
         conversation = await authorized_conversation(session, principal, conversation_id, lock=True)
         if request.expected_authority_revision != conversation.authority_revision:
             raise DomainError(ErrorCode.AUTHORITY_REVISION_CONFLICT)
-        conversation.authority_revision += 1
+        advance_authority(conversation)
         conversation.control_mode = request.control_mode.value
         conversation.updated_at = await db_clock(session)
         await session.flush()

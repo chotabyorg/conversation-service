@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from api.effects import router as effects_router
 from api.handlers import install_error_handlers
 from api.health import router as health_router
 from api.internal import router as internal_router
@@ -60,6 +61,7 @@ def create_app(
     install_error_handlers(application)
     application.include_router(health_router)
     application.include_router(internal_router)
+    application.include_router(effects_router)
     application.include_router(telegram_router)
     application.include_router(voice_router)
     application.include_router(website_router)

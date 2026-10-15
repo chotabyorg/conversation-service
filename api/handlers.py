@@ -12,7 +12,7 @@ from starlette.exceptions import HTTPException
 from api.middleware import error_payload
 from core.errors import DomainError
 from core.logging import logger
-from schemas import contracts
+from schemas import contracts, effects
 from schemas.contracts import ErrorCode
 
 _FIELD_NAMES = {
@@ -27,6 +27,9 @@ _FIELD_NAMES = {
     "delivery_attempt_id",
 }
 for _object in vars(contracts).values():
+    if isinstance(_object, type) and issubclass(_object, contracts.Contract):
+        _FIELD_NAMES.update(_object.model_fields)
+for _object in vars(effects).values():
     if isinstance(_object, type) and issubclass(_object, contracts.Contract):
         _FIELD_NAMES.update(_object.model_fields)
 

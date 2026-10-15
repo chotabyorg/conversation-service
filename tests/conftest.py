@@ -151,7 +151,8 @@ async def sql(database_url: str):
         assert 160000 <= int(version) < 170000, "Required real PostgreSQL16"
         await connection.execute(
             text(
-                "TRUNCATE telegram_response_attempts, telegram_immediate_turns, "
+                "TRUNCATE external_effect_permits, telegram_response_attempts, "
+                "telegram_immediate_turns, "
                 "telegram_admissions, telegram_provider_accounts, settling_bursts, "
                 "website_response_attempts, website_immediate_turns, website_admissions, "
                 "delivery_reconciliations, delivery_attempts, agent_turns, messages, "

@@ -21,6 +21,8 @@ gateway change or provider send. The managed executor is described in
 | POST `/turns/{id}/complete` | claim_epoch, claim_token, outcome DRAFT_READY/NO_RESPONSE, draft_text optional, operation_refs=[] | TurnResult; first mutation needs live winning proof; exact terminal replay needs stored winning proof and identical result, even after expiry |
 | POST `/turns/{id}/fail` | claim_epoch, claim_token, failure_code, operation_refs=[] | TurnResult with inspectable failure; same terminal replay/fencing contract |
 | POST `/conversations/{id}/control` | expected_authority_revision, control_mode | ConversationRead; every accepted CAS increments revision, including same-mode; stale retry conflicts |
+| POST `/external-effect-eligibility` | strict opaque effect context | Observational 200 with eligible/reason and authority/input floors; never grants dispatch authority |
+| POST `/external-effect-permits` | strict context plus opaque Business operation identity and frozen command fingerprint | Immutable permit 200 after positive commit; exact full-request replay returns original permit; a fresh denial is 409 |
 | POST `/conversations/{id}/delivery-attempts` | delivery_key UUID, source_turn_id UUID, expected_authority_revision | DeliveryResult; new GENERATED 201, exact creation replay 200; changed key DELIVERY_IDENTITY_CONFLICT, another key for same draft DELIVERY_INTENT_EXISTS |
 | GET `/delivery-attempts/{id}` | UUID | DeliveryAttemptRead through granted parent |
 | POST `/delivery-attempts/{id}/reconcile` | reconciliation_key UUID, expected_revision, status other than GENERATED; optional provider refs/time/error_code, expected_authority_revision | DeliveryReconcileResult; new/old exact evidence 200; old replay returns current attempt and original applied_revision; changed key payload conflicts |
@@ -31,8 +33,8 @@ Message edit or generic outbound append exists. Website response completion adds
 canonical assistant history only under the [explicit write policy](history-projection.md).
 
 `GET /health` returns `{status:"ok",service:"conversation-service"}`.
-`GET /ready` returns ready200 only when DB query, migration `0006_turn_settling` and
-required Conversation, Website and Telegram journal queries succeed; otherwise not_ready503. These are the only
+`GET /ready` returns ready200 only when DB query, migration `0008_business_effect_permits` and
+required Conversation, permit, Website and Telegram journal queries succeed; otherwise not_ready503. These are the only
 unauthenticated routes. `GET /internal/openapi.json` requires the service header.
 Default `/docs`, `/redoc`, `/openapi.json` are disabled. The fetched schema provides
 every exact DTO/property and X-Service-Token security requirement.
@@ -176,6 +178,19 @@ thread is the decimal private `chat_id`, scoped by the generic tuple
 `(owner_id,integration_id,TELEGRAM,provider_thread_id)`. Group/non-text/anonymous
 messages stay on their preexisting unsupported/legacy path. See
 [Telegram canary](telegram-canary.md) for rollback and send semantics.
+
+## Business external-effect authority
+
+The private `BUSINESS_EFFECT` role can POST only `/external-effect-eligibility`
+and `/external-effect-permits`; see [external-effect authority](external-effect-authority.md)
+for exact DTOs, grant scope, closed denial reasons and the transaction boundary.
+The role cannot use foundation, execution, Website, Telegram, Voice or OpenAPI
+routes. Eligibility is a read-only observation. Permit authority exists only after
+Conversation commits the immutable opaque permit while holding the same parent
+lock used by customer ingress and authority changes. Existing exact permit replay
+has precedence over later authority/input changes; fresh permits require the
+latest complete canonical customer input and reject every split settling chunk.
+This private route does not add a Gateway or public client API.
 
 ## Goal5 durable settling and supersede
 

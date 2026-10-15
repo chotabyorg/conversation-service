@@ -87,6 +87,15 @@ class BoundaryMiddleware:
                 if principal.role == "VOICE_PROCESSING":
                     await reject(ErrorCode.NOT_FOUND)
                     return
+                business_effect_paths = {
+                    "/internal/v1/external-effect-eligibility",
+                    "/internal/v1/external-effect-permits",
+                }
+                if principal.role == "BUSINESS_EFFECT" and (
+                    path not in business_effect_paths or scope["method"] != "POST"
+                ):
+                    await reject(ErrorCode.NOT_FOUND)
+                    return
                 website_paths = {"/internal/v1/website/admissions", "/internal/v1/website/results",
                                  "/internal/v1/website/responses/begin",
                                  "/internal/v1/website/responses/complete"}
