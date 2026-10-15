@@ -37,6 +37,7 @@ from services.common import (
 from services.settling import CANDIDATE_PAGE_SIZE, select_settled_turn
 from services.telegram import expected_response_attempt_id
 from services.telegram_worker import TelegramWorker
+from tests.conftest import observed_waiters
 from tests.test_telegram import DeterministicManagedPort, inbound
 from tests.test_telegram import admit as telegram_admit
 
@@ -674,6 +675,138 @@ async def test_latest_input_fence_catches_late_stamped_m2_m3_and_allows_m4(
         finally:
             port.release.set()
         assert await running
+
+
+@pytest.mark.parametrize("permit_first", [False, True], ids=["acceptance-first", "permit-first"])
+async def test_settling_selected_turn_acceptance_and_effect_permit_share_parent_lock(
+    telegram_harness, sql, permit_first
+):
+    """Only the transaction first on the Conversation lock can cross the fence."""
+    from core.config import AuthPrincipal
+
+    h = telegram_harness
+    settings = _policy_settings(h["settings"], quiet_ms=10, max_wait_ms=30_000)
+    _install_settings(h, settings)
+    business_token = secrets.token_urlsafe(32)
+    business = AuthPrincipal(
+        principal_id="settling-effect-lock-race",
+        role="BUSINESS_EFFECT",
+        token=business_token,
+        grants=(settings.auth_principals[0].grants[0],),
+    )
+    settings = settings.model_copy(update={
+        "auth_principals": (*settings.auth_principals, business),
+    })
+    _install_settings(h, settings)
+    headers = {"X-Service-Token": business_token}
+    binding = settings.managed_ai_bindings[0]
+
+    first = await telegram_admit(
+        h["client"], h["gateway_headers"], message_id=7, update_id=55,
+        text_value="origin customer input",
+    )
+    assert first.status_code == 200, first.text
+    await _advance_to_due(sql, sequences=[1])
+    assert await TelegramWorker(
+        h["database"], settings, DeterministicManagedPort()
+    ).run_once()
+    async with h["database"].session_factory() as session:
+        origin = await session.scalar(select(AgentTurn))
+        conversation = await session.get(Conversation, origin.conversation_id)
+    assert origin is not None and origin.status == "COMPLETED"
+    assert conversation is not None
+
+    second = await telegram_admit(
+        h["client"], h["gateway_headers"], message_id=8, update_id=56,
+        text_value="settled selected turn",
+    )
+    assert second.status_code == 200, second.text
+    await _advance_to_due(sql, sequences=[2])
+    port = PausingManagedPort()
+    running = asyncio.create_task(TelegramWorker(h["database"], settings, port).run_once())
+    try:
+        await asyncio.wait_for(port.started.wait(), timeout=8)
+        async with h["database"].session_factory() as session:
+            current = await session.scalar(select(AgentTurn).where(
+                AgentTurn.status == "CLAIMED"))
+            selected_conversation = (
+                await session.get(Conversation, current.conversation_id)
+                if current is not None else None
+            )
+        assert current is not None and selected_conversation is not None
+        assert current.id != origin.id
+        assert (current.input_first_sequence, current.input_last_sequence) == (2, 2)
+        assert current.managed_request_fingerprint is not None
+        context = {
+            "contract_version": 1,
+            "conversation_id": str(selected_conversation.id),
+            "turn_id": str(current.id),
+            "origin_turn_id": str(origin.id),
+            "owner_id": selected_conversation.owner_id,
+            "integration_id": str(selected_conversation.integration_id),
+            "channel": selected_conversation.channel,
+            "agent_id": str(binding.agent_id),
+            "authority_revision": current.authority_revision,
+            "managed_request_fingerprint": current.managed_request_fingerprint,
+        }
+        request = {
+            **context,
+            "operation_namespace": "main-chota.ai-business.v1",
+            "operation_id": str(uuid4()),
+            "operation_fingerprint": "e" * 64,
+        }
+
+        async def issue_permit():
+            return await h["client"].post(
+                "/internal/v1/external-effect-permits", json=request, headers=headers,
+            )
+
+        async def accept_next_customer_input():
+            return await telegram_admit(
+                h["client"], h["gateway_headers"], message_id=9, update_id=57,
+                text_value="new burst races the permit",
+            )
+
+        async with sql.begin() as blocker:
+            blocker_pid = await blocker.scalar(text("SELECT pg_backend_pid()"))
+            await blocker.execute(
+                text("SELECT id FROM conversations WHERE id=:id FOR UPDATE"),
+                {"id": selected_conversation.id},
+            )
+            first_task = asyncio.create_task(
+                issue_permit() if permit_first else accept_next_customer_input()
+            )
+            await observed_waiters(sql, blocker_pid, 1, "Settling ingress versus effect permit")
+            second_task = asyncio.create_task(
+                accept_next_customer_input() if permit_first else issue_permit()
+            )
+            await observed_waiters(sql, blocker_pid, 2, "Settling ingress versus effect permit")
+
+        first_result, second_result = await asyncio.gather(first_task, second_task)
+        permit_result, admission_result = (
+            (first_result, second_result) if permit_first else (second_result, first_result)
+        )
+        assert admission_result.status_code == 200, admission_result.text
+        if permit_first:
+            assert permit_result.status_code == 200, permit_result.text
+            assert permit_result.json()["replayed"] is False
+            replay = await issue_permit()
+            assert replay.status_code == 200, replay.text
+            assert replay.json()["replayed"] is True
+            assert replay.json()["permit_id"] == permit_result.json()["permit_id"]
+        else:
+            assert permit_result.status_code == 409, permit_result.text
+            assert permit_result.json()["detail"] == {
+                "code": "EXTERNAL_EFFECT_DENIED", "reason": "INPUT_SUPERSEDED"
+            }
+        async with sql.connect() as connection:
+            permit_count = await connection.scalar(
+                text("SELECT count(*) FROM external_effect_permits")
+            )
+        assert permit_count == (1 if permit_first else 0)
+    finally:
+        port.release.set()
+    assert await running
 
 
 @pytest.mark.asyncio

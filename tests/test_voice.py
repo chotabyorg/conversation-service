@@ -408,6 +408,111 @@ async def test_voice_input_ownership_can_authorize_an_opaque_business_permit(vh)
     assert replay.json()["permit_id"] == issued.json()["permit_id"]
 
 
+@pytest.mark.parametrize("permit_first", [False, True], ids=["close-first", "permit-first"])
+async def test_voice_close_and_business_permit_share_the_parent_lock(vh, sql, permit_first):
+    """Call closure and permit issuance serialize on the same Conversation row."""
+    from core.config import AuthPrincipal
+    from schemas.contracts import TurnClaim
+    from tests.conftest import observed_waiters
+
+    origin_id = UUID(await draft(vh))
+    assert (await post(vh, "utterances", sequence=2, text="new customer input")).status_code == 200
+    current_id = await voice.select_turn(vh["database"], vh["worker"].principal, vh["settings"])
+    assert current_id is not None
+    claim = await turns.claim_turn(
+        vh["database"], vh["worker"].principal, current_id,
+        TurnClaim(worker_ref="effect-race", lease_seconds=30),
+    )
+    async with vh["database"].session_factory() as session, session.begin():
+        current = await session.get(AgentTurn, current_id)
+        origin = await session.get(AgentTurn, origin_id)
+        conversation = await session.scalar(select(Conversation))
+        assert current is not None and origin is not None and conversation is not None
+        assert origin.status == "COMPLETED"
+        current.managed_agent_id = AGENT
+        current.managed_dispatch_epoch = claim.turn.claim_epoch
+        current.managed_dispatch_started_at = current.started_at
+        current.managed_request_fingerprint = "a" * 64
+        context = {
+            "contract_version": 1,
+            "conversation_id": str(conversation.id),
+            "turn_id": str(current.id),
+            "origin_turn_id": str(origin.id),
+            "owner_id": OWNER,
+            "integration_id": str(INTEGRATION),
+            "channel": "VOICE",
+            "agent_id": str(AGENT),
+            "authority_revision": current.authority_revision,
+            "managed_request_fingerprint": current.managed_request_fingerprint,
+        }
+        conversation_id = conversation.id
+
+    token = secrets.token_urlsafe(32)
+    business = AuthPrincipal.model_validate({
+        "principal_id": "voice-effect-lock-race",
+        "role": "BUSINESS_EFFECT",
+        "token": token,
+        "grants": [{"owner_id": OWNER, "integration_id": INTEGRATION,
+                    "channel": "VOICE", "provider_namespace": "main-chota.voice.v1"}],
+    })
+    vh["app"].state.settings = vh["settings"].model_copy(update={
+        "auth_principals": (*vh["settings"].auth_principals, business),
+    })
+    headers = {"X-Service-Token": token}
+    request = {
+        **context,
+        "operation_namespace": "main-chota.ai-business.v1",
+        "operation_id": str(uuid4()),
+        "operation_fingerprint": "e" * 64,
+    }
+
+    async def issue_permit():
+        return await vh["client"].post(
+            "/internal/v1/external-effect-permits", json=request, headers=headers,
+        )
+
+    async def close_call():
+        return await post(vh, "calls/end", reason="DISCONNECTED")
+
+    async with sql.begin() as blocker:
+        blocker_pid = await blocker.scalar(text("SELECT pg_backend_pid()"))
+        await blocker.execute(
+            text("SELECT id FROM conversations WHERE id=:id FOR UPDATE"),
+            {"id": conversation_id},
+        )
+        first = asyncio.create_task(issue_permit() if permit_first else close_call())
+        await observed_waiters(sql, blocker_pid, 1, "Voice close versus effect permit")
+        second = asyncio.create_task(close_call() if permit_first else issue_permit())
+        await observed_waiters(sql, blocker_pid, 2, "Voice close versus effect permit")
+    first_result, second_result = await asyncio.gather(first, second)
+    permit_result, close_result = (
+        (first_result, second_result) if permit_first else (second_result, first_result)
+    )
+    assert close_result.status_code == 200, close_result.text
+
+    if permit_first:
+        assert permit_result.status_code == 200, permit_result.text
+        assert permit_result.json()["replayed"] is False
+        replay = await issue_permit()
+        assert replay.status_code == 200, replay.text
+        assert replay.json()["replayed"] is True
+        assert replay.json()["permit_id"] == permit_result.json()["permit_id"]
+    else:
+        assert permit_result.status_code == 409, permit_result.text
+        assert permit_result.json()["detail"] == {
+            "code": "EXTERNAL_EFFECT_DENIED", "reason": "AUTHORITY_CHANGED"
+        }
+
+    async with vh["database"].session_factory() as session:
+        call = await session.scalar(select(VoiceCall))
+        assert call is not None and call.ended_at is not None
+    async with sql.connect() as connection:
+        permit_count = await connection.scalar(
+            text("SELECT count(*) FROM external_effect_permits")
+        )
+    assert permit_count == (1 if permit_first else 0)
+
+
 async def test_invalid_candidate_does_not_starve_a_later_call(vh):
     await start(vh)
     await post(vh, "utterances", sequence=1, text="first")
