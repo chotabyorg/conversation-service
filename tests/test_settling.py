@@ -882,6 +882,61 @@ async def test_split_burst_chunks_are_ineligible_and_later_turn_reports_split_fl
         port.release.set()
     assert await running
 
+    # A later complete burst can start a new intent using itself as origin;
+    # the old split floor applies only when carrying older provenance forward.
+    fresh_after_split = await telegram_admit(
+        h["client"], h["gateway_headers"], message_id=5001, update_id=6001,
+        text_value="new intent after split",
+    )
+    assert fresh_after_split.status_code == 200
+    await _advance_to_due(sql)
+    fresh_port = PausingManagedPort()
+    fresh_running = asyncio.create_task(
+        TelegramWorker(h["database"], settings, fresh_port).run_once()
+    )
+    try:
+        await asyncio.wait_for(fresh_port.started.wait(), timeout=8)
+        async with h["database"].session_factory() as session:
+            fresh_current = await session.scalar(select(AgentTurn).where(
+                AgentTurn.status == "CLAIMED"))
+            fresh_conversation = (
+                await session.get(Conversation, fresh_current.conversation_id)
+                if fresh_current is not None else None
+            )
+        assert fresh_current is not None and fresh_conversation is not None
+        context = {
+            "contract_version": 1,
+            "conversation_id": str(fresh_conversation.id),
+            "turn_id": str(fresh_current.id),
+            "origin_turn_id": str(fresh_current.id),
+            "owner_id": fresh_conversation.owner_id,
+            "integration_id": str(fresh_conversation.integration_id),
+            "channel": fresh_conversation.channel,
+            "agent_id": str(binding.agent_id),
+            "authority_revision": fresh_current.authority_revision,
+            "managed_request_fingerprint": fresh_current.managed_request_fingerprint,
+        }
+        eligibility = await h["client"].post(
+            "/internal/v1/external-effect-eligibility", json=context, headers=headers,
+        )
+        assert eligibility.status_code == 200, eligibility.text
+        assert eligibility.json()["eligible"] is True, eligibility.json()
+        permit = await h["client"].post(
+            "/internal/v1/external-effect-permits",
+            json={
+                **context,
+                "operation_namespace": "main-chota.ai-business.v1",
+                "operation_id": str(uuid4()),
+                "operation_fingerprint": "a" * 64,
+            },
+            headers=headers,
+        )
+        assert permit.status_code == 200, permit.text
+        assert permit.json()["replayed"] is False
+    finally:
+        fresh_port.release.set()
+    assert await fresh_running
+
 
 @pytest.mark.asyncio
 async def test_projection_prunes_old_context_but_keeps_every_new_burst_input(
