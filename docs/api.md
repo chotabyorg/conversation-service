@@ -20,12 +20,12 @@ gateway change or provider send. The managed executor is described in
 | POST `/turns/{id}/execute` | claim_epoch, claim_token only | TurnResult; one-attempt managed execution; sameepoch unfinished duplicate409 MANAGED_EXECUTION_STARTED; recovered marked epoch completes EXECUTION_UNKNOWN without AI; winning terminal proof replays without AI |
 | POST `/turns/{id}/complete` | claim_epoch, claim_token, outcome DRAFT_READY/NO_RESPONSE, draft_text optional, operation_refs=[] | TurnResult; first mutation needs live winning proof; exact terminal replay needs stored winning proof and identical result, even after expiry |
 | POST `/turns/{id}/fail` | claim_epoch, claim_token, failure_code, operation_refs=[] | TurnResult with inspectable failure; same terminal replay/fencing contract |
-| POST `/conversations/{id}/control` | expected_authority_revision, control_mode | ConversationRead; every accepted CAS increments revision, including same-mode; stale retry conflicts |
+| POST `/conversations/{id}/control` | expected_authority_revision, control_mode | ConversationRead for legacy scopes; every accepted CAS increments revision, including same-mode; stale retry conflicts; ever-enrolled Telegram scopes return `HANDOFF_CONFLICT` and use the owner Inbox Return route |
 | POST `/external-effect-eligibility` | strict opaque effect context | Observational 200 with eligible/reason and authority/input floors; never grants dispatch authority |
 | POST `/external-effect-permits` | strict context plus opaque Business operation identity and frozen command fingerprint | Immutable permit 200 after positive commit; exact full-request replay returns original permit; a fresh denial is 409 |
 | POST `/conversations/{id}/delivery-attempts` | delivery_key UUID, source_turn_id UUID, expected_authority_revision | DeliveryResult; new GENERATED 201, exact creation replay 200; changed key DELIVERY_IDENTITY_CONFLICT, another key for same draft DELIVERY_INTENT_EXISTS |
 | GET `/delivery-attempts/{id}` | UUID | DeliveryAttemptRead through granted parent |
-| POST `/delivery-attempts/{id}/reconcile` | reconciliation_key UUID, expected_revision, status other than GENERATED; optional provider refs/time/error_code, expected_authority_revision | DeliveryReconcileResult; new/old exact evidence 200; old replay returns current attempt and original applied_revision; changed key payload conflicts |
+| POST `/delivery-attempts/{id}/reconcile` | reconciliation_key UUID, expected_revision, status other than GENERATED; optional provider refs/time/error_code, expected_authority_revision | DeliveryReconcileResult for legacy attempts; exact evidence replay returns current attempt and original applied_revision; changed key payload conflicts; Telegram v2-owned attempts return 404 and require their original supplier's v2 completion |
 
 All outputs occur after commit. Mutation successes are 200 unless a new immutable
 resource is created. There is no 202 implying that work executed. No deletion,
@@ -33,11 +33,26 @@ Message edit or generic outbound append exists. Website response completion adds
 canonical assistant history only under the [explicit write policy](history-projection.md).
 
 `GET /health` returns `{status:"ok",service:"conversation-service"}`.
-`GET /ready` returns ready200 only when DB query, migration `0008_business_effect_permits` and
-required Conversation, permit, Website and Telegram journal queries succeed; otherwise not_ready503. These are the only
+`GET /ready` returns ready200 only when DB query, migration
+`0009_telegram_handoff_inbox` and required Conversation, permit, Inbox, Website
+and Telegram journal queries succeed; otherwise not_ready503. These are the only
 unauthenticated routes. `GET /internal/openapi.json` requires the service header.
 Default `/docs`, `/redoc`, `/openapi.json` are disabled. The fetched schema provides
 every exact DTO/property and X-Service-Token security requirement.
+
+Generic FULL control transitions are disabled for Telegram integration scopes
+that have ever enrolled the Handoff Inbox, including after revocation. They cannot
+move an open case back to AGENT or bypass Return's floor and queued-intent rules.
+Likewise, the legacy reconciliation route cannot fabricate provider evidence for
+Telegram v2-tagged intents or end their writers; only the exact supplier identity
+from the first v2 `begin` may submit completion and positive `TASK_JOINED`
+evidence. New generic Turn selections and delivery-attempt creations are also
+blocked for enrolled Telegram scopes, while exact historical replays remain
+available. Initial grant provision locks the scope and ordered Conversation roots
+and refuses activation while any pending or claimed AgentTurn remains, giving
+the legacy Telegram coordinator a chance to finish or recover it first. Migration
+does not assign v2 FIFO ordinals to legacy delivery rows; only v2-owned intents
+participate in the Handoff outbound ordering stream.
 
 ## Normalization and strict bounds
 
@@ -191,6 +206,95 @@ lock used by customer ingress and authority changes. Existing exact permit repla
 has precedence over later authority/input changes; fresh permits require the
 latest complete canonical customer input and reject every split settling chunk.
 This private route does not add a Gateway or public client API.
+
+## Telegram Handoff and owner Inbox
+
+The Handoff cohort defaults empty and requires an exact
+`TELEGRAM_HANDOFF_INTEGRATION_IDS` enrollment plus the sticky Telegram binding.
+The browser gateway proxies these routes while preserving the original cookie;
+Conversation independently calls live User `/api/v1/me` and creates a distinct
+`HumanPrincipal`. The browser's `access_token` is never converted to FULL or
+service authority. Invalid sessions map to 401. User-service outage, malformed
+upstream identity, or missing auth configuration maps to 503. Foreign owner,
+ungranted case and guessed ID map to the same 404. Email verification is required
+unless `INBOX_REQUIRE_VERIFIED_EMAIL=false` is explicitly configured.
+
+| Method/path | Request | Response and retry behavior |
+| --- | --- | --- |
+| GET `/public/v1/inbox/cases` | `limit` 1..50 (default20), opaque `cursor` | `{items:[CaseSummary],next_cursor}`; owner-only, stable ID order |
+| GET `/public/v1/inbox/cases/{case_id}` | `after_sequence` default0, `limit` 1..100 (default50) | `{case,messages,next_after_sequence}`; ascending canonical Messages include delivery status, provider reference and `delivery_blocked_by_live_writer` |
+| POST `/public/v1/inbox/cases/{case_id}/claim` | stable `command_id`, `expected_authority_revision`, `expected_case_revision` | `{receipt,case}`; owner assigns self, same exact command replays original receipt; claim races serialize by scope/root/case locks |
+| POST `/public/v1/inbox/cases/{case_id}/messages` | same command fields plus `expected_assignment_revision` and text | canonical HUMAN Message and immutable outbound intent are committed before `{receipt,case}`; success means queued only |
+| POST `/public/v1/inbox/cases/{case_id}/return-to-agent` | stable command plus expected authority/case revisions | atomically returns case, increments authority, captures resume/input floor, retires unacquired HUMAN intents, and returns `{receipt,case}` |
+
+`CaseSummary` carries `case_id`, `conversation_id`, exact `owner_id`, integration,
+TELEGRAM channel, provider thread, `OPEN|CLAIMED|RETURNED` status, case/authority/
+assignment revisions, assigned account, reason/note and timestamps. `MessageView`
+contains canonical message ID/sequence, actor/direction/text, nullable delivery
+state/provider message ID, and the LIVE-writer FIFO-block fact. Command receipts
+carry command/case IDs, kind, applied revisions, optional canonical message and
+intent IDs, and `replayed`. Changed payload under a command ID returns 409;
+stale revisions or changed assignment return 409. No team/RBAC or foreign-account
+access is implied by the concurrent same-owner command behavior.
+
+Provisioning and lifecycle proofs use a private CP-only role named
+`control-plane-inbox-lifecycle` with `X-Service-Token`; revoke also accepts the
+AI-owned `ai-handoff-lifecycle` principal under the distinct lifecycle token.
+Conversation `POST /internal/v1/inbox-grants/provision` calls CP
+`POST /internal/v1/handoff/integration-proof` using `X-Inbox-Lifecycle-Token`
+and AI `POST /internal/v1/handoff/agent-proof` using its dedicated
+`X-Service-Token`. The CP proof binds `{account_id,owner_id,integration_id,
+channel,agent_id,binding_generation}`; the AI proof binds the same opaque scope
+plus `{agent_owner_id,agent_lifecycle_generation}`. Conversation accepts only an
+exactly matching scope with `agent_owner_id == account_id` and fresh generations.
+Provision request is `{contract_version:1,command_id,owner_id,integration_id,
+channel:"TELEGRAM",agent_id,expected_binding_generation}`; success echoes both
+proof generations, monotonically increasing `grant_generation`, `active:true`,
+SHA-256 request fingerprint and replay flag. CP/AI changes call
+`POST /internal/v1/inbox-grants/revoke` with their lifecycle source, stable
+command UUID and source/target generation pair (`target=source+1`). A matching
+ACK echoes exact scope and generation pair, grant generation, `active:false`,
+fingerprint, command ID and replay flag. Revoke holds scope then sorted root locks,
+advances each root's shared Goal5 authority/input floor, retires fresh sends and
+preserves previously acquired writers/evidence. Pending CP/AI lifecycle state
+denies proof until the exact matching ACK is committed.
+After an AI-only revoke, CP may still cache its grant as active. CP must
+complete its deactivate/activate lifecycle before a fresh provision can enroll
+the binding again.
+
+The existing `/internal/v1/turns/{turn_id}/execute` route selects managed
+contract v3 for enrolled Handoff turns. Its strict AI request contains exact v2
+correlation/input/context, up to64 `communication_facts`, and up to32
+`prior_operation_refs`; AI returns either an execution result or typed platform
+HUMAN_HANDOFF control request. No HUMAN handoff is represented as a fake AI
+draft. The canonical v3 request snapshot, request fingerprint and UUID5 dispatch
+identity persist before HTTP. An exact replay retrieves the retained result; it
+does not re-run model execution. The v3 request keeps the frozen canonical
+message window, bounded at 256 messages. Every included HUMAN/SYSTEM outbound
+has a delivery fact. If more than 64 required delivery facts remain, the turn
+terminalizes as `INVALID_RESULT` before AI instead of dropping evidence.
+
+| Method/path | Request | Response and retry behavior |
+| --- | --- | --- |
+| POST `/internal/v2/telegram/delivery/work` | `{contract_version:2,owner_id,integration_id,agent_id,bot_id}` | up to100 ordered immutable items; AGENT turns and canonical HUMAN messages share one Conversation ordinal stream |
+| POST `/internal/v2/telegram/delivery/begin` | complete work identity including source, ordinal, attempt UUID, text plus `supplier_instance_id` and `process_incarnation_id` | exact retained text and identity plus `{send,writer_state,replayed}`; only first acquisition of `SEND_CANDIDATE` returns `send:true`; recovery and replays return false |
+| POST `/internal/v2/telegram/delivery/complete` | begin identity plus `PROVIDER_ACCEPTED` with provider ID, `FAILED` with `PROVIDER_REJECTED`, or `UNKNOWN` with `TIMEOUT|TRANSPORT_ERROR`; optional exact `TASK_JOINED` writer end | `{outbound_intent_id,response_attempt_id,outcome,writer_state,replayed}`; records positive provider evidence and/or original-task join; never claims read/delivery beyond Telegram send response |
+
+`response_attempt_id` is `uuid5(UUID("ec0df7d3-b0f4-4c6a-b16d-a02f80ebcde3"),
+str(outbound_intent_id))`. The first `begin` binds supplier and process incarnation
+under the same scope/root/intent locks as Return and revocation. Timeout and
+transport uncertainty remain UNKNOWN and are never blindly resent. A LIVE writer
+remains a barrier regardless of elapsed time or another poller's recovery; only a
+matching positive `TASK_JOINED` report from its original supplier ends it. A later
+fresh AGENT response can then proceed without changing the old outcome. Inbound
+events retained during HUMAN control or at/below the Return floor complete
+immediately with `AUTHORITY_FENCED`; they do not block ordered Telegram ingress.
+
+Migration `0009_telegram_handoff_inbox` is required for readiness. Downgrade is
+refused while Handoff cases, command/lifecycle receipts, grant generations,
+Return floors, managed-v3 snapshots, delivery intents or writer evidence would be
+lost. Disable the exact cohort and worker for rollback; keep migrations and sticky
+binding/configuration evidence available for replay.
 
 ## Goal5 durable settling and supersede
 

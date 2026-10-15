@@ -100,8 +100,11 @@ async def create_turn(
     response: Response,
     database: AppDatabase,
     principal: TrustedPrincipal,
+    settings: AppSettings,
 ) -> TurnResult:
-    result = await turns.create_turn(database, principal, conversation_id, request)
+    result = await turns.create_turn(
+        database, principal, conversation_id, request, settings=settings
+    )
     response.status_code = 200 if result.replayed else 201
     logger.info(
         "",
@@ -208,8 +211,11 @@ async def control(
     request: ControlTransition,
     database: AppDatabase,
     principal: TrustedPrincipal,
+    settings: AppSettings,
 ) -> ConversationRead:
-    result = await authority.transition_control(database, principal, conversation_id, request)
+    result = await authority.transition_control(
+        database, principal, conversation_id, request, settings
+    )
     logger.info("", extra={"stage": "authority", "conversation_id": result.id})
     return result
 
@@ -225,8 +231,11 @@ async def create_delivery(
     response: Response,
     database: AppDatabase,
     principal: TrustedPrincipal,
+    settings: AppSettings,
 ) -> DeliveryResult:
-    result = await delivery.create_delivery(database, principal, conversation_id, request)
+    result = await delivery.create_delivery(
+        database, principal, conversation_id, request, settings=settings
+    )
     response.status_code = 200 if result.replayed else 201
     logger.info(
         "",

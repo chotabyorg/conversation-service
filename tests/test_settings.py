@@ -65,9 +65,7 @@ def write_dotenv(path, data):
 
 def set_environment(monkeypatch, data):
     for key, value in data.items():
-        monkeypatch.setenv(
-            ALIASES[key], json.dumps(value) if key == "auth_principals" else value
-        )
+        monkeypatch.setenv(ALIASES[key], json.dumps(value) if key == "auth_principals" else value)
 
 
 def clear_settings_environment(monkeypatch):
@@ -151,38 +149,73 @@ def test_both_constructor_spellings_use_uppercase_alias(monkeypatch):
 
 def test_settling_policy_resolution_is_explicit_and_integration_override_wins():
     integration = "00000000-0000-4000-8000-000000000001"
-    configured = Settings(**values("policy"), managed_ai_bindings=[
-        dict(owner_id="bound", integration_id=integration, channel="TELEGRAM",
+    configured = Settings(
+        **values("policy"),
+        managed_ai_bindings=[
+            dict(
+                owner_id="bound",
+                integration_id=integration,
+                channel="TELEGRAM",
              agent_id="00000000-0000-4000-8000-000000000002",
-             service_token="synthetic-managed-service-token-" + "x" * 32),
-    ], turn_settling_policies=[
-        dict(version="telegram-default-v1", channel="TELEGRAM",
-             quiet_window_ms=500, max_wait_ms=3000),
-        dict(version="telegram-fast-v1", channel="TELEGRAM", integration_id=integration,
-             quiet_window_ms=100, max_wait_ms=900),
-    ], _env_file=None)
+                service_token="synthetic-managed-service-token-" + "x" * 32,
+            ),
+        ],
+        turn_settling_policies=[
+            dict(
+                version="telegram-default-v1",
+                channel="TELEGRAM",
+                quiet_window_ms=500,
+                max_wait_ms=3000,
+            ),
+            dict(
+                version="telegram-fast-v1",
+                channel="TELEGRAM",
+                integration_id=integration,
+                quiet_window_ms=100,
+                max_wait_ms=900,
+            ),
+        ],
+        _env_file=None,
+    )
 
-    assert configured.settling_policy_for(Channel.TELEGRAM, UUID(integration)).version \
+    assert (
+        configured.settling_policy_for(Channel.TELEGRAM, UUID(integration)).version
         == "telegram-fast-v1"
+    )
     assert configured.settling_policy_for(Channel.WEBSITE_WIDGET, UUID(integration)) is None
-    assert SettlingPolicy(version="boundary", channel=Channel.TELEGRAM,
-                          quiet_window_ms=1, max_wait_ms=1)
+    assert SettlingPolicy(
+        version="boundary", channel=Channel.TELEGRAM, quiet_window_ms=1, max_wait_ms=1
+    )
 
 
 def test_invalid_settling_policy_and_duplicate_scope_fail_closed():
     integration = "00000000-0000-4000-8000-000000000001"
     with pytest.raises(ValidationError):
-        SettlingPolicy(version="invalid", channel=Channel.TELEGRAM,
-                       quiet_window_ms=20, max_wait_ms=19)
+        SettlingPolicy(
+            version="invalid", channel=Channel.TELEGRAM, quiet_window_ms=20, max_wait_ms=19
+        )
 
-    policy = dict(version="telegram-v1", channel="TELEGRAM", integration_id=integration,
-                  quiet_window_ms=100, max_wait_ms=1000)
-    binding = dict(owner_id="bound", integration_id=integration, channel="TELEGRAM",
+    policy = dict(
+        version="telegram-v1",
+        channel="TELEGRAM",
+        integration_id=integration,
+        quiet_window_ms=100,
+        max_wait_ms=1000,
+    )
+    binding = dict(
+        owner_id="bound",
+        integration_id=integration,
+        channel="TELEGRAM",
                    agent_id="00000000-0000-4000-8000-000000000002",
-                   service_token="synthetic-managed-service-token-" + "x" * 32)
+        service_token="synthetic-managed-service-token-" + "x" * 32,
+    )
     with pytest.raises(ValidationError):
-        Settings(**values("duplicate-policy"), managed_ai_bindings=[binding],
-                 turn_settling_policies=[policy, dict(policy)], _env_file=None)
+        Settings(
+            **values("duplicate-policy"),
+            managed_ai_bindings=[binding],
+            turn_settling_policies=[policy, dict(policy)],
+            _env_file=None,
+        )
 
 
 @pytest.mark.parametrize(
@@ -340,7 +373,7 @@ def test_native_migration_database_source_priority_and_no_auth_requirement(
             timeout=30,
         )
         assert smoke.returncode == 0
-        assert "0008_business_effect_permits" in smoke.stdout
+        assert "0009_telegram_handoff_inbox" in smoke.stdout
     else:
         assert result.returncode != 0
         assert "DATABASE_URL must be a dedicated PostgreSQL asyncpg URL" in result.stderr

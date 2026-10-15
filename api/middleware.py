@@ -12,8 +12,15 @@ from api.security import authenticate
 from core.errors import DomainError
 from core.logging import logger, request_id_context
 from schemas.contracts import ErrorCode
+from services.human_auth import INBOX_ORIGIN, authenticate_browser
 
 MAX_BODY_BYTES = 65536
+STRICT_JSON_PREFIXES = (
+    "/public/v1/inbox/",
+    "/internal/v1/inbox-grants/",
+    "/internal/v2/telegram/delivery/",
+    "/internal/v3/managed-turns/",
+)
 
 
 def error_payload(code: ErrorCode, request_id: str) -> dict[str, object]:
@@ -68,20 +75,67 @@ class BoundaryMiddleware:
             )
             await safe_send({"type": "http.response.body", "body": body})
 
+        def has_duplicate_json_keys(raw: bytes) -> bool:
+            def unique(pairs: list[tuple[str, object]]) -> dict[str, object]:
+                value: dict[str, object] = {}
+                for key, item in pairs:
+                    if key in value:
+                        raise ValueError("duplicate key")
+                    value[key] = item
+                return value
+
+            try:
+                json.loads(raw, object_pairs_hook=unique)
+            except ValueError as exc:
+                return str(exc) == "duplicate key"
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                return False
+            return False
+
         try:
-            if scope["path"] not in {"/health", "/ready"}:
+            path = scope["path"]
+            public_inbox = path == "/public/v1/inbox" or path.startswith("/public/v1/inbox/")
+            if public_inbox:
+                settings = getattr(scope["app"].state, "settings", None)
+                if settings is None or not settings.handoff_cohort_integration_ids:
+                    await reject(ErrorCode.NOT_FOUND)
+                    return
+                if scope["method"] not in {"GET", "HEAD"}:
+                    origins = [v for k, v in headers if k.lower() == b"origin"]
+                    if len(origins) != 1 or origins[0] != INBOX_ORIGIN.encode("ascii"):
+                        await reject(ErrorCode.FORBIDDEN)
+                        return
+                human = await authenticate_browser(headers, scope["method"], settings)
+                if human is None:
+                    await reject(ErrorCode.UNAUTHENTICATED)
+                    return
+                if human.consent_required or (
+                    settings.inbox_require_verified_email and not human.email_verified
+                ):
+                    await reject(ErrorCode.FORBIDDEN)
+                    return
+                state["human_principal"] = human
+            elif path not in {"/health", "/ready"}:
                 settings = getattr(scope["app"].state, "settings", None)
                 principal = authenticate(headers, settings) if settings is not None else None
                 if principal is None:
                     await reject(ErrorCode.UNAUTHENTICATED)
                     return
-                path = scope["path"]
-                voice_paths = {"/internal/v1/voice/" + suffix for suffix in (
-                    "calls/start", "calls/heartbeat", "calls/end", "utterances",
-                    "responses/next", "responses/begin", "playback",
-                )}
-                if principal.role == "VOICE" and (path not in voice_paths
-                                                   or scope["method"] != "POST"):
+                voice_paths = {
+                    "/internal/v1/voice/" + suffix
+                    for suffix in (
+                        "calls/start",
+                        "calls/heartbeat",
+                        "calls/end",
+                        "utterances",
+                        "responses/next",
+                        "responses/begin",
+                        "playback",
+                    )
+                }
+                if principal.role == "VOICE" and (
+                    path not in voice_paths or scope["method"] != "POST"
+                ):
                     await reject(ErrorCode.NOT_FOUND)
                     return
                 if principal.role == "VOICE_PROCESSING":
@@ -96,30 +150,71 @@ class BoundaryMiddleware:
                 ):
                     await reject(ErrorCode.NOT_FOUND)
                     return
-                website_paths = {"/internal/v1/website/admissions", "/internal/v1/website/results",
+                website_paths = {
+                    "/internal/v1/website/admissions",
+                    "/internal/v1/website/results",
                                  "/internal/v1/website/responses/begin",
-                                 "/internal/v1/website/responses/complete"}
+                    "/internal/v1/website/responses/complete",
+                }
                 telegram_paths = {
                     "/internal/v1/telegram/admissions",
                     "/internal/v1/telegram/results",
                     "/internal/v1/telegram/responses/work",
                     "/internal/v1/telegram/responses/begin",
                     "/internal/v1/telegram/responses/complete",
+                    "/internal/v2/telegram/delivery/work",
+                    "/internal/v2/telegram/delivery/begin",
+                    "/internal/v2/telegram/delivery/complete",
                 }
-                if principal.role == "WEBSITE" and (path not in website_paths
-                                                      or scope["method"] != "POST"):
+                if principal.role == "WEBSITE" and (
+                    path not in website_paths or scope["method"] != "POST"
+                ):
                     await reject(ErrorCode.NOT_FOUND)
                     return
-                if principal.role == "TELEGRAM" and (path not in telegram_paths
-                                                       or scope["method"] != "POST"):
+                if principal.role == "TELEGRAM" and (
+                    path not in telegram_paths or scope["method"] != "POST"
+                ):
                     await reject(ErrorCode.NOT_FOUND)
                     return
+                if path.startswith("/internal/v2/telegram/delivery/") and (
+                    principal.role != "TELEGRAM" or scope["method"] != "POST"
+                ):
+                    await reject(ErrorCode.NOT_FOUND)
+                    return
+                lifecycle_paths = {
+                    "/internal/v1/inbox-grants/provision",
+                    "/internal/v1/inbox-grants/revoke",
+                }
+                if principal.role == "INBOX_LIFECYCLE":
+                    if path not in lifecycle_paths or scope["method"] != "POST":
+                        await reject(ErrorCode.NOT_FOUND)
+                        return
+                    if (
+                        principal.principal_id == "control-plane-inbox-lifecycle"
+                        and path not in lifecycle_paths
+                    ):
+                        await reject(ErrorCode.NOT_FOUND)
+                        return
+                    if (
+                        principal.principal_id == "ai-handoff-lifecycle"
+                        and path != "/internal/v1/inbox-grants/revoke"
+                    ):
+                        await reject(ErrorCode.NOT_FOUND)
+                        return
+                    if principal.principal_id not in {
+                        "control-plane-inbox-lifecycle",
+                        "ai-handoff-lifecycle",
+                    }:
+                        await reject(ErrorCode.NOT_FOUND)
+                        return
                 if principal.role == "TELEGRAM_PROCESSING":
                     await reject(ErrorCode.NOT_FOUND)
                     return
-                if principal.role == "PROCESSING" and (not path.startswith(
-                        "/internal/v1/processing/turns/") or not path.endswith("/evidence")
-                        or scope["method"] != "GET"):
+                if principal.role == "PROCESSING" and (
+                    not path.startswith("/internal/v1/processing/turns/")
+                    or not path.endswith("/evidence")
+                    or scope["method"] != "GET"
+                ):
                     await reject(ErrorCode.NOT_FOUND)
                     return
                 state["principal"] = principal
@@ -142,6 +237,17 @@ class BoundaryMiddleware:
                 body.extend(data)
                 if not chunk.get("more_body", False):
                     break
+            if (
+                scope["path"].startswith(STRICT_JSON_PREFIXES)
+                and any(
+                    k.lower() == b"content-type"
+                    and v.split(b";", 1)[0].strip().lower() == b"application/json"
+                    for k, v in headers
+                )
+                and has_duplicate_json_keys(bytes(body))
+            ):
+                await reject(ErrorCode.VALIDATION_ERROR)
+                return
             delivered = False
 
             async def bounded_receive() -> Message:
@@ -152,6 +258,10 @@ class BoundaryMiddleware:
                 return await receive()
 
             await self.app(scope, bounded_receive, safe_send)
+        except DomainError as exc:
+            if response_started:
+                raise
+            await reject(exc.code)
         except Exception:
             if response_started:
                 raise

@@ -10,9 +10,10 @@ from sqlalchemy import or_, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError
 
+from core.config import Settings
 from core.errors import DomainError
 from db.database import Database
-from models import AgentTurn, Conversation, Message, TurnInputMessage
+from models import AgentTurn, Conversation, InboxGrantScope, Message, TurnInputMessage
 from schemas.contracts import (
     ErrorCode,
     Principal,
@@ -32,12 +33,18 @@ from services.common import (
     locked_turn,
     message_is_consumed,
     scope_filter,
+    telegram_handoff_was_ever_enrolled,
     unique_violation,
 )
 
 
 async def create_turn(
-    database: Database, principal: Principal, conversation_id: UUID, request: TurnCreate
+    database: Database,
+    principal: Principal,
+    conversation_id: UUID,
+    request: TurnCreate,
+    *,
+    settings: Settings | None = None,
 ) -> TurnResult:
     digest = fingerprint(
         {
@@ -48,12 +55,13 @@ async def create_turn(
     )
     try:
         async with database.session_factory() as session, session.begin():
-            conversation = await authorized_conversation(
-                session, principal, conversation_id, lock=True
-            )
+            # Exact historical selection replay remains available after a
+            # handoff/floor transition. New Telegram selections first acquire
+            # the same integration-scope lock as enrollment and supplier work.
+            probe = await authorized_conversation(session, principal, conversation_id)
             turn = await session.scalar(
                 select(AgentTurn).where(
-                    AgentTurn.conversation_id == conversation.id,
+                    AgentTurn.conversation_id == probe.id,
                     AgentTurn.selection_key == request.selection_key,
                 )
             )
@@ -62,6 +70,56 @@ async def create_turn(
                     raise DomainError(ErrorCode.TURN_SELECTION_CONFLICT)
                 result = TurnResult(turn=TurnRead.model_validate(turn), replayed=True)
             else:
+                handoff_enrolled = False
+                if probe.channel == "TELEGRAM":
+                    from services.telegram import _ever_enrolled, _locked_handoff_scope_values
+
+                    agent_ids = set(
+                        (
+                            await session.scalars(
+                                select(InboxGrantScope.agent_id).where(
+                                    InboxGrantScope.owner_id == probe.owner_id,
+                                    InboxGrantScope.integration_id == probe.integration_id,
+                                    InboxGrantScope.channel == "TELEGRAM",
+                                )
+                            )
+                        ).all()
+                    )
+                    if settings is not None:
+                        agent_ids.update(
+                            binding.agent_id
+                            for binding in settings.managed_ai_bindings
+                            if binding.channel.value == "TELEGRAM"
+                            and binding.owner_id == probe.owner_id
+                            and binding.integration_id == probe.integration_id
+                        )
+                    handoff_scopes = [
+                        await _locked_handoff_scope_values(
+                            session, probe.owner_id, probe.integration_id, agent_id
+                        )
+                        for agent_id in sorted(agent_ids, key=str)
+                    ]
+                    handoff_enrolled = any(_ever_enrolled(scope) for scope in handoff_scopes)
+                conversation = await authorized_conversation(
+                    session, principal, conversation_id, lock=True
+                )
+                # Another request can have inserted the exact selection while
+                # this transaction waited for the scope or parent lock.
+                turn = await session.scalar(
+                    select(AgentTurn).where(
+                        AgentTurn.conversation_id == conversation.id,
+                        AgentTurn.selection_key == request.selection_key,
+                    )
+                )
+                if turn is not None:
+                    if turn.creation_fingerprint != digest:
+                        raise DomainError(ErrorCode.TURN_SELECTION_CONFLICT)
+                    result = TurnResult(turn=TurnRead.model_validate(turn), replayed=True)
+                    return result
+                if handoff_enrolled or await telegram_handoff_was_ever_enrolled(
+                    session, conversation
+                ):
+                    raise DomainError(ErrorCode.HANDOFF_CONFLICT)
                 if conversation.control_mode != "AGENT":
                     raise DomainError(ErrorCode.CONTROL_MODE_CONFLICT)
                 if request.expected_authority_revision != conversation.authority_revision:
@@ -75,15 +133,21 @@ async def create_turn(
                     <= conversation.last_message_sequence
                 ):
                     raise DomainError(ErrorCode.INVALID_INPUT_BOUNDARY)
-                settling_input = await session.scalar(select(Message.id).where(
+                settling_input = await session.scalar(
+                    select(Message.id)
+                    .where(
                     Message.conversation_id == conversation.id,
                     Message.sequence >= request.input_first_sequence,
                     Message.sequence <= request.input_last_sequence,
                     Message.actor == "CUSTOMER",
                     Message.direction == "INBOUND",
-                    or_(Message.settling_policy_version.is_not(None),
-                        Message.settling_burst_id.is_not(None)),
-                ).limit(1))
+                        or_(
+                            Message.settling_policy_version.is_not(None),
+                            Message.settling_burst_id.is_not(None),
+                        ),
+                    )
+                    .limit(1)
+                )
                 if settling_input is not None:
                     raise DomainError(ErrorCode.SETTLING_REQUIRED)
                 endpoints = set(
@@ -112,18 +176,23 @@ async def create_turn(
                     select(AgentTurn.id).where(
                         AgentTurn.conversation_id == conversation.id,
                         AgentTurn.status.in_(("PENDING", "CLAIMED")),
+                        AgentTurn.retired_at.is_(None),
                     )
                 )
                 if active_id is not None:
                     raise DomainError(ErrorCode.ACTIVE_TURN_EXISTS)
-                covered_by_retained_turn = await session.scalar(select(Message.id).where(
+                covered_by_retained_turn = await session.scalar(
+                    select(Message.id)
+                    .where(
                     Message.conversation_id == conversation.id,
                     Message.sequence >= request.input_first_sequence,
                     Message.sequence <= request.input_last_sequence,
                     Message.actor == "CUSTOMER",
                     Message.direction == "INBOUND",
                     message_is_consumed(),
-                ).limit(1))
+                    )
+                    .limit(1)
+                )
                 if covered_by_retained_turn is not None:
                     raise DomainError(ErrorCode.TURN_SELECTION_CONFLICT)
                 turn = AgentTurn(
@@ -144,20 +213,32 @@ async def create_turn(
                 )
                 session.add(turn)
                 await session.flush()
-                selected_messages = (await session.execute(select(
-                    Message.id, Message.sequence,
-                ).where(
+                selected_messages = (
+                    await session.execute(
+                        select(
+                            Message.id,
+                            Message.sequence,
+                        )
+                        .where(
                     Message.conversation_id == conversation.id,
                     Message.sequence >= request.input_first_sequence,
                     Message.sequence <= request.input_last_sequence,
                     Message.actor == "CUSTOMER",
                     Message.direction == "INBOUND",
-                ).order_by(Message.sequence))).all()
+                        )
+                        .order_by(Message.sequence)
+                    )
+                ).all()
                 for ordinal, (message_id, sequence) in enumerate(selected_messages):
-                    await session.execute(insert(TurnInputMessage).values(
-                        message_id=message_id, conversation_id=conversation.id,
-                        turn_id=turn.id, sequence=sequence, ordinal=ordinal,
-                    ))
+                    await session.execute(
+                        insert(TurnInputMessage).values(
+                            message_id=message_id,
+                            conversation_id=conversation.id,
+                            turn_id=turn.id,
+                            sequence=sequence,
+                            ordinal=ordinal,
+                        )
+                    )
                 result = TurnResult(turn=TurnRead.model_validate(turn), replayed=False)
     except IntegrityError as exc:
         # session.begin has rolled back before translating a recognized durable fence.
@@ -185,7 +266,48 @@ async def claim_turn(
     database: Database, principal: Principal, turn_id: UUID, request: TurnClaim
 ) -> TurnClaimResult:
     async with database.session_factory() as session, session.begin():
+        probe = (
+            await session.execute(
+                select(
+                    Conversation.owner_id,
+                    Conversation.integration_id,
+                    Conversation.channel,
+                    AgentTurn.managed_contract_version,
+                    AgentTurn.managed_projection_agent_id,
+                    AgentTurn.managed_dispatch_epoch,
+                )
+                .join(AgentTurn, AgentTurn.conversation_id == Conversation.id)
+                .where(
+                    AgentTurn.id == turn_id,
+                    scope_filter(principal),
+                )
+            )
+        ).first()
+        handoff_scope = None
+        if probe is not None and probe.managed_contract_version == 3:
+            if probe.channel != "TELEGRAM" or probe.managed_projection_agent_id is None:
+                raise DomainError(ErrorCode.NOT_FOUND)
+            from services.telegram import _locked_handoff_scope_values
+
+            handoff_scope = await _locked_handoff_scope_values(
+                session,
+                probe.owner_id,
+                probe.integration_id,
+                probe.managed_projection_agent_id,
+            )
+            if handoff_scope is None:
+                raise DomainError(ErrorCode.GRANT_CONFLICT)
+            if not handoff_scope.active and probe.managed_dispatch_epoch is None:
+                raise DomainError(ErrorCode.GRANT_CONFLICT)
         conversation, turn = await locked_turn(session, principal, turn_id)
+        if turn.retired_at is not None and turn.managed_dispatch_epoch is None:
+            raise DomainError(ErrorCode.CONTROL_MODE_CONFLICT)
+        if (
+            handoff_scope is not None
+            and not handoff_scope.active
+            and turn.managed_dispatch_epoch is None
+        ):
+            raise DomainError(ErrorCode.GRANT_CONFLICT)
         clock = await db_clock(session)
         if turn.status in ("COMPLETED", "FAILED"):
             raise DomainError(ErrorCode.TURN_TERMINAL)

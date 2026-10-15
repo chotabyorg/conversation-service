@@ -9,6 +9,7 @@ from core.config import Settings
 from core.errors import DomainError
 from db.database import Database
 from schemas.contracts import ErrorCode, Principal
+from schemas.handoff import HumanPrincipal
 from services.managed_client import ManagedAIPort
 
 _service_header = APIKeyHeader(name="X-Service-Token", auto_error=False)
@@ -20,6 +21,13 @@ def get_principal(
 ) -> Principal:
     principal = getattr(request.state, "principal", None)
     if not isinstance(principal, Principal):
+        raise DomainError(ErrorCode.UNAUTHENTICATED)
+    return principal
+
+
+def get_human_principal(request: Request) -> HumanPrincipal:
+    principal = getattr(request.state, "human_principal", None)
+    if not isinstance(principal, HumanPrincipal):
         raise DomainError(ErrorCode.UNAUTHENTICATED)
     return principal
 
@@ -37,6 +45,7 @@ def get_managed_port(request: Request) -> ManagedAIPort:
 
 
 TrustedPrincipal = Annotated[Principal, Depends(get_principal)]
+TrustedHuman = Annotated[HumanPrincipal, Depends(get_human_principal)]
 AppDatabase = Annotated[Database, Depends(get_database)]
 AppSettings = Annotated[Settings, Depends(get_settings)]
 AppManagedPort = Annotated[ManagedAIPort, Depends(get_managed_port)]
