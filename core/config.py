@@ -36,7 +36,8 @@ ServiceToken = Annotated[SecretStr, BeforeValidator(validate_service_token)]
 class AuthPrincipal(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
     principal_id: WorkerRef
-    role: Literal["FULL", "WEBSITE", "PROCESSING", "TELEGRAM", "TELEGRAM_PROCESSING"] = "FULL"
+    role: Literal["FULL", "WEBSITE", "PROCESSING", "TELEGRAM", "TELEGRAM_PROCESSING",
+                  "VOICE", "VOICE_PROCESSING"] = "FULL"
     token: ServiceToken = Field(repr=False)
     grants: tuple[ScopeGrant, ...] = Field(min_length=1, max_length=64, repr=False)
 
@@ -97,6 +98,23 @@ class Settings(BaseSettings):
         extra="ignore",
         frozen=True,
     )
+    voice_cohort_integration_ids: Annotated[tuple[UUID, ...], NoDecode] = Field(
+        default=(), alias="VOICE_CANARY_INTEGRATION_IDS",
+        validation_alias=AliasChoices("VOICE_CANARY_INTEGRATION_IDS",
+                                     "voice_cohort_integration_ids"), max_length=64,
+    )
+    voice_worker_enabled: bool = Field(
+        default=False, alias="VOICE_WORKER_ENABLED",
+        validation_alias=AliasChoices("VOICE_WORKER_ENABLED", "voice_worker_enabled"),
+    )
+    voice_worker_principal_id: WorkerRef | None = Field(
+        default=None, alias="VOICE_WORKER_PRINCIPAL_ID",
+        validation_alias=AliasChoices("VOICE_WORKER_PRINCIPAL_ID", "voice_worker_principal_id"),
+    )
+    voice_worker_lease_seconds: int = Field(default=30, ge=5, le=300)
+    voice_worker_poll_seconds: float = Field(default=0.1, ge=0.05, le=10, allow_inf_nan=False)
+    voice_worker_health_port: int = Field(default=8003, ge=1, le=65535)
+    voice_call_lease_seconds: int = Field(default=15, ge=5, le=60)
     # Both constructor spellings use one source key, so explicit values outrank env/dotenv.
     # If both are supplied, the uppercase alias wins deterministically.
     database_url: SecretStr = Field(
@@ -254,7 +272,9 @@ class Settings(BaseSettings):
                 raise ValueError("invalid managed AI configuration") from None
         return value
 
-    @field_validator("telegram_cohort_integration_ids", mode="before")
+    @field_validator(
+        "telegram_cohort_integration_ids", "voice_cohort_integration_ids", mode="before",
+    )
     @classmethod
     def parse_telegram_cohort(cls, value: object) -> object:
         if isinstance(value, str):
@@ -307,6 +327,26 @@ class Settings(BaseSettings):
         tokens = [entry.token.get_secret_value() for entry in self.auth_principals]
         if len(set(ids)) != len(ids) or len(set(tokens)) != len(tokens):
             raise ValueError("duplicate principal configuration")
+        voice_ids = self.voice_cohort_integration_ids
+        voice_bindings = [b for b in self.managed_ai_bindings if b.channel == Channel.VOICE]
+        if len(set(voice_ids)) != len(voice_ids) or any(
+            value not in {b.integration_id for b in voice_bindings} for value in voice_ids
+        ):
+            raise ValueError("invalid Voice configuration")
+        if any(p.channel == Channel.VOICE for p in self.turn_settling_policies):
+            raise ValueError("Voice accepts acoustic finals without a settling policy")
+        if self.voice_worker_enabled:
+            principal = next((p for p in self.auth_principals
+                              if p.principal_id == self.voice_worker_principal_id), None)
+            if (principal is None or principal.role not in {"FULL", "VOICE_PROCESSING"}
+                    or self.managed_ai_base_url is None or not voice_bindings):
+                raise ValueError("invalid Voice worker configuration")
+            for b in voice_bindings:
+                if not any(g.owner_id == b.owner_id and g.integration_id == b.integration_id
+                           and g.channel == Channel.VOICE
+                           and g.provider_namespace == "main-chota.voice.v1"
+                           for g in principal.grants):
+                    raise ValueError("invalid Voice worker configuration")
         scopes = [entry.scope() for entry in self.managed_ai_bindings]
         if len(set(scopes)) != len(scopes):
             raise ValueError("invalid managed AI configuration")

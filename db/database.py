@@ -50,7 +50,7 @@ class Database:
     async def dispose(self) -> None:
         await self.engine.dispose()
 
-    async def ready(self, expected_revision: str = "0006_turn_settling") -> bool:
+    async def ready(self, expected_revision: str = "0007_voice_bridge") -> bool:
         try:
             async with self.engine.connect() as connection:
                 if await connection.scalar(text("SELECT 1")) != 1:
@@ -62,6 +62,12 @@ class Database:
                 )
                 if versions != [expected_revision]:
                     return False
+                await connection.execute(text(
+                    "SELECT c.id, i.message_id, r.delivery_id, e.sequence FROM voice_calls c "
+                    "LEFT JOIN voice_inputs i ON i.call_id=c.id "
+                    "LEFT JOIN voice_responses r ON r.call_id=c.id "
+                    "LEFT JOIN voice_playback_events e ON e.response_id=r.id LIMIT 1"
+                ))
                 await connection.execute(
                     text(
                         "SELECT id, last_message_sequence, authority_revision, settling_revision "

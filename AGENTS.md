@@ -4,6 +4,15 @@ This repository implements the Main Chota communication foundation. It is separa
 from the paused Chota 2.0 product (`chotabyorg/chota`, Project #6). Read README and
 docs before changes. The accepted Main ADR and Project #3 are planning authority.
 
+The user explicitly authorized completing and accepting Goal5 and connecting
+Voice/Conversation on 2026-10-15, including the required coordinated releases
+and the controlled inbound test of +375173820015. This supersedes the historical
+source-only/no-Goal5-merge restrictions below. Review and verify the exact
+cross-service candidates before promotion, preserve existing Website/Telegram
+identities and evidence, and activate no other phone number. No unrelated
+Business/CRM change or legacy direct-AI fallback is authorized.
+Use native Python/PostgreSQL verification; the user prohibited local Docker.
+
 Dependencies remain exact `==` pins in requirements files; pyproject configures
 tools only. Python 3.11, FastAPI/Pydantic 2, async SQLAlchemy 2, Alembic and real
 PostgreSQL 16 form the foundation. Each concurrent operation owns its own session.

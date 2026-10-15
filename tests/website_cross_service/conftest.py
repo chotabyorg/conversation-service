@@ -110,6 +110,9 @@ class WebsiteHarness:
         python = self.website_python if name.startswith("website") else Path(sys.executable)
         env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "PYTHONPATH": str(repo),
                "PYTHONUNBUFFERED": "1", "PYTHONDONTWRITEBYTECODE": "1"}
+        if os.name == "nt":
+            # Winsock needs SystemRoot even in an otherwise isolated process.
+            env["SystemRoot"] = os.environ["SystemRoot"]
         scopes = self.widget_scopes()
         grants = [{"owner_id": item["owner_id"], "integration_id": item["integration_id"],
                    "channel": "WEBSITE_WIDGET", "provider_namespace":

@@ -344,7 +344,8 @@ async def test_repeated_cancellation_joins_the_same_db_finalization(h, managed, 
     assert len(port.calls) == 1
 
 
-@pytest.mark.parametrize("count,text_value", [(257, "small"), (17, "é" * 16384)])
+@pytest.mark.parametrize("count,text_value", [(257, "small"), (17, "é" * 16384)],
+                         ids=["message-count", "utf8-byte-limit"])
 async def test_over_limit_frozen_projection_never_sets_marker(h, managed, sql, count, text_value):
     _, port = managed
     accepted = await h.ingest(text=text_value)

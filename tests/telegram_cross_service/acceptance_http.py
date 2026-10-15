@@ -724,6 +724,8 @@ class TelegramHarness:
             "GOAL4B_ALLOWLIST_PORTS": json.dumps(allowed_ports),
             "GOAL4B_GUARD_REPORT": str(self.root / f"{name}-guard.json"),
         }
+        if os.name == "nt":
+            env["SystemRoot"] = os.environ["SystemRoot"]
         grants = [
             {"owner_id": self.ids["owner"], "integration_id": self.ids["canary"],
              "channel": "TELEGRAM", "provider_namespace": "main-chota.telegram.v1"},

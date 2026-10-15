@@ -120,6 +120,17 @@ def no_external_network(
 ) -> None:
     """Ordinary tests remain PG-only; harness fixtures add exact loopback ports."""
     original = socket.socket.connect
+    if sys.platform == "win32":
+        # Windows implements asyncio's internal socketpair through a temporary
+        # loopback listener. The socketpair API accepts no remote endpoint.
+        original_pair = socket.socketpair
+
+        def local_socketpair(*args: Any, **kwargs: Any) -> Any:
+            with monkeypatch.context() as local:
+                local.setattr(socket.socket, "connect", original)
+                return original_pair(*args, **kwargs)
+
+        monkeypatch.setattr(socket, "socketpair", local_socketpair)
 
     def guarded(sock: socket.socket, address: Any) -> Any:
         if sock.family in {socket.AF_INET, socket.AF_INET6}:
