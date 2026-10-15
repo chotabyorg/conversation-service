@@ -4,6 +4,7 @@ from schemas.contracts import ErrorCode
 
 _SPECIAL: dict[ErrorCode, tuple[int, str]] = {
     ErrorCode.UNAUTHENTICATED: (401, "Service authentication required."),
+    ErrorCode.FORBIDDEN: (403, "Inbox access is not permitted."),
     ErrorCode.NOT_FOUND: (404, "Resource not found."),
     ErrorCode.PAYLOAD_TOO_LARGE: (413, "Request body exceeds the allowed size."),
     ErrorCode.VALIDATION_ERROR: (422, "Request validation failed."),
@@ -11,6 +12,11 @@ _SPECIAL: dict[ErrorCode, tuple[int, str]] = {
     ErrorCode.INTERNAL_ERROR: (500, "Internal service error."),
 }
 _CONFLICT_MESSAGES = {
+    ErrorCode.COMMAND_CONFLICT: "Command identity has different immutable content.",
+    ErrorCode.REVISION_CONFLICT: "Current case or authority revision is stale.",
+    ErrorCode.GRANT_CONFLICT: "Current Inbox grant is inactive or stale.",
+    ErrorCode.HANDOFF_CONFLICT: "Handoff identity or current state conflicts.",
+    ErrorCode.TELEGRAM_WRITER_LIVE: "An earlier Telegram transport writer is still active.",
     ErrorCode.EVENT_CONFLICT: "Event identity has different immutable content.",
     ErrorCode.TURN_SELECTION_CONFLICT: "Turn selection identity has different content.",
     ErrorCode.ACTIVE_TURN_EXISTS: "An active turn already exists.",

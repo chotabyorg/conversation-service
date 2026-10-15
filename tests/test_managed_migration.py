@@ -82,8 +82,40 @@ PRE_GOAL5_COLUMNS["messages"] = PRE_GOAL5_COLUMNS["messages"] | {"input_revision
 # Authority floors were introduced in 0008 and must be omitted both from the
 # populated-0001 fixture projection and from cross-revision equality checks.
 PRE_GOAL5_COLUMNS["conversations"] = (
-    PRE_GOAL5_COLUMNS["conversations"] | {"authority_input_floor_sequence"}
+    PRE_GOAL5_COLUMNS["conversations"]
+    | {
+        "authority_input_floor_sequence",
+        "handoff_resume_floor_sequence",
+    }
 )
+PRE_GOAL5_COLUMNS["messages"] |= {
+    "source_agent_turn_id",
+}
+PRE_GOAL5_COLUMNS["agent_turns"] |= {
+    "settling_revision",
+    "settling_burst_id",
+    "retired_at",
+    "managed_v3_snapshot",
+    "managed_v3_request_fingerprint",
+    "managed_v3_dispatch_id",
+}
+PRE_GOAL5_COLUMNS["delivery_attempts"] |= {
+    "source_message_id",
+    "outbound_ordinal",
+    "case_id",
+    "case_revision",
+    "assignment_revision",
+    "grant_generation",
+    "writer_state",
+    "writer_supplier_instance_id",
+    "writer_process_incarnation_id",
+    "writer_started_at",
+    "writer_ended_at",
+}
+PRE_GOAL5_COLUMNS["delivery_reconciliations"] |= {
+    "expected_settling_revision",
+    "result_settling_revision",
+}
 GOAL5_TABLES = (
     *TABLES,
     "turn_input_messages",
@@ -156,14 +188,23 @@ async def goal4b_rows(sql):
     """Project retained facts onto the exact 0005 schema before comparing an upgrade."""
     result = {}
     omitted = {table: set() for table in GOAL4B_TABLES}
-    omitted["conversations"].update({"settling_revision", "authority_input_floor_sequence"})
+    omitted["conversations"].update({
+        "settling_revision", "authority_input_floor_sequence",
+        "handoff_resume_floor_sequence",
+    })
     omitted["messages"].update({
         "input_revision", "settling_revision", "settling_policy_version",
         "settling_quiet_window_ms", "settling_max_wait_ms", "settling_burst_id",
     })
-    omitted["agent_turns"].update({"settling_revision", "settling_burst_id"})
+    omitted["agent_turns"].update({
+        "settling_revision", "settling_burst_id", "retired_at", "managed_v3_snapshot",
+        "managed_v3_request_fingerprint", "managed_v3_dispatch_id",
+    })
     omitted["delivery_attempts"].update({
-        "expected_settling_revision", "fenced_settling_revision",
+        "expected_settling_revision", "fenced_settling_revision", "source_message_id",
+        "outbound_ordinal", "case_id", "case_revision", "assignment_revision",
+        "grant_generation", "writer_state", "writer_supplier_instance_id",
+        "writer_process_incarnation_id", "writer_started_at", "writer_ended_at",
     })
     omitted["delivery_reconciliations"].update({
         "expected_settling_revision", "result_settling_revision",
@@ -872,6 +913,38 @@ async def test_0008_backfills_and_retains_nonzero_authority_input_floor(h, sql, 
             "SELECT authority_input_floor_sequence FROM conversations WHERE id=:id"
         ), {"id": conversation_id})
     assert retained == 2
+
+
+async def test_0009_keeps_historical_delivery_outside_telegram_fifo(h, sql, database_url):
+    accepted, turn = await h.draft()
+    await h.database.dispose()
+    migrate(database_url, "downgrade", "0008_business_effect_permits")
+    attempt_id, delivery_key = uuid4(), uuid4()
+    async with sql.begin() as connection:
+        await connection.execute(
+            text(
+                "INSERT INTO delivery_attempts "
+                "(id,conversation_id,delivery_key,source_turn_id,creation_fingerprint,"
+                "authority_revision,status,revision,created_at,updated_at) "
+                "VALUES (:id,:conversation,:key,:turn,:fingerprint,0,'GENERATED',0,"
+                "clock_timestamp(),clock_timestamp())"
+            ),
+            {
+                "id": attempt_id,
+                "conversation": accepted["conversation"]["id"],
+                "key": delivery_key,
+                "turn": turn["id"],
+                "fingerprint": "e" * 64,
+            },
+        )
+    migrate(database_url, "upgrade", "head")
+    assert await h.database.ready()
+    async with sql.connect() as connection:
+        ordinal = await connection.scalar(
+            text("SELECT outbound_ordinal FROM delivery_attempts WHERE id=:id"),
+            {"id": attempt_id},
+        )
+    assert ordinal is None
 
 
 async def test_0008_downgrade_refuses_retained_immutable_permit(h, sql, database_url):

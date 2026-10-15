@@ -43,7 +43,7 @@ from schemas.managed import (
     prepare_request,
 )
 from services import telegram, turns
-from services.common import db_clock, locked_turn
+from services.common import db_clock, locked_turn, scope_filter
 from services.history_projection import canonical_window, projected_request
 from services.managed_client import ManagedAIPort, ManagedPortFailure
 from services.website_evidence import recovery_refs
@@ -73,6 +73,7 @@ async def validate_website_agent(
 ) -> None:
     if conversation_channel == Channel.VOICE.value:
         from services.voice import validate_dispatch
+
         conversation = await session.get(Conversation, turn.conversation_id)
         if conversation is None:
             raise DomainError(ErrorCode.NOT_FOUND)
@@ -84,25 +85,38 @@ async def validate_website_agent(
         # durable Telegram admission before dispatch and again before commit.
         if turn.managed_contract_version != 2:
             return
-        admission_agent = await session.scalar(select(TelegramAdmission.agent_id).join(
+        admission_agent = await session.scalar(
+            select(TelegramAdmission.agent_id)
+            .join(
             TelegramImmediateTurn,
             TelegramImmediateTurn.message_id == TelegramAdmission.canonical_message_id,
-        ).where(TelegramImmediateTurn.turn_id == turn.id,
+            )
+            .where(
+                TelegramImmediateTurn.turn_id == turn.id,
                 TelegramImmediateTurn.conversation_id == turn.conversation_id,
                 TelegramAdmission.conversation_id == turn.conversation_id,
-                TelegramAdmission.route == "MANAGED"))
-        if (admission_agent != agent_id or turn.managed_projection_agent_id != agent_id):
+                TelegramAdmission.route == "MANAGED",
+            )
+        )
+        if admission_agent != agent_id or turn.managed_projection_agent_id != agent_id:
             raise DomainError(ErrorCode.VALIDATION_ERROR)
         return
-    admission_agent = await session.scalar(select(WebsiteAdmission.agent_id).join(
+    admission_agent = await session.scalar(
+        select(WebsiteAdmission.agent_id)
+        .join(
         WebsiteImmediateTurn,
         WebsiteImmediateTurn.message_id == WebsiteAdmission.canonical_message_id,
-    ).where(WebsiteImmediateTurn.turn_id == turn.id,
+        )
+        .where(
+            WebsiteImmediateTurn.turn_id == turn.id,
             WebsiteImmediateTurn.conversation_id == turn.conversation_id,
-            WebsiteAdmission.conversation_id == turn.conversation_id))
-    if ((admission_agent is not None and admission_agent != agent_id)
-            or (turn.managed_contract_version == 2 and (
-                admission_agent is None or turn.managed_projection_agent_id != agent_id))):
+            WebsiteAdmission.conversation_id == turn.conversation_id,
+        )
+    )
+    if (admission_agent is not None and admission_agent != agent_id) or (
+        turn.managed_contract_version == 2
+        and (admission_agent is None or turn.managed_projection_agent_id != agent_id)
+    ):
         raise DomainError(ErrorCode.VALIDATION_ERROR)
 
 
@@ -110,18 +124,19 @@ async def validate_fresh_telegram_dispatch(
     session: AsyncSession, turn: AgentTurn, conversation: Conversation, agent_id: UUID
 ) -> None:
     """Fence new Telegram v2 AI execution on the pinned account and full input range."""
-    if (conversation.channel != Channel.TELEGRAM.value
-            or turn.managed_contract_version != 2):
+    if conversation.channel != Channel.TELEGRAM.value or turn.managed_contract_version != 2:
         return
     account = await telegram._telegram_account(
         session, conversation.owner_id, conversation.integration_id
     )
-    if (account is None or account.state != "BOUND" or account.bot_id is None
-            or turn.managed_projection_agent_id != agent_id):
+    if (
+        account is None
+        or account.state != "BOUND"
+        or account.bot_id is None
+        or turn.managed_projection_agent_id != agent_id
+    ):
         raise DomainError(ErrorCode.VALIDATION_ERROR)
-    members = await telegram._validated_turn_admissions(
-        session, conversation, turn, agent_id
-    )
+    members = await telegram._validated_turn_admissions(session, conversation, turn, agent_id)
     if not members or any(member.bot_id != account.bot_id for member in members):
         raise DomainError(ErrorCode.VALIDATION_ERROR)
 
@@ -129,7 +144,7 @@ async def validate_fresh_telegram_dispatch(
 async def claimed_state(
     session: AsyncSession, principal: Principal, turn_id: UUID, proof: TurnExecute
 ) -> tuple[AgentTurn, TurnResult | RecoverMarked | None]:
-    _, turn = await locked_turn(session, principal, turn_id)
+    conversation, turn = await locked_turn(session, principal, turn_id)
     turns.winning_claim(turn, proof.claim_epoch, proof.claim_token.get_secret_value())
     if turn.status in {"COMPLETED", "FAILED"}:
         return turn, TurnResult(turn=TurnRead.model_validate(turn), replayed=True)
@@ -142,6 +157,15 @@ async def claimed_state(
         if turn.managed_dispatch_epoch == proof.claim_epoch:
             raise DomainError(ErrorCode.MANAGED_EXECUTION_STARTED)
         return turn, RecoverMarked()
+    # Lifecycle revoke retires unmarked legacy Telegram turns under the same
+    # Conversation lock. A still-valid claimant may finish only a request whose
+    # dispatch marker already committed; it cannot begin a new provider call.
+    if (
+        conversation.channel == Channel.TELEGRAM.value
+        and turn.managed_contract_version in {1, 2}
+        and turn.retired_at is not None
+    ):
+        raise DomainError(ErrorCode.CONTROL_MODE_CONFLICT)
     return turn, None
 
 
@@ -157,8 +181,10 @@ async def take_snapshot(
         if conversation is None:
             raise DomainError(ErrorCode.NOT_FOUND)
         scope = (conversation.owner_id, conversation.integration_id, Channel(conversation.channel))
-        if (conversation.channel == Channel.VOICE.value
-                and conversation.integration_id not in settings.voice_cohort_integration_ids):
+        if (
+            conversation.channel == Channel.VOICE.value
+            and conversation.integration_id not in settings.voice_cohort_integration_ids
+        ):
             raise DomainError(ErrorCode.SERVICE_UNAVAILABLE)
         binding = next(
             (entry for entry in settings.managed_ai_bindings if entry.scope() == scope), None
@@ -166,13 +192,21 @@ async def take_snapshot(
         if binding is None or settings.managed_ai_base_url is None:
             raise DomainError(ErrorCode.SERVICE_UNAVAILABLE)
         await validate_website_agent(session, turn, binding.agent_id, conversation.channel)
-        await validate_fresh_telegram_dispatch(
-            session, turn, conversation, binding.agent_id
+        await validate_fresh_telegram_dispatch(session, turn, conversation, binding.agent_id)
+        messages = await canonical_window(
+            session,
+            conversation.id,
+            turn.managed_context_first_sequence,
+            turn.context_last_sequence,
         )
-        messages = await canonical_window(session, conversation.id,
-            turn.managed_context_first_sequence, turn.context_last_sequence)
-        snapshot = Snapshot(TurnRead.model_validate(turn), *scope, binding, messages,
-                            turn.managed_contract_version, turn.managed_projection_fingerprint)
+        snapshot = Snapshot(
+            TurnRead.model_validate(turn),
+            *scope,
+            binding,
+            messages,
+            turn.managed_contract_version,
+            turn.managed_projection_fingerprint,
+        )
         prepare_snapshot(snapshot)
         return snapshot
 
@@ -201,9 +235,10 @@ def prepare_snapshot(snapshot: Snapshot) -> PreparedManagedRequest:
             ),
         )
         prepared = prepare_request(request)
-        if ((snapshot.projection_fingerprint is not None
-                and prepared.fingerprint != snapshot.projection_fingerprint)
-                or (snapshot.contract_version == 2 and snapshot.projection_fingerprint is None)):
+        if (
+            snapshot.projection_fingerprint is not None
+            and prepared.fingerprint != snapshot.projection_fingerprint
+        ) or (snapshot.contract_version == 2 and snapshot.projection_fingerprint is None):
             raise ValueError("frozen projection changed")
         return prepared
     except (ValueError, TypeError):
@@ -226,21 +261,28 @@ async def mark_dispatch(
         conversation = await session.get(Conversation, turn.conversation_id)
         if conversation is None:
             raise DomainError(ErrorCode.NOT_FOUND)
-        await validate_website_agent(
-            session, turn, prepared.request.agent_id, conversation.channel
-        )
+        await validate_website_agent(session, turn, prepared.request.agent_id, conversation.channel)
         await validate_fresh_telegram_dispatch(
             session, turn, conversation, prepared.request.agent_id
         )
-        messages = await canonical_window(session, conversation.id,
-            turn.managed_context_first_sequence, turn.context_last_sequence)
+        messages = await canonical_window(
+            session,
+            conversation.id,
+            turn.managed_context_first_sequence,
+            turn.context_last_sequence,
+        )
         try:
             current = projected_request(turn, conversation, prepared.request.agent_id, messages)
         except ValueError:
             raise DomainError(ErrorCode.VALIDATION_ERROR) from None
-        if (current.fingerprint != prepared.fingerprint or current.body != prepared.body
-                or (turn.managed_contract_version == 2
-                    and current.fingerprint != turn.managed_projection_fingerprint)):
+        if (
+            current.fingerprint != prepared.fingerprint
+            or current.body != prepared.body
+            or (
+                turn.managed_contract_version == 2
+                and current.fingerprint != turn.managed_projection_fingerprint
+            )
+        ):
             raise DomainError(ErrorCode.VALIDATION_ERROR)
         turn.managed_agent_id = prepared.request.agent_id
         turn.managed_dispatch_epoch = proof.claim_epoch
@@ -273,8 +315,14 @@ def terminal_request(
     ]
     if result.status in {"FAILED", "UNKNOWN"}:
         # Only the validated, correlated closed result crosses the logging boundary.
-        logger.warning("", extra={"stage": "turn", "turn_id": result.turn_id,
-                                  "code": f"MANAGED_{result.status}_{result.error_code}"})
+        logger.warning(
+            "",
+            extra={
+                "stage": "turn",
+                "turn_id": result.turn_id,
+                "code": f"MANAGED_{result.status}_{result.error_code}",
+            },
+        )
     if result.status in {"DRAFT_READY", "NO_RESPONSE"}:
         return TurnComplete(
             claim_epoch=proof.claim_epoch,
@@ -334,13 +382,34 @@ async def execute_claimed_turn(
     port: ManagedAIPort,
     request_id: str = "",
 ) -> TurnResult:
+    # Enrolled Telegram uses a distinct closed v3 request and deterministic AI
+    # receipt. Existing v1/v2 Website, Voice, and legacy Telegram paths stay put.
+    async with database.session_factory() as session:
+        managed_version = await session.scalar(
+            select(AgentTurn.managed_contract_version)
+            .join(Conversation, Conversation.id == AgentTurn.conversation_id)
+            .where(AgentTurn.id == turn_id, scope_filter(principal))
+        )
+    if managed_version == 3:
+        from services.managed_execution_v3 import execute_claimed_turn_v3
+
+        return await execute_claimed_turn_v3(
+            database,
+            principal,
+            turn_id,
+            proof,
+            settings,
+            port,
+            request_id,
+        )
     snapshot = await take_snapshot(database, principal, turn_id, proof, settings)
     if isinstance(snapshot, TurnResult):
         return snapshot
     if isinstance(snapshot, RecoverMarked):
         terminal_unknown = fail_request(proof, TurnFailureCode.EXECUTION_UNKNOWN)
         terminal_unknown.operation_refs = await recovery_refs(
-            database, principal, turn_id, proof, settings, port)
+            database, principal, turn_id, proof, settings, port
+        )
         return await turns.finish_turn(database, principal, turn_id, terminal_unknown)
     prepared = prepare_snapshot(snapshot)
     retained = await mark_dispatch(database, principal, turn_id, proof, prepared)
@@ -360,8 +429,10 @@ async def execute_claimed_turn(
         terminal = fail_request(proof, failure.failure_code)
     except Exception:
         terminal = fail_request(proof, TurnFailureCode.EXECUTION_UNKNOWN)
-    if (isinstance(terminal, TurnFail)
-            and terminal.failure_code == TurnFailureCode.EXECUTION_UNKNOWN):
+    if (
+        isinstance(terminal, TurnFail)
+        and terminal.failure_code == TurnFailureCode.EXECUTION_UNKNOWN
+    ):
         refs = await recovery_refs(database, principal, turn_id, proof, settings, port)
         if refs:
             terminal.operation_refs = refs

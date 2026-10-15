@@ -50,7 +50,7 @@ class Database:
     async def dispose(self) -> None:
         await self.engine.dispose()
 
-    async def ready(self, expected_revision: str = "0008_business_effect_permits") -> bool:
+    async def ready(self, expected_revision: str = "0009_telegram_handoff_inbox") -> bool:
         try:
             async with self.engine.connect() as connection:
                 if await connection.scalar(text("SELECT 1")) != 1:
@@ -62,12 +62,14 @@ class Database:
                 )
                 if versions != [expected_revision]:
                     return False
-                await connection.execute(text(
+                await connection.execute(
+                    text(
                     "SELECT c.id, i.message_id, r.delivery_id, e.sequence FROM voice_calls c "
                     "LEFT JOIN voice_inputs i ON i.call_id=c.id "
                     "LEFT JOIN voice_responses r ON r.call_id=c.id "
                     "LEFT JOIN voice_playback_events e ON e.response_id=r.id LIMIT 1"
-                ))
+                    )
+                )
                 await connection.execute(
                     text(
                         "SELECT id, last_message_sequence, authority_revision, "
@@ -75,17 +77,40 @@ class Database:
                         "FROM conversations LIMIT 1"
                     )
                 )
-                await connection.execute(text(
+                await connection.execute(
+                    text(
                     "SELECT id,conversation_id,turn_id,origin_turn_id,operation_namespace,"
                     "operation_id,operation_fingerprint,request_fingerprint,agent_id,"
                     "authority_revision,authority_input_floor_sequence,split_input_floor_sequence "
                     "FROM external_effect_permits LIMIT 1"
-                ))
-                await connection.execute(text(
+                    )
+                )
+                await connection.execute(
+                    text(
+                        "SELECT owner_id,integration_id,channel,agent_id,grant_generation,active "
+                        "FROM inbox_grant_scopes LIMIT 1"
+                    )
+                )
+                await connection.execute(
+                    text(
+                        "SELECT id,conversation_id,control_request_id,case_revision,status "
+                        "FROM handoff_cases LIMIT 1"
+                    )
+                )
+                await connection.execute(
+                    text(
+                        "SELECT id,conversation_id,command_id,kind,request_fingerprint "
+                        "FROM inbox_command_receipts LIMIT 1"
+                    )
+                )
+                await connection.execute(
+                    text(
                     "SELECT id,input_revision,settling_revision,settling_policy_version,"
                     "settling_quiet_window_ms,settling_max_wait_ms FROM messages LIMIT 1"
-                ))
-                await connection.execute(text(
+                    )
+                )
+                await connection.execute(
+                    text(
                     "SELECT a.id,t.turn_id,r.id,m.source_agent_turn_id, "
                     "s.ordinal,v.settling_revision,d.expected_settling_revision, "
                     "q.expected_settling_revision,q.result_settling_revision, "
@@ -99,8 +124,10 @@ class Database:
                     "LEFT JOIN delivery_attempts d ON d.source_turn_id=v.id "
                     "LEFT JOIN delivery_reconciliations q ON q.delivery_attempt_id=d.id "
                     "LEFT JOIN messages m ON m.source_agent_turn_id=v.id LIMIT 1"
-                ))
-                await connection.execute(text(
+                    )
+                )
+                await connection.execute(
+                    text(
                     "SELECT a.id,t.turn_id,r.id,m.source_inbound_event_id,s.ordinal, "
                     "v.settling_revision,d.expected_settling_revision, "
                     "q.expected_settling_revision,q.result_settling_revision "
@@ -113,7 +140,8 @@ class Database:
                     "LEFT JOIN delivery_attempts d ON d.source_turn_id=v.id "
                     "LEFT JOIN delivery_reconciliations q ON q.delivery_attempt_id=d.id "
                     "LEFT JOIN messages m ON m.id=a.canonical_message_id LIMIT 1"
-                ))
+                    )
+                )
                 return True
         except (SQLAlchemyError, OSError, TimeoutError):
             return False

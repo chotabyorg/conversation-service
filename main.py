@@ -7,10 +7,13 @@ from fastapi import FastAPI
 
 from api.effects import router as effects_router
 from api.handlers import install_error_handlers
+from api.handoff import router as handoff_router
 from api.health import router as health_router
+from api.inbox import router as inbox_router
 from api.internal import router as internal_router
 from api.middleware import BoundaryMiddleware
 from api.telegram import router as telegram_router
+from api.telegram_v2 import router as telegram_v2_router
 from api.voice import router as voice_router
 from api.website import operations as processing_router
 from api.website import router as website_router
@@ -21,7 +24,8 @@ from services.managed_client import ManagedAIClient, ManagedAIPort
 
 
 def create_app(
-    settings: Settings | None = None, database: Database | None = None,
+    settings: Settings | None = None,
+    database: Database | None = None,
     managed_port: ManagedAIPort | None = None,
 ) -> FastAPI:
     @asynccontextmanager
@@ -61,8 +65,11 @@ def create_app(
     install_error_handlers(application)
     application.include_router(health_router)
     application.include_router(internal_router)
+    application.include_router(handoff_router)
+    application.include_router(inbox_router)
     application.include_router(effects_router)
     application.include_router(telegram_router)
+    application.include_router(telegram_v2_router)
     application.include_router(voice_router)
     application.include_router(website_router)
     application.include_router(processing_router)

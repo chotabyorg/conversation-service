@@ -238,6 +238,84 @@ burst ownership, supersede or send-permission evidence, settling fences, multipl
 response attempts, or non-reconstructible ownership/account history depends on the
 new schema. See the migration details in [durable turn settling](docs/turn-settling.md).
 Migration `0008_business_effect_permits` adds the authority input floor and
-append-only opaque effect permits. Existing nonzero authority epochs are backfilled
-to their current message tail, so their historical customer inputs cannot be
-reinterpreted as fresh business authority after upgrade.
+append-only opaque effect permits. Existing nonzero authority epochs are
+backfilled to their current message tail, so historical customer inputs cannot
+be reinterpreted as fresh business authority after upgrade.
+
+## Telegram Handoff and owner Inbox
+
+The Handoff MVP adds a durable human-assistance case, owner-only Inbox commands,
+trusted CP/AI grant lifecycle proofs, canonical HUMAN messages, and one ordered
+Telegram writer journal for HUMAN and managed AGENT output. Its route and strict
+DTO details are in [API contracts](docs/api.md); the accepted cross-service
+contract is mirrored in the Gateway API documentation.
+
+The feature is dark by default. `TELEGRAM_HANDOFF_INTEGRATION_IDS` must contain
+the exact enrolled integration UUIDs and stay within the existing sticky
+`MANAGED_AI_BINDINGS` and Telegram identity grants. A browser-facing surface uses
+the original live `access_token` cookie: Conversation calls the configured
+`USER_SERVICE_BASE_URL/api/v1/me` and accepts only an active account. Invalid
+sessions return 401; user-service outages, malformed responses, or configuration
+failures return 503 so an outage does not look like logout. Inbox operations are
+owner-only; `X-User-Id`, `X-User-Role`, FULL service credentials, and Telegram
+principal identity never stand in for a human session. Email verification is
+required by default and may only be relaxed by explicit private configuration.
+
+Grant provisioning is CP-owned and lifecycle operations require independent
+`INBOX_LIFECYCLE_TOKEN` and `HANDOFF_LIFECYCLE_TOKEN` credentials. Conversation
+obtains fresh exact CP integration and AI agent ownership proofs, checks the
+account UUID mapping, and persists generation high-water marks before granting
+Inbox authority. CP/AI lifecycle changes hold the exact binding pending until a
+matching durable revoke acknowledgement returns. Revoke advances the shared
+Conversation authority/input floor in the same transaction that invalidates
+new grants, AGENT sends, and unacquired HUMAN sends. Existing external-effect
+permits remain immutable under Goal5 semantics. After an AI-only revoke, CP's
+cached grant may still be active; CP must complete its deactivate/activate
+lifecycle before a new grant enrollment can succeed.
+
+`POST /public/v1/inbox/cases/{case_id}/claim`, `/messages`, and
+`/return-to-agent` use stable command UUIDs and expected case, authority, and
+assignment revisions. The transaction stores command receipts and canonical
+HUMAN Messages before delivery. A public receipt means queued, not delivered;
+PENDING/UNKNOWN facts remain visible. A HUMAN send is authorized once by its
+exact scope, grant generation, case assignment, authority revision, and FIFO
+ordinal. Return moves the case to RETURNED, snapshots the latest input sequence
+as the resume floor, retires never-acquired HUMAN intents, and leaves LIVE
+provider writers as FIFO barriers until their original task reports positive
+`TASK_JOINED` evidence.
+
+After a Telegram integration scope has enrolled Handoff, the generic FULL
+`/conversations/{id}/control` route is disabled for that scope, even after a
+later revoke. Owners return control only through the Inbox case command, which
+updates the resume floor and retires queued intents atomically. New generic
+`/conversations/{id}/turns` selections and `/conversations/{id}/delivery-attempts`
+creations are also rejected for enrolled scopes; exact historical replays still
+return their original receipt. Before the first grant activates, provision locks
+the scope and ordered roots and refuses any pending or claimed AgentTurn until
+the legacy coordinator has resolved it. Generic
+`/delivery-attempts/{id}/reconcile` also rejects Telegram v2-tagged intents;
+legacy attempts retain their reconciliation path and do not acquire v2 FIFO
+ordinals during migration. Provider results and writer retirement for v2 intents
+must come from the original supplier's v2 completion identity.
+
+Managed Handoff turns use strict v3 request/result contracts while existing
+v1/v2 paths stay intact. The v3 request keeps the frozen canonical message
+window. `communication_facts` has a 64-item bound and preserves a delivery fact
+for every included HUMAN/SYSTEM outbound; if more than 64 are required, the turn
+terminalizes as `INVALID_RESULT` before calling AI. Telegram v2 outbound intent
+UUIDs are stable UUIDv5 values derived from
+the immutable intent ID. A provider call happens only after the first `begin`
+returns `send=true`; replay/recovery never authorizes a second send. `UNKNOWN`
+is retained without blind retry. A LIVE writer is never released by elapsed time
+or another poller; only the original supplier's positive task-joined lifecycle
+receipt ends it. New inbound customer messages received during HUMAN mode or at
+or below the Return floor are retained and reported `AUTHORITY_FENCED`, not left
+blocking ordered update ingestion.
+
+Migration `0009_telegram_handoff_inbox` adds the case, command receipt, grant
+generation, retained v3 snapshot, delivery ordering, writer lifecycle, and Return
+floor state. Readiness requires migration 0009. Downgrade is refused while any
+case, lifecycle/command receipt, active or historical grant generation, retained
+Return floor, v3 Turn snapshot/dispatch identity, or HUMAN delivery intent/evidence
+would be lost. Rollback therefore disables the exact cohort and worker while
+keeping migration history and sticky bindings available for safe evidence replay.

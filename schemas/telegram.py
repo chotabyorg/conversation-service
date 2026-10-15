@@ -73,7 +73,14 @@ class TelegramResult(TelegramIdentity):
     def disposition_matches_progress(self) -> "TelegramResult":
         if self.progress_disposition == "WAIT":
             return self
-        if self.progress_disposition == "AUTHORITY_FENCED" and self.state != "DRAFT_READY":
+        if self.progress_disposition == "AUTHORITY_FENCED" and not (
+            self.state == "DRAFT_READY"
+            or (
+                self.state == "PENDING"
+                and self.turn_id is None
+                and self.delivery_state == "NOT_STARTED"
+            )
+        ):
             raise ValueError("invalid authority-fenced progress")
         return self
 

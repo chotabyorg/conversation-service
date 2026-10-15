@@ -14,7 +14,14 @@ from sqlalchemy.orm import aliased
 from sqlalchemy.sql.elements import ColumnElement
 
 from core.errors import DomainError
-from models import AgentTurn, Conversation, DeliveryAttempt, Message, TurnInputMessage
+from models import (
+    AgentTurn,
+    Conversation,
+    DeliveryAttempt,
+    InboxGrantScope,
+    Message,
+    TurnInputMessage,
+)
 from schemas.contracts import ErrorCode, Principal
 
 _TEST_DATABASE_CLOCK: ContextVar[datetime | None] = ContextVar(
@@ -80,6 +87,37 @@ async def authorized_conversation(
     if conversation is None:
         raise DomainError(ErrorCode.NOT_FOUND)
     return conversation
+
+
+async def telegram_handoff_was_ever_enrolled(
+    session: AsyncSession, conversation: Conversation
+) -> bool:
+    """Recheck the durable Telegram enrollment fence after locking its parent.
+
+    Generic legacy writers normally lock an existing/configured grant scope
+    before the Conversation. A stale settings instance can miss a scope that
+    enrollment creates while the writer waits for the Conversation lock. This
+    read-only post-lock check closes that gap without taking the scope lock in
+    reverse order.
+    """
+    if conversation.channel != "TELEGRAM":
+        return False
+    return bool(
+        await session.scalar(
+            select(InboxGrantScope.owner_id)
+            .where(
+                InboxGrantScope.owner_id == conversation.owner_id,
+                InboxGrantScope.integration_id == conversation.integration_id,
+                InboxGrantScope.channel == "TELEGRAM",
+                or_(
+                    InboxGrantScope.grant_generation > 0,
+                    InboxGrantScope.cp_binding_high_water.is_not(None),
+                    InboxGrantScope.agent_lifecycle_high_water.is_not(None),
+                ),
+            )
+            .limit(1)
+        )
+    )
 
 
 async def locked_turn(
