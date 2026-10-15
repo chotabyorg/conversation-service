@@ -1793,6 +1793,135 @@ async def test_browser_consent_email_and_write_origin_matrix(
         assert receipt_count == 0
 
 
+@pytest.mark.asyncio
+async def test_strict_json_duplicate_guard_matches_fastapi_json_media_types(
+    inbox_harness, user_me_transport
+):
+    async def post_raw(path: str, raw: bytes, content_type: str | None):
+        headers = browser_headers("session-a", write=True)
+        if content_type is not None:
+            headers["Content-Type"] = content_type
+        return await inbox_harness.client.post(
+            path,
+            content=raw,
+            headers=headers,
+        )
+
+    ids = await seed_case(inbox_harness.database)
+    path = f"/public/v1/inbox/cases/{ids['case_id']}"
+    duplicate_claim = (
+        f'{{"command_id":"{uuid4()}","expected_authority_revision":1,'
+        '"expected_authority_revision":1,"expected_case_revision":1}'
+    ).encode()
+    rejected_without_type = await post_raw(
+        f"{path}/claim", duplicate_claim, content_type=None
+    )
+    assert rejected_without_type.status_code == 422, rejected_without_type.text
+    assert rejected_without_type.json()["detail"]["code"] == "VALIDATION_ERROR"
+
+    valid_claim_body = json.dumps(
+        {
+            "command_id": str(uuid4()),
+            "expected_authority_revision": 1,
+            "expected_case_revision": 1,
+        },
+        separators=(",", ":"),
+    ).encode()
+    accepted_without_type = await post_raw(
+        f"{path}/claim", valid_claim_body, content_type=None
+    )
+    assert accepted_without_type.status_code == 200, accepted_without_type.text
+    claimed_case = accepted_without_type.json()["case"]
+
+    duplicate_return = (
+        f'{{"command_id":"{uuid4()}","expected_authority_revision":1,'
+        f'"expected_case_revision":{claimed_case["case_revision"]},'
+        f'"metadata":{{"key":1,"key":2}}}}'
+    ).encode()
+    rejected_vendor_type = await post_raw(
+        f"{path}/return-to-agent",
+        duplicate_return,
+        content_type="application/vnd.chota+json; charset=utf-8",
+    )
+    assert rejected_vendor_type.status_code == 422, rejected_vendor_type.text
+    assert rejected_vendor_type.json()["detail"]["code"] == "VALIDATION_ERROR"
+
+    valid_return_body = json.dumps(
+        {
+            "command_id": str(uuid4()),
+            "expected_authority_revision": claimed_case["authority_revision"],
+            "expected_case_revision": claimed_case["case_revision"],
+        },
+        separators=(",", ":"),
+    ).encode()
+    accepted_vendor_type = await post_raw(
+        f"{path}/return-to-agent",
+        valid_return_body,
+        content_type="application/vnd.chota+json; charset=utf-8",
+    )
+    assert accepted_vendor_type.status_code == 200, accepted_vendor_type.text
+
+
+@pytest.mark.asyncio
+async def test_handoff_private_auth_precedes_bad_bodies_and_duplicate_credentials(
+    inbox_harness, sql
+):
+    path = "/internal/v1/inbox-grants/provision"
+    duplicate_credentials = [
+        ("X-Inbox-Lifecycle-Token", inbox_harness.cp_lifecycle_headers["X-Inbox-Lifecycle-Token"]),
+        ("X-Inbox-Lifecycle-Token", inbox_harness.cp_lifecycle_headers["X-Inbox-Lifecycle-Token"]),
+    ]
+    for headers, body in (
+        ({}, b"{malformed-private-body"),
+        ({}, b"x" * 70000),
+        (duplicate_credentials, b"{malformed-private-body"),
+    ):
+        response = await inbox_harness.client.post(path, content=body, headers=headers)
+        assert response.status_code == 401, response.text
+        assert response.json()["detail"]["code"] == "UNAUTHENTICATED"
+        assert "private-body" not in response.text
+    async with sql.connect() as connection:
+        assert await connection.scalar(text("SELECT count(*) FROM inbox_grant_scopes")) == 0
+
+
+@pytest.mark.parametrize("invalid_version", [True, 1.0, "1"])
+@pytest.mark.asyncio
+async def test_new_lifecycle_and_telegram_versions_reject_coercions_without_mutation(
+    inbox_harness, sql, invalid_version
+):
+    provision = await inbox_harness.client.post(
+        "/internal/v1/inbox-grants/provision",
+        json={
+            "contract_version": invalid_version,
+            "command_id": str(uuid4()),
+            "owner_id": OWNER,
+            "integration_id": str(INTEGRATION),
+            "channel": "TELEGRAM",
+            "agent_id": str(AGENT),
+            "expected_binding_generation": 1,
+        },
+        headers=inbox_harness.cp_lifecycle_headers,
+    )
+    telegram_work = await inbox_harness.client.post(
+        "/internal/v2/telegram/delivery/work",
+        json={
+            "contract_version": invalid_version,
+            "owner_id": OWNER,
+            "integration_id": str(INTEGRATION),
+            "agent_id": str(AGENT),
+            "bot_id": 999,
+        },
+        headers=inbox_harness.service_headers,
+    )
+    assert provision.status_code == 422, provision.text
+    assert telegram_work.status_code == 422, telegram_work.text
+    assert provision.json()["detail"]["code"] == "VALIDATION_ERROR"
+    assert telegram_work.json()["detail"]["code"] == "VALIDATION_ERROR"
+    async with sql.connect() as connection:
+        assert await connection.scalar(text("SELECT count(*) FROM inbox_grant_scopes")) == 0
+        assert await connection.scalar(text("SELECT count(*) FROM delivery_attempts")) == 0
+
+
 async def claim_and_send_human(inbox_harness) -> tuple[dict[str, UUID], dict[str, object]]:
     ids = await seed_case(inbox_harness.database)
     claim = await inbox_harness.client.post(

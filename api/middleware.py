@@ -28,6 +28,15 @@ def error_payload(code: ErrorCode, request_id: str) -> dict[str, object]:
     return {"detail": {"code": code.value, "message": error.message, "request_id": request_id}}
 
 
+def _fastapi_json_content_type(value: bytes) -> bool:
+    media_type = value.split(b";", 1)[0].strip().lower()
+    if media_type == b"application/json":
+        return True
+    if not media_type.startswith(b"application/"):
+        return False
+    return media_type.partition(b"/")[2].endswith(b"+json")
+
+
 class BoundaryMiddleware:
     def __init__(self, app: ASGIApp) -> None:
         self.app = app
@@ -239,10 +248,13 @@ class BoundaryMiddleware:
                     break
             if (
                 scope["path"].startswith(STRICT_JSON_PREFIXES)
-                and any(
-                    k.lower() == b"content-type"
-                    and v.split(b";", 1)[0].strip().lower() == b"application/json"
-                    for k, v in headers
+                and (
+                    not [v for k, v in headers if k.lower() == b"content-type"]
+                    or any(
+                        _fastapi_json_content_type(v)
+                        for k, v in headers
+                        if k.lower() == b"content-type"
+                    )
                 )
                 and has_duplicate_json_keys(bytes(body))
             ):

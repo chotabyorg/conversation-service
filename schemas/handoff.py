@@ -20,6 +20,8 @@ Revision = Annotated[StrictInt, Field(ge=0, le=9_223_372_036_854_775_807)]
 PositiveRevision = Annotated[StrictInt, Field(ge=1, le=9_223_372_036_854_775_807)]
 Generation = Annotated[StrictInt, Field(ge=0, le=9_223_372_036_854_775_807)]
 PositiveGeneration = Annotated[StrictInt, Field(ge=1, le=9_223_372_036_854_775_807)]
+ContractVersion1 = Annotated[StrictInt, Field(ge=1, le=1)]
+ContractVersion2 = Annotated[StrictInt, Field(ge=2, le=2)]
 
 
 class HumanPrincipal(Contract):
@@ -121,7 +123,7 @@ class InboxCommandResult(Contract):
 
 
 class CpBindingProofRequest(Contract):
-    contract_version: Literal[1]
+    contract_version: ContractVersion1
     command_id: UUID
     owner_id: OwnerId
     integration_id: UUID
@@ -131,7 +133,7 @@ class CpBindingProofRequest(Contract):
 
 
 class CpBindingProof(Contract):
-    contract_version: Literal[1]
+    contract_version: ContractVersion1
     account_id: UUID
     owner_id: OwnerId
     integration_id: UUID
@@ -141,7 +143,7 @@ class CpBindingProof(Contract):
 
 
 class AiAgentProofRequest(Contract):
-    contract_version: Literal[1]
+    contract_version: ContractVersion1
     owner_id: OwnerId
     integration_id: UUID
     channel: Literal["TELEGRAM"]
@@ -149,7 +151,7 @@ class AiAgentProofRequest(Contract):
 
 
 class AiAgentProof(Contract):
-    contract_version: Literal[1]
+    contract_version: ContractVersion1
     owner_id: OwnerId
     integration_id: UUID
     channel: Literal["TELEGRAM"]
@@ -159,7 +161,7 @@ class AiAgentProof(Contract):
 
 
 class InboxGrantProvision(Contract):
-    contract_version: Literal[1]
+    contract_version: ContractVersion1
     command_id: UUID
     owner_id: OwnerId
     integration_id: UUID
@@ -169,7 +171,7 @@ class InboxGrantProvision(Contract):
 
 
 class InboxGrantProvisioned(Contract):
-    contract_version: Literal[1]
+    contract_version: ContractVersion1
     command_id: UUID
     account_id: UUID
     owner_id: OwnerId
@@ -186,7 +188,7 @@ class InboxGrantProvisioned(Contract):
 
 
 class InboxGrantRevokeBase(Contract):
-    contract_version: Literal[1]
+    contract_version: ContractVersion1
     command_id: UUID
     owner_id: OwnerId
     integration_id: UUID
@@ -223,7 +225,7 @@ GrantRevoke = Annotated[CpGrantRevoke | AiGrantRevoke, Field(discriminator="life
 
 
 class InboxGrantRevokedBase(Contract):
-    contract_version: Literal[1]
+    contract_version: ContractVersion1
     command_id: UUID
     owner_id: OwnerId
     integration_id: UUID
@@ -261,11 +263,11 @@ class TelegramWorkScope(Contract):
 
 
 class TelegramWorkRequest(TelegramWorkScope):
-    contract_version: Literal[2]
+    contract_version: ContractVersion2
 
 
 class TelegramDeliveryIdentity(Contract):
-    contract_version: Literal[2]
+    contract_version: ContractVersion2
     owner_id: OwnerId
     integration_id: UUID
     agent_id: UUID
@@ -335,7 +337,7 @@ class TelegramCompleteRequest(TelegramBeginRequest):
 
 
 class TelegramCompleteResult(Contract):
-    contract_version: Literal[2]
+    contract_version: ContractVersion2
     outbound_intent_id: UUID
     response_attempt_id: UUID
     outcome: Literal["PROVIDER_ACCEPTED", "FAILED", "UNKNOWN"]
