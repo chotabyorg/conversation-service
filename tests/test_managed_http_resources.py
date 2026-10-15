@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import socket
+import sys
 import weakref
 from contextlib import asynccontextmanager
 
@@ -17,6 +18,16 @@ from tests.test_managed_execution import execute
 from tests.test_managed_execution import managed as managed_fixture
 
 managed = managed_fixture
+
+
+@pytest.fixture(scope="module")
+def event_loop_policy():
+    # These native buffered-write regressions exercise SelectorSocketTransport.
+    # Windows' default Proactor uses a different overlapped-send buffer model;
+    # use its supported selector loop to exercise the same path as Linux CI.
+    if sys.platform == "win32":
+        return asyncio.WindowsSelectorEventLoopPolicy()
+    return asyncio.DefaultEventLoopPolicy()
 
 
 @asynccontextmanager

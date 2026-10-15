@@ -71,6 +71,13 @@ class RecoverMarked:
 async def validate_website_agent(
     session: AsyncSession, turn: AgentTurn, agent_id: UUID, conversation_channel: str
 ) -> None:
+    if conversation_channel == Channel.VOICE.value:
+        from services.voice import validate_dispatch
+        conversation = await session.get(Conversation, turn.conversation_id)
+        if conversation is None:
+            raise DomainError(ErrorCode.NOT_FOUND)
+        await validate_dispatch(session, turn, conversation, agent_id)
+        return
     if conversation_channel == Channel.TELEGRAM.value:
         # Telegram v1 turns predate the Telegram admission model. Preserve their
         # established path while binding every new immediate v2 turn to its
@@ -150,6 +157,9 @@ async def take_snapshot(
         if conversation is None:
             raise DomainError(ErrorCode.NOT_FOUND)
         scope = (conversation.owner_id, conversation.integration_id, Channel(conversation.channel))
+        if (conversation.channel == Channel.VOICE.value
+                and conversation.integration_id not in settings.voice_cohort_integration_ids):
+            raise DomainError(ErrorCode.SERVICE_UNAVAILABLE)
         binding = next(
             (entry for entry in settings.managed_ai_bindings if entry.scope() == scope), None
         )

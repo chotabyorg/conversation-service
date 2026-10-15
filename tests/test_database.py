@@ -125,10 +125,14 @@ async def test_migrated_catalog_constraints_indexes_utc_and_exact_collation(h, s
             "telegram_provider_accounts",
             "turn_input_messages",
             "settling_bursts",
+            "voice_calls",
+            "voice_inputs",
+            "voice_responses",
+            "voice_playback_events",
         }
         assert (
             await connection.scalar(text("SELECT version_num FROM alembic_version"))
-            == "0006_turn_settling"
+            == "0007_voice_bridge"
         )
         timestamps = (
             (
@@ -369,7 +373,7 @@ async def test_missing_or_wrong_revision_and_missing_table_are_not_ready(h, sql)
     finally:
         async with sql.begin() as connection:
             await connection.execute(
-                text("UPDATE alembic_version SET version_num='0006_turn_settling'")
+                text("UPDATE alembic_version SET version_num='0007_voice_bridge'")
             )
     async with sql.begin() as connection:
         await connection.execute(

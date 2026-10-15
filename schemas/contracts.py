@@ -273,7 +273,8 @@ class ScopeGrant(Contract):
 class Principal(Contract):
     model_config = ConfigDict(extra="forbid", frozen=True)
     principal_id: WorkerRef
-    role: Literal["FULL", "WEBSITE", "PROCESSING", "TELEGRAM", "TELEGRAM_PROCESSING"] = "FULL"
+    role: Literal["FULL", "WEBSITE", "PROCESSING", "TELEGRAM", "TELEGRAM_PROCESSING",
+                  "VOICE", "VOICE_PROCESSING"] = "FULL"
     grants: tuple[ScopeGrant, ...] = Field(min_length=1, max_length=64)
 
 

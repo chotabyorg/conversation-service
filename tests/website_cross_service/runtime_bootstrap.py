@@ -43,6 +43,22 @@ def install_guard(config):
     socket.socket.connect = guarded_connect
     socket.socket.connect_ex = guarded_connect_ex
     socket.getaddrinfo = guarded_resolve
+    if os.name == "nt":
+        original_pair = socket.socketpair
+
+        def local_socketpair(*args, **kwargs):
+            # Windows asyncio's internal socketpair takes no remote address.
+            socket.socket.connect = connect
+            socket.socket.connect_ex = connect_ex
+            socket.getaddrinfo = resolve
+            try:
+                return original_pair(*args, **kwargs)
+            finally:
+                socket.socket.connect = guarded_connect
+                socket.socket.connect_ex = guarded_connect_ex
+                socket.getaddrinfo = guarded_resolve
+
+        socket.socketpair = local_socketpair
     denials = 0
     for method in ("connect", "connect_ex"):
         with socket.socket() as probe:

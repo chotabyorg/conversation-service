@@ -1,5 +1,10 @@
 # Main Chota Platform — Conversation Service
 
+Candidate Voice source integration is described in [Voice contract](docs/voice-contract.md).
+It is stacked above Goal5 and disabled by default. The separate native entry point
+is `python voice_worker.py`; it requires explicit VOICE grants, bindings and an
+enabled worker. This does not activate a phone reservation or production route.
+
 Durable provider-neutral communication journal and processing primitives for Main
 Chota Platform. PostgreSQL owns accepted inbound events, canonical Messages,
 Conversation identity, stable AgentTurns, delivery evidence and control authority.

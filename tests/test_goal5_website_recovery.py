@@ -122,6 +122,11 @@ class Accepted0005Runtime:
             "PYTHONDONTWRITEBYTECODE": "1",
             "GOAL4A_BOOTSTRAP_CONFIG": str(config_path),
         }
+        if os.name == "nt":
+            # Winsock loads its provider DLLs through SystemRoot. Keep the
+            # application environment fresh while preserving Windows bootstrap.
+            env.update({key: os.environ[key] for key in ("SYSTEMROOT", "WINDIR", "TEMP", "TMP")
+                        if key in os.environ})
         if name != "fake":
             env.update({
                 "DATABASE_URL": self.database_url,

@@ -76,6 +76,17 @@ class BoundaryMiddleware:
                     await reject(ErrorCode.UNAUTHENTICATED)
                     return
                 path = scope["path"]
+                voice_paths = {"/internal/v1/voice/" + suffix for suffix in (
+                    "calls/start", "calls/heartbeat", "calls/end", "utterances",
+                    "responses/next", "responses/begin", "playback",
+                )}
+                if principal.role == "VOICE" and (path not in voice_paths
+                                                   or scope["method"] != "POST"):
+                    await reject(ErrorCode.NOT_FOUND)
+                    return
+                if principal.role == "VOICE_PROCESSING":
+                    await reject(ErrorCode.NOT_FOUND)
+                    return
                 website_paths = {"/internal/v1/website/admissions", "/internal/v1/website/results",
                                  "/internal/v1/website/responses/begin",
                                  "/internal/v1/website/responses/complete"}

@@ -131,16 +131,20 @@ def _fresh_worker_once(database_url: str, settings: Settings) -> list[str]:
         args=(database_url, _worker_settings(settings, database_url), output),
     )
     process.start()
-    process.join(timeout=30)
-    if process.is_alive():
-        process.terminate()
-        process.join(timeout=5)
-        pytest.fail("fresh Telegram worker process did not finish burst recovery")
-    assert process.exitcode == 0
     try:
-        result = output.get(timeout=2)
+        # Drain before join: a 256-ID result exceeds the Windows pipe buffer,
+        # so the child's Queue feeder cannot exit until the parent receives it.
+        result = output.get(timeout=30)
     except queue.Empty:
         pytest.fail("fresh Telegram worker process returned no result")
+    finally:
+        process.join(timeout=5)
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=5)
+        output.close()
+        output.join_thread()
+    assert process.exitcode == 0
     assert not isinstance(result, dict), result
     worked, selected = result
     assert worked is True and len(selected) == 1

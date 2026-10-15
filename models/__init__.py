@@ -15,8 +15,10 @@ from models.entities import (
     WebsiteImmediateTurn,
     WebsiteResponseAttempt,
 )
+from models.voice import VoiceCall, VoiceInput, VoicePlaybackEvent, VoiceResponse
 
 __all__ = [
+    "VoiceCall", "VoiceInput", "VoicePlaybackEvent", "VoiceResponse",
     "AgentTurn",
     "Conversation",
     "DeliveryAttempt",
