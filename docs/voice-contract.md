@@ -145,3 +145,25 @@ integration readiness, provision dedicated grants and agree runtime rollout.
 Only then coordinate one real inbound test on `+375173820015`. No other number,
 pool route, production migration, credential, image publication or GitOps change
 is authorized by this source implementation.
+# Optional call-start prompt warmup
+
+`VOICE_PROMPT_WARMUP_ENABLED` defaults to false. When enabled, only a newly admitted
+active Voice call in the configured canary cohort can issue a best-effort
+`/internal/v1/voice/warmup` hint to its exact managed AI binding. The payload contains
+contract version 1, owner, integration, channel `VOICE`, agent and call IDs. It
+contains no customer text, model choice, turn claim or effect authority.
+
+This is separate from the text worker and from managed turn execution. A background
+owner rechecks the live call after admission; it holds no DB lock during HTTP I/O.
+At most four hints can be in flight per Conversation process. It never retries,
+persists or delivers the result. HTTP work has a three-second deadline and owned
+cleanup. Admission does not await it. The first admitted utterance, call end and
+application shutdown cancel and join owned work; repeated starts never rewarm.
+
+AI separately requires the exact authenticated Voice profile with `prompt_warmup`
+enabled. Missing endpoint/configuration and failed hints leave the call path intact.
+Deploy both reviewed service images before a controlled pilot. No schema migration,
+text queue modification, Voice Gateway release or additional number activation is
+part of this feature. Synthetic measurements have not established reliable benefit;
+keep it off until a controlled call demonstrates an improvement.
+
