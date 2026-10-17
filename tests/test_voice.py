@@ -635,6 +635,7 @@ async def test_partial_draft_next_begin_before_completed_and_final_remainder(vh)
     assert turn_id is not None
     permission = await begin(vh, turn_id)
     assert permission["send"] is True and permission["text"] == "First sentence. "
+    assert permission["is_partial"] is True
     async with vh["database"].session_factory() as session:
         turn = await session.get(AgentTurn, UUID(turn_id))
         assert turn is not None
@@ -648,6 +649,7 @@ async def test_partial_draft_next_begin_before_completed_and_final_remainder(vh)
     assert (await post(vh, "responses/next")).json()["turn_id"] == turn_id
     final = await begin(vh, turn_id)
     assert final["send"] is True and final["text"] == "Second sentence."
+    assert final["is_partial"] is False
     assert final["response_id"] != permission["response_id"]
     assert (await begin(vh, turn_id))["send"] is False
     assert (await fact(vh, final)).status_code == 200
