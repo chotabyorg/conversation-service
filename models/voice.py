@@ -25,6 +25,7 @@ class VoiceCall(Base):
     conversation_id: Mapped[UUID] = mapped_column(unique=True)
     media_session_id: Mapped[UUID] = mapped_column()
     agent_id: Mapped[UUID] = mapped_column()
+    caller_number: Mapped[str | None] = mapped_column(String(16))
     last_sequence: Mapped[int] = mapped_column(BigInteger, default=0)
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
@@ -34,6 +35,10 @@ class VoiceCall(Base):
         ForeignKeyConstraint(["conversation_id"], ["conversations.id"]),
         UniqueConstraint("id", "conversation_id", name="uq_voice_call_parent"),
         CheckConstraint("last_sequence >= 0", name="ck_voice_sequence"),
+        CheckConstraint(
+            r"caller_number IS NULL OR caller_number ~ '^\+375[0-9]{9}$'",
+            name="ck_voice_caller_number",
+        ),
         CheckConstraint("expires_at > started_at", name="ck_voice_lease"),
         CheckConstraint(
             "(ended_at IS NULL AND end_reason IS NULL) OR "

@@ -50,6 +50,7 @@ class ManagedAIPort(Protocol):
         binding: ManagedBinding,
         request_id: str = "",
         on_partial: PartialCallback | None = None,
+        caller_phone: str = "",
     ) -> ManagedTurnResult: ...
 
 
@@ -121,11 +122,11 @@ class ManagedAIClient:
 
     async def execute(
         self, prepared: PreparedManagedRequest, binding: ManagedBinding, request_id: str = "",
-        on_partial: PartialCallback | None = None,
+        on_partial: PartialCallback | None = None, caller_phone: str = "",
     ) -> ManagedTurnResult:
         resources = NativeHTTPResourceOwner()
         owner = asyncio.create_task(
-            self._execute_owned(prepared, binding, request_id, resources, on_partial),
+            self._execute_owned(prepared, binding, request_id, resources, on_partial, caller_phone),
             name="managed-ai-http-owner",
         )
         cancellation = None
@@ -157,7 +158,7 @@ class ManagedAIClient:
     async def _execute_owned(
         self, prepared: PreparedManagedRequest, binding: ManagedBinding, request_id: str,
         resources: NativeHTTPResourceOwner,
-        on_partial: PartialCallback | None = None,
+        on_partial: PartialCallback | None = None, caller_phone: str = "",
     ) -> ManagedTurnResult:
         settings = self.settings
         if settings.managed_ai_base_url is None:
@@ -168,6 +169,9 @@ class ManagedAIClient:
         }
         if re.fullmatch(r"[A-Za-z0-9._:-]{1,64}", request_id):
             headers["X-Request-ID"] = request_id
+        if re.fullmatch(r"\+375[0-9]{9}", caller_phone):
+            # Trusted caller ANI, carried outside the bounded body/fingerprint.
+            headers["X-Caller-Phone"] = caller_phone
         timeout = httpx.Timeout(
             connect=settings.managed_ai_connect_seconds,
             write=settings.managed_ai_write_seconds,

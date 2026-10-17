@@ -124,6 +124,7 @@ async def start(database: Database, principal: Principal, request: CallStart,
         clock = await db_clock(session)
         call = VoiceCall(id=request.call_id, conversation_id=conversation.id,
                          media_session_id=request.media_session_id, agent_id=request.agent_id,
+                         caller_number=request.caller_number,
                          started_at=clock,
                          expires_at=clock + timedelta(seconds=settings.voice_call_lease_seconds))
         if not configured(settings, conversation, call):

@@ -24,6 +24,8 @@ class CallStart(CallIdentity):
     owner_id: OwnerId
     integration_id: UUID
     agent_id: UUID
+    # Validated caller ANI (the number being called from); optional.
+    caller_number: Annotated[str, Field(pattern=r"^\+375[0-9]{9}$")] | None = None
 
 
 class CallResult(CallIdentity):

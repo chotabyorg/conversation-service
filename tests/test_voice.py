@@ -354,10 +354,12 @@ async def test_voice_input_ownership_can_authorize_an_opaque_business_permit(vh)
     entered, release = asyncio.Event(), asyncio.Event()
     original_execute = vh["port"].execute
 
-    async def hold_after_marker(prepared, binding, request_id="", on_partial=None):
+    async def hold_after_marker(prepared, binding, request_id="", on_partial=None, caller_phone=""):
         entered.set()
         await release.wait()
-        return await original_execute(prepared, binding, request_id, on_partial=on_partial)
+        return await original_execute(
+            prepared, binding, request_id, on_partial=on_partial, caller_phone=caller_phone
+        )
 
     vh["port"].execute = hold_after_marker
     running = asyncio.create_task(vh["worker"].run_once())
@@ -602,7 +604,7 @@ async def test_partial_draft_next_begin_before_completed_and_final_remainder(vh)
     await post(vh, "utterances", sequence=1, text="hi")
     first_partial, release = asyncio.Event(), asyncio.Event()
 
-    async def streaming(prepared, binding, request_id="", on_partial=None):
+    async def streaming(prepared, binding, request_id="", on_partial=None, caller_phone=""):
         assert prepared.request.stream_partials is True
         assert on_partial is not None
         await on_partial("First sentence. ")
@@ -660,7 +662,7 @@ async def test_partial_draft_appends_new_sentences_from_ai_events(vh):
     await post(vh, "utterances", sequence=1, text="hi")
     first_partial, release = asyncio.Event(), asyncio.Event()
 
-    async def streaming(prepared, binding, request_id="", on_partial=None):
+    async def streaming(prepared, binding, request_id="", on_partial=None, caller_phone=""):
         await on_partial("First sentence. ")
         first_partial.set()
         await release.wait()
@@ -704,7 +706,7 @@ async def test_partial_covering_full_draft_seals_history_without_extra_speech(vh
     await post(vh, "utterances", sequence=1, text="hi")
     first_partial, release = asyncio.Event(), asyncio.Event()
 
-    async def streaming(prepared, binding, request_id="", on_partial=None):
+    async def streaming(prepared, binding, request_id="", on_partial=None, caller_phone=""):
         await on_partial("Only sentence.")
         first_partial.set()
         await release.wait()
