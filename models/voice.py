@@ -11,6 +11,7 @@ from sqlalchemy import (
     DateTime,
     ForeignKeyConstraint,
     String,
+    Text,
     UniqueConstraint,
 )
 from sqlalchemy.orm import Mapped, mapped_column
@@ -64,15 +65,19 @@ class VoiceResponse(Base):
     id: Mapped[UUID] = mapped_column(primary_key=True)
     call_id: Mapped[UUID] = mapped_column()
     conversation_id: Mapped[UUID] = mapped_column()
-    turn_id: Mapped[UUID] = mapped_column(unique=True)
+    turn_id: Mapped[UUID] = mapped_column()
     delivery_id: Mapped[UUID] = mapped_column(unique=True)
     send_authorized: Mapped[bool] = mapped_column(Boolean)
+    ordinal: Mapped[int] = mapped_column(BigInteger, default=0)
+    is_partial: Mapped[bool] = mapped_column(Boolean, default=False)
+    authorized_text: Mapped[str | None] = mapped_column(Text)
     last_event_sequence: Mapped[int] = mapped_column(BigInteger, default=0)
     generated_bytes: Mapped[int] = mapped_column(BigInteger, default=0)
     accepted_bytes: Mapped[int] = mapped_column(BigInteger, default=0)
     terminal: Mapped[bool] = mapped_column(Boolean, default=False)
     __table_args__ = (
         UniqueConstraint("id", "call_id", name="uq_voice_response_call"),
+        UniqueConstraint("turn_id", "ordinal", name="uq_voice_response_turn_ordinal"),
         ForeignKeyConstraint(["call_id", "conversation_id"],
                              ["voice_calls.id", "voice_calls.conversation_id"]),
         ForeignKeyConstraint(["turn_id", "conversation_id"],
@@ -82,6 +87,17 @@ class VoiceResponse(Base):
         CheckConstraint("last_event_sequence >= 0 AND accepted_bytes >= 0 AND "
                         "generated_bytes >= accepted_bytes AND generated_bytes <= 8388608",
                         name="ck_voice_response_counters"),
+        CheckConstraint("ordinal >= 0", name="ck_voice_response_ordinal"),
+        CheckConstraint(
+            "(authorized_text IS NULL) OR ("
+            "char_length(authorized_text) BETWEEN 1 AND 16384 AND "
+            "octet_length(authorized_text) <= 32768)",
+            name="ck_voice_response_authorized_text",
+        ),
+        CheckConstraint(
+            "(is_partial = false) OR (send_authorized = true AND authorized_text IS NOT NULL)",
+            name="ck_voice_response_partial_shape",
+        ),
     )
 
 

@@ -34,7 +34,7 @@ class CapturePort:
         self.status = "DRAFT_READY"
         self.error_code = None
 
-    async def execute(self, prepared, binding, request_id=""):
+    async def execute(self, prepared, binding, request_id="", on_partial=None):
         assert self.database.engine.pool.checkedout() == 0
         self.calls.append((prepared, binding))
         self.entered.set()

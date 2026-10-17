@@ -21,10 +21,10 @@ class HeldAI(FakeAI):
         self.started = asyncio.Event()
         self.release = asyncio.Event()
 
-    async def execute(self, prepared, binding, request_id=""):
+    async def execute(self, prepared, binding, request_id="", on_partial=None):
         self.started.set()
         await self.release.wait()
-        return await super().execute(prepared, binding, request_id)
+        return await super().execute(prepared, binding, request_id, on_partial=on_partial)
 
 
 async def test_stop_idle_wakes_poll_and_prevents_admission(wh):

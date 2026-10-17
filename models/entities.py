@@ -373,6 +373,7 @@ class AgentTurn(Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     outcome: Mapped[str | None] = mapped_column(String(16))
     draft_text: Mapped[str | None] = mapped_column(Text)
+    partial_draft_text: Mapped[str | None] = mapped_column(Text)
     failure_code: Mapped[str | None] = mapped_column(String(32))
     operation_refs: Mapped[list[dict[str, str | None]]] = mapped_column(
         JSONB, default=list, server_default=sql_text("'[]'::jsonb")
@@ -447,6 +448,7 @@ class AgentTurn(Base):
             name="ck_turn_failure",
         ),
         CheckConstraint(content_check("draft_text"), name="ck_turn_draft_bounds"),
+        CheckConstraint(content_check("partial_draft_text"), name="ck_turn_partial_draft_bounds"),
         CheckConstraint(REFS_CHECK, name="ck_turn_operation_refs"),
         CheckConstraint(TURN_LIFECYCLE, name="ck_turn_lifecycle"),
         CheckConstraint(MANAGED_MARKER, name="ck_turn_managed_marker"),
@@ -537,6 +539,8 @@ class DeliveryAttempt(Base):
     conversation_id: Mapped[UUID] = mapped_column(nullable=False)
     delivery_key: Mapped[UUID] = mapped_column(nullable=False)
     source_turn_id: Mapped[UUID] = mapped_column(nullable=False)
+    # Per-source-ordinal Speech leases share one turn; other channels stay at 0.
+    ordinal: Mapped[int] = mapped_column(BigInteger, default=0, server_default=sql_text("0"))
     creation_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
     authority_revision: Mapped[int] = mapped_column(BigInteger, nullable=False)
     expected_settling_revision: Mapped[int | None] = mapped_column(BigInteger)
@@ -560,8 +564,9 @@ class DeliveryAttempt(Base):
     read_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     __table_args__ = (
         UniqueConstraint("conversation_id", "delivery_key", name="uq_delivery_key"),
-        UniqueConstraint("source_turn_id", name="uq_delivery_source_turn"),
+        UniqueConstraint("source_turn_id", "ordinal", name="uq_delivery_source_turn"),
         UniqueConstraint("id", "conversation_id", name="uq_delivery_id_conversation"),
+        CheckConstraint("ordinal >= 0", name="ck_delivery_ordinal"),
         ForeignKeyConstraint(
             ["conversation_id"],
             ["conversations.id"],

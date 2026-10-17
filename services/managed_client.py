@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+from collections.abc import Awaitable, Callable
 from typing import Protocol
 
 import httpx
@@ -39,10 +40,40 @@ class ManagedPortFailure(Exception):
         super().__init__(failure_code.value)
 
 
+PartialCallback = Callable[[str], Awaitable[None]]
+
+
 class ManagedAIPort(Protocol):
     async def execute(
-        self, prepared: PreparedManagedRequest, binding: ManagedBinding, request_id: str = ""
+        self,
+        prepared: PreparedManagedRequest,
+        binding: ManagedBinding,
+        request_id: str = "",
+        on_partial: PartialCallback | None = None,
     ) -> ManagedTurnResult: ...
+
+
+# Bounded server-sent event intake for opted-in partial drafts.
+MAX_PARTIAL_EVENTS = 512
+MAX_PARTIAL_CHARS = 8000
+
+
+def parse_sse_event(line: str) -> dict[str, object] | None:
+    """Parse one SSE data line; returns the payload or None for blanks/control."""
+    if not line.startswith("data:"):
+        return None
+    payload = line[len("data:") :].strip()
+    if not payload or payload == "[DONE]":
+        return None
+    try:
+        value = json.loads(
+            payload, object_pairs_hook=unique_json_object, parse_constant=reject_constant
+        )
+    except ValueError as exc:
+        raise ManagedPortFailure() from exc
+    if not isinstance(value, dict):
+        raise ManagedPortFailure()
+    return value
 
 
 def unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -89,11 +120,12 @@ class ManagedAIClient:
         self.settings = settings
 
     async def execute(
-        self, prepared: PreparedManagedRequest, binding: ManagedBinding, request_id: str = ""
+        self, prepared: PreparedManagedRequest, binding: ManagedBinding, request_id: str = "",
+        on_partial: PartialCallback | None = None,
     ) -> ManagedTurnResult:
         resources = NativeHTTPResourceOwner()
         owner = asyncio.create_task(
-            self._execute_owned(prepared, binding, request_id, resources),
+            self._execute_owned(prepared, binding, request_id, resources, on_partial),
             name="managed-ai-http-owner",
         )
         cancellation = None
@@ -125,6 +157,7 @@ class ManagedAIClient:
     async def _execute_owned(
         self, prepared: PreparedManagedRequest, binding: ManagedBinding, request_id: str,
         resources: NativeHTTPResourceOwner,
+        on_partial: PartialCallback | None = None,
     ) -> ManagedTurnResult:
         settings = self.settings
         if settings.managed_ai_base_url is None:
@@ -162,18 +195,22 @@ class ManagedAIClient:
                     ) as response:
                         media = response.headers.get_list("content-type")
                         encoding = response.headers.get_list("content-encoding")
-                        if (
-                            len(media) != 1
-                            or media[0].split(";", 1)[0].strip().lower() != "application/json"
-                            or any(v.strip().lower() != "identity" for v in encoding)
+                        if len(media) != 1 or any(
+                            v.strip().lower() != "identity" for v in encoding
                         ):
                             raise ManagedPortFailure()
-                        body = bytearray()
-                        async for chunk in response.aiter_raw():
-                            if len(body) + len(chunk) > MAX_RESULT_BYTES:
-                                raise ManagedPortFailure()
-                            body.extend(chunk)
-                        result = parse_response(bytes(body), response.status_code, prepared)
+                        media_type = media[0].split(";", 1)[0].strip().lower()
+                        if response.status_code != 200 or media_type == "application/json":
+                            body = bytearray()
+                            async for chunk in response.aiter_raw():
+                                if len(body) + len(chunk) > MAX_RESULT_BYTES:
+                                    raise ManagedPortFailure()
+                                body.extend(chunk)
+                            result = parse_response(bytes(body), response.status_code, prepared)
+                        elif media_type == "text/event-stream" and on_partial is not None:
+                            result = await self._read_partial_stream(response, prepared, on_partial)
+                        else:
+                            raise ManagedPortFailure()
             if operation.cancel_called or result is None:
                 raise ManagedPortFailure()
             return result
@@ -188,6 +225,46 @@ class ManagedAIClient:
                 await resources.aclose()
             except Exception:
                 raise ManagedPortFailure() from None
+
+    async def _read_partial_stream(
+        self,
+        response: httpx.Response,
+        prepared: PreparedManagedRequest,
+        on_partial: PartialCallback,
+    ) -> ManagedTurnResult:
+        """Consume opt-in sentence events, then validate the final result.
+
+        Partial sentences are advisory only; the final event carries the
+        authoritative outcome and always closes the stream. A missing final
+        event, oversized traffic or malformed payload fails explicitly.
+        """
+        total_bytes = 0
+        total_chars = 0
+        seen_events = 0
+        final_payload: bytes | None = None
+        async for raw in response.aiter_lines():
+            total_bytes += len(raw.encode("utf-8")) + 1
+            if total_bytes > MAX_RESULT_BYTES:
+                raise ManagedPortFailure()
+            event = parse_sse_event(raw.strip())
+            if event is None:
+                continue
+            seen_events += 1
+            if seen_events > MAX_PARTIAL_EVENTS:
+                raise ManagedPortFailure()
+            if event.get("partial_final") is True:
+                final_payload = json.dumps(event, ensure_ascii=False).encode("utf-8")
+                break
+            text = event.get("partial_text")
+            if not isinstance(text, str) or not text:
+                raise ManagedPortFailure()
+            total_chars += len(text)
+            if total_chars > MAX_PARTIAL_CHARS:
+                raise ManagedPortFailure()
+            await on_partial(text)
+        if final_payload is None:
+            raise ManagedPortFailure()
+        return parse_response(final_payload, 200, prepared)
 
     async def evidence(self, request: ManagedEvidenceRequest,
                        binding: ManagedBinding) -> ManagedEvidenceResult:

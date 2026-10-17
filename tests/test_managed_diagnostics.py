@@ -124,7 +124,7 @@ async def test_arbitrary_exception_emits_no_diagnostic(h, managed, caplog):
 async def test_terminal_boundary_revalidates_before_logging(h, managed, caplog, invalid):
     _, port = managed
 
-    async def untrusted_result(prepared, binding, request_id=""):
+    async def untrusted_result(prepared, binding, request_id="", on_partial=None):
         port.calls.append((prepared, binding))
         result = response_for(prepared, "FAILED", "MODEL_ERROR")
         return result.model_copy(update={"error_code": SENTINEL} if invalid == "code"

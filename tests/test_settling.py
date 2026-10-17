@@ -48,10 +48,10 @@ class PausingManagedPort(DeterministicManagedPort):
         self.started = asyncio.Event()
         self.release = asyncio.Event()
 
-    async def execute(self, prepared, binding, request_id=""):
+    async def execute(self, prepared, binding, request_id="", on_partial=None):
         self.started.set()
         await self.release.wait()
-        return await super().execute(prepared, binding, request_id)
+        return await super().execute(prepared, binding, request_id, on_partial=on_partial)
 
 
 @pytest_asyncio.fixture

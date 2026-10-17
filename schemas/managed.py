@@ -78,6 +78,8 @@ class ManagedTurnRequest(ManagedValue):
     context_last_sequence: PositiveCounter
     messages: tuple[ManagedMessage, ...] = Field(min_length=1, max_length=MAX_MESSAGES)
     selected_input_message_ids: tuple[UUID, ...] = Field(min_length=1, max_length=MAX_MESSAGES)
+    stream_partials: bool = False
+    max_partial_chars: Annotated[int, Field(ge=1, le=8000)] = 2000
 
     @model_validator(mode="after")
     def frozen_projection(self) -> ManagedTurnRequest:
@@ -102,9 +104,15 @@ class ManagedTurnRequest(ManagedValue):
             raise ValueError("invalid selected input")
         if sum(len(m.text.encode("utf-8")) for m in self.messages) > MAX_PROJECTED_TEXT_BYTES:
             raise ValueError("projection exceeds limit")
-        if (self.contract_version == 2
-                and len(self.model_dump_json().encode("utf-8")) > MAX_REQUEST_BYTES):
+        if (
+            self.contract_version == 2
+            and len(self.model_dump_json().encode("utf-8")) > MAX_REQUEST_BYTES
+        ):
             raise ValueError("request exceeds limit")
+        if self.stream_partials and (
+            self.contract_version != 2 or self.channel != Channel.VOICE
+        ):
+            raise ValueError("streaming partials require voice contract version 2")
         return self
 
 
@@ -127,6 +135,8 @@ class ManagedTurnResult(ManagedValue):
     draft_text: TextContent | None
     error_code: ManagedErrorCode | None
     operation_refs: list[ManagedOperationReference] = Field(default_factory=list, max_length=32)
+    partial_text: TextContent | None = None
+    partial_final: bool = False
 
     @model_validator(mode="after")
     def result_shape(self) -> ManagedTurnResult:

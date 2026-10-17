@@ -133,8 +133,9 @@ Delivery creation locks parent then source Turn. Stable delivery_key lookup is
 first: exact replay returns current attempt, changed create payload conflicts.
 New creation requires immutable COMPLETED/DRAFT_READY, current AGENT, and expected
 authority matching current Conversation and Turn snapshot. It creates GENERATED
-revision0. `uq_delivery_source_turn` allows only one attempt per immutable draft;
-UNKNOWN cannot generate another attempt. No Message/counter is appended.
+revision0. `uq_delivery_source_turn` allows one attempt per immutable draft and
+ordinal (Voice sentence leases share a Turn by ordinal); UNKNOWN cannot generate
+another attempt. No Message/counter is appended.
 
 Each reconciliation key has its own immutable row, submitted refs/time/error,
 fingerprint, expected revision and original result revision. Lookup occurs before

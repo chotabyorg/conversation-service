@@ -31,7 +31,10 @@ async def fake_http(network_allowlist, mode, status=200, payload=None):
                 await asyncio.Event().wait()
             content = payload(calls[-1][2]) if callable(payload) else payload
             encoded = content if isinstance(content, bytes) else json.dumps(content).encode()
-            media = "text/plain" if mode == "media" else "application/json"
+            if mode in {"event-stream", "event-stream-truncated", "event-stream-malformed"}:
+                media = "text/event-stream"
+            else:
+                media = "text/plain" if mode == "media" else "application/json"
             extra = "Content-Encoding: gzip\r\n" if mode == "compressed" else ""
             if mode == "redirect":
                 extra += "Location: http://127.0.0.1:1/forbidden\r\n"
