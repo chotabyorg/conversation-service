@@ -40,13 +40,18 @@ class ManagedPortFailure(Exception):
         super().__init__(failure_code.value)
 
 
+PartialCallback = Callable[[str], Awaitable[None]]
+
+
 class ManagedAIPort(Protocol):
     async def execute(
-        self, prepared: PreparedManagedRequest, binding: ManagedBinding, request_id: str = ""
+        self,
+        prepared: PreparedManagedRequest,
+        binding: ManagedBinding,
+        request_id: str = "",
+        on_partial: PartialCallback | None = None,
     ) -> ManagedTurnResult: ...
 
-
-PartialCallback = Callable[[str], Awaitable[None]]
 
 # Bounded server-sent event intake for opted-in partial drafts.
 MAX_PARTIAL_EVENTS = 512

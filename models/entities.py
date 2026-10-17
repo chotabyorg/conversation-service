@@ -373,6 +373,7 @@ class AgentTurn(Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     outcome: Mapped[str | None] = mapped_column(String(16))
     draft_text: Mapped[str | None] = mapped_column(Text)
+    partial_draft_text: Mapped[str | None] = mapped_column(Text)
     failure_code: Mapped[str | None] = mapped_column(String(32))
     operation_refs: Mapped[list[dict[str, str | None]]] = mapped_column(
         JSONB, default=list, server_default=sql_text("'[]'::jsonb")
@@ -447,6 +448,7 @@ class AgentTurn(Base):
             name="ck_turn_failure",
         ),
         CheckConstraint(content_check("draft_text"), name="ck_turn_draft_bounds"),
+        CheckConstraint(content_check("partial_draft_text"), name="ck_turn_partial_draft_bounds"),
         CheckConstraint(REFS_CHECK, name="ck_turn_operation_refs"),
         CheckConstraint(TURN_LIFECYCLE, name="ck_turn_lifecycle"),
         CheckConstraint(MANAGED_MARKER, name="ck_turn_managed_marker"),

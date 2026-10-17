@@ -16,19 +16,27 @@ from schemas.managed import (
 )
 
 
+def stream_partials_for(channel: Channel | str, contract_version: int) -> bool:
+    """Voice v2 only; must match freeze, prepare_snapshot and mark_dispatch."""
+    value = channel if isinstance(channel, Channel) else Channel(channel)
+    return value == Channel.VOICE and contract_version == 2
+
+
 def projected_request(turn: AgentTurn, conversation: Conversation, agent_id: UUID,
                       messages: tuple[ManagedMessage, ...]) -> PreparedManagedRequest:
+    channel = Channel(conversation.channel)
     return prepare_request(ManagedTurnRequest(
         contract_version=turn.managed_contract_version,
         conversation_id=conversation.id, turn_id=turn.id,
         owner_id=conversation.owner_id, integration_id=conversation.integration_id,
-        agent_id=agent_id, channel=Channel(conversation.channel),
+        agent_id=agent_id, channel=channel,
         input_revision=turn.input_revision, authority_revision=turn.authority_revision,
         input_first_sequence=turn.input_first_sequence,
         input_last_sequence=turn.input_last_sequence,
         context_last_sequence=turn.context_last_sequence, messages=messages,
         selected_input_message_ids=tuple(m.id for m in messages
             if turn.input_first_sequence <= m.sequence <= turn.input_last_sequence),
+        stream_partials=stream_partials_for(channel, turn.managed_contract_version),
     ))
 
 

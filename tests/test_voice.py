@@ -15,6 +15,7 @@ from core.config import Settings
 from db.database import Database
 from main import create_app
 from models import AgentTurn, Conversation, DeliveryAttempt, Message, VoiceCall, VoiceInput
+from schemas.managed import ManagedTurnResult
 from services import turns, voice
 from services.voice_worker import VoiceWorker
 from tests.test_telegram import DeterministicManagedPort
@@ -353,10 +354,10 @@ async def test_voice_input_ownership_can_authorize_an_opaque_business_permit(vh)
     entered, release = asyncio.Event(), asyncio.Event()
     original_execute = vh["port"].execute
 
-    async def hold_after_marker(prepared, binding, request_id=""):
+    async def hold_after_marker(prepared, binding, request_id="", on_partial=None):
         entered.set()
         await release.wait()
-        return await original_execute(prepared, binding, request_id)
+        return await original_execute(prepared, binding, request_id, on_partial=on_partial)
 
     vh["port"].execute = hold_after_marker
     running = asyncio.create_task(vh["worker"].run_once())
@@ -586,3 +587,156 @@ async def test_worker_token_and_wrong_namespace_have_no_voice_http_access(vh):
     await voice.expire_calls(vh["database"], wrong.principal())
     async with vh["database"].session_factory() as session:
         assert (await session.scalar(select(VoiceCall))).ended_at is None
+
+
+async def test_voice_requests_stream_partials_on_managed_projection(vh):
+    await start(vh)
+    await post(vh, "utterances", sequence=1, text="hi")
+    assert await vh["worker"].run_once()
+    assert vh["port"].prepared[-1].request.stream_partials is True
+    assert vh["port"].prepared[-1].request.contract_version == 2
+
+
+async def test_partial_draft_next_begin_before_completed_and_final_remainder(vh):
+    await start(vh)
+    await post(vh, "utterances", sequence=1, text="hi")
+    first_partial, release = asyncio.Event(), asyncio.Event()
+
+    async def streaming(prepared, binding, request_id="", on_partial=None):
+        assert prepared.request.stream_partials is True
+        assert on_partial is not None
+        await on_partial("First sentence. ")
+        first_partial.set()
+        await release.wait()
+        await on_partial("First sentence. Second sentence.")
+        request = prepared.request
+        return ManagedTurnResult(
+            contract_version=request.contract_version,
+            conversation_id=request.conversation_id,
+            turn_id=request.turn_id,
+            agent_id=request.agent_id,
+            input_revision=request.input_revision,
+            authority_revision=request.authority_revision,
+            input_first_sequence=request.input_first_sequence,
+            input_last_sequence=request.input_last_sequence,
+            context_last_sequence=request.context_last_sequence,
+            status="DRAFT_READY",
+            draft_text="First sentence. Second sentence.",
+            error_code=None,
+            operation_refs=[],
+        )
+
+    vh["port"].execute = streaming
+    task = asyncio.create_task(vh["worker"].run_once())
+    await asyncio.wait_for(first_partial.wait(), 5)
+    turn_id = (await post(vh, "responses/next")).json()["turn_id"]
+    assert turn_id is not None
+    permission = await begin(vh, turn_id)
+    assert permission["send"] is True and permission["text"] == "First sentence. "
+    async with vh["database"].session_factory() as session:
+        turn = await session.get(AgentTurn, UUID(turn_id))
+        assert turn is not None
+        assert turn.status == "CLAIMED" and turn.draft_text is None
+        assert turn.partial_draft_text == "First sentence. "
+    assert (await fact(vh, permission)).status_code == 200
+    async with vh["database"].session_factory() as session:
+        assert await session.scalar(select(func.count()).select_from(Message)) == 1
+    release.set()
+    assert await task
+    assert (await post(vh, "responses/next")).json()["turn_id"] == turn_id
+    final = await begin(vh, turn_id)
+    assert final["send"] is True and final["text"] == "Second sentence."
+    assert final["response_id"] != permission["response_id"]
+    assert (await begin(vh, turn_id))["send"] is False
+    assert (await fact(vh, final)).status_code == 200
+    async with vh["database"].session_factory() as session:
+        rows = list((await session.scalars(select(Message).order_by(Message.sequence))).all())
+        assert [row.actor for row in rows] == ["CUSTOMER", "AGENT"]
+        assert rows[1].text == "First sentence. Second sentence."
+
+
+async def test_partial_draft_appends_new_sentences_from_ai_events(vh):
+    await start(vh)
+    await post(vh, "utterances", sequence=1, text="hi")
+    first_partial, release = asyncio.Event(), asyncio.Event()
+
+    async def streaming(prepared, binding, request_id="", on_partial=None):
+        await on_partial("First sentence. ")
+        first_partial.set()
+        await release.wait()
+        await on_partial("Second sentence.")
+        request = prepared.request
+        return ManagedTurnResult(
+            contract_version=request.contract_version,
+            conversation_id=request.conversation_id,
+            turn_id=request.turn_id,
+            agent_id=request.agent_id,
+            input_revision=request.input_revision,
+            authority_revision=request.authority_revision,
+            input_first_sequence=request.input_first_sequence,
+            input_last_sequence=request.input_last_sequence,
+            context_last_sequence=request.context_last_sequence,
+            status="DRAFT_READY",
+            draft_text="First sentence. Second sentence.",
+            error_code=None,
+            operation_refs=[],
+        )
+
+    vh["port"].execute = streaming
+    task = asyncio.create_task(vh["worker"].run_once())
+    await asyncio.wait_for(first_partial.wait(), 5)
+    turn_id = (await post(vh, "responses/next")).json()["turn_id"]
+    permission = await begin(vh, turn_id)
+    assert permission["text"] == "First sentence. "
+    assert (await fact(vh, permission)).status_code == 200
+    release.set()
+    assert await task
+    async with vh["database"].session_factory() as session:
+        turn = await session.get(AgentTurn, UUID(turn_id))
+        assert turn.partial_draft_text == "First sentence. Second sentence."
+    assert (await post(vh, "responses/next")).json()["turn_id"] == turn_id
+    final = await begin(vh, turn_id)
+    assert final["text"] == "Second sentence."
+
+
+async def test_partial_covering_full_draft_seals_history_without_extra_speech(vh):
+    await start(vh)
+    await post(vh, "utterances", sequence=1, text="hi")
+    first_partial, release = asyncio.Event(), asyncio.Event()
+
+    async def streaming(prepared, binding, request_id="", on_partial=None):
+        await on_partial("Only sentence.")
+        first_partial.set()
+        await release.wait()
+        request = prepared.request
+        return ManagedTurnResult(
+            contract_version=request.contract_version,
+            conversation_id=request.conversation_id,
+            turn_id=request.turn_id,
+            agent_id=request.agent_id,
+            input_revision=request.input_revision,
+            authority_revision=request.authority_revision,
+            input_first_sequence=request.input_first_sequence,
+            input_last_sequence=request.input_last_sequence,
+            context_last_sequence=request.context_last_sequence,
+            status="DRAFT_READY",
+            draft_text="Only sentence.",
+            error_code=None,
+            operation_refs=[],
+        )
+
+    vh["port"].execute = streaming
+    task = asyncio.create_task(vh["worker"].run_once())
+    await asyncio.wait_for(first_partial.wait(), 5)
+    turn_id = (await post(vh, "responses/next")).json()["turn_id"]
+    permission = await begin(vh, turn_id)
+    assert permission["text"] == "Only sentence."
+    assert (await fact(vh, permission)).status_code == 200
+    release.set()
+    assert await task
+    final = await begin(vh, turn_id)
+    assert final["send"] is False and final["text"] is None and final["replayed"] is False
+    async with vh["database"].session_factory() as session:
+        rows = list((await session.scalars(select(Message).order_by(Message.sequence))).all())
+        assert [row.actor for row in rows] == ["CUSTOMER", "AGENT"]
+        assert rows[1].text == "Only sentence."

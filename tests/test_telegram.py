@@ -36,7 +36,7 @@ class DeterministicManagedPort(ManagedAIPort):
         self.operation_refs: list[dict[str, str | None]] = []
 
     async def execute(self, prepared: PreparedManagedRequest, binding: Any,
-                      request_id: str = "") -> ManagedTurnResult:
+                      request_id: str = "", on_partial: Any = None) -> ManagedTurnResult:
         self.calls += 1
         self.prepared.append(prepared)
         request = prepared.request

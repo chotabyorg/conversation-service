@@ -44,8 +44,12 @@ from schemas.managed import (
 )
 from services import telegram, turns
 from services.common import db_clock, locked_turn
-from services.history_projection import canonical_window, projected_request
-from services.managed_client import ManagedAIPort, ManagedPortFailure
+from services.history_projection import (
+    canonical_window,
+    projected_request,
+    stream_partials_for,
+)
+from services.managed_client import ManagedAIPort, ManagedPortFailure, PartialCallback
 from services.website_evidence import recovery_refs
 
 FINALIZATION_SECONDS = 5.0
@@ -199,6 +203,7 @@ def prepare_snapshot(snapshot: Snapshot) -> PreparedManagedRequest:
                 for message in snapshot.messages
                 if turn.input_first_sequence <= message.sequence <= turn.input_last_sequence
             ),
+            stream_partials=stream_partials_for(snapshot.channel, snapshot.contract_version),
         )
         prepared = prepare_request(request)
         if ((snapshot.projection_fingerprint is not None
@@ -350,8 +355,17 @@ async def execute_claimed_turn(
         return await turns.finish_turn(
             database, principal, turn_id, fail_request(proof, TurnFailureCode.EXECUTION_UNKNOWN)
         )
+    on_partial: PartialCallback | None = None
+    if prepared.request.stream_partials:
+        from services.voice import persist_partial_draft
+
+        async def on_partial(text: str) -> None:
+            await persist_partial_draft(database, turn_id, proof.claim_epoch, text)
+
     try:
-        result = await port.execute(prepared, snapshot.binding, request_id)
+        result = await port.execute(
+            prepared, snapshot.binding, request_id, on_partial=on_partial
+        )
         terminal = terminal_request(proof, result, prepared)
     except asyncio.CancelledError:
         await finalize_cancelled(database, principal, turn_id, proof)

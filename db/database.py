@@ -50,7 +50,7 @@ class Database:
     async def dispose(self) -> None:
         await self.engine.dispose()
 
-    async def ready(self, expected_revision: str = "0008_business_effect_permits") -> bool:
+    async def ready(self, expected_revision: str = "0009_voice_partial_drafts") -> bool:
         try:
             async with self.engine.connect() as connection:
                 if await connection.scalar(text("SELECT 1")) != 1:
@@ -63,10 +63,14 @@ class Database:
                 if versions != [expected_revision]:
                     return False
                 await connection.execute(text(
-                    "SELECT c.id, i.message_id, r.delivery_id, e.sequence FROM voice_calls c "
+                    "SELECT c.id, i.message_id, r.delivery_id, r.ordinal, r.is_partial, "
+                    "r.authorized_text, e.sequence FROM voice_calls c "
                     "LEFT JOIN voice_inputs i ON i.call_id=c.id "
                     "LEFT JOIN voice_responses r ON r.call_id=c.id "
                     "LEFT JOIN voice_playback_events e ON e.response_id=r.id LIMIT 1"
+                ))
+                await connection.execute(text(
+                    "SELECT id, draft_text, partial_draft_text FROM agent_turns LIMIT 1"
                 ))
                 await connection.execute(
                     text(

@@ -109,8 +109,10 @@ class ManagedTurnRequest(ManagedValue):
             and len(self.model_dump_json().encode("utf-8")) > MAX_REQUEST_BYTES
         ):
             raise ValueError("request exceeds limit")
-        if self.stream_partials and self.contract_version != 2:
-            raise ValueError("streaming partials require contract version 2")
+        if self.stream_partials and (
+            self.contract_version != 2 or self.channel != Channel.VOICE
+        ):
+            raise ValueError("streaming partials require voice contract version 2")
         return self
 
 

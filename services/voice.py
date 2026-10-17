@@ -314,6 +314,51 @@ async def select_turn(database: Database, principal: Principal, settings: Settin
         after = ids[-1]
 
 
+async def authorized_prefix(session: AsyncSession, turn_id: UUID) -> str:
+    texts = (await session.scalars(select(VoiceResponse.authorized_text).where(
+        VoiceResponse.turn_id == turn_id, VoiceResponse.send_authorized.is_(True),
+        VoiceResponse.authorized_text.is_not(None),
+    ).order_by(VoiceResponse.ordinal))).all()
+    return "".join(texts)
+
+
+def remaining_speech(source: str | None, spoken: str) -> str | None:
+    if source is None:
+        return None
+    if source.startswith(spoken):
+        rest = source[len(spoken):]
+        return rest or None
+    # Divergent revisions must not replay already-authorized audio.
+    return None if spoken else source
+
+
+async def persist_partial_draft(database: Database, turn_id: UUID, claim_epoch: int,
+                                text: str) -> None:
+    """Short independent write; never holds a claim lock across managed HTTP.
+
+    AI emits newly completed sentences; callers may also send cumulative text.
+    Store a monotonic spoken prefix so begin can authorize only the remainder.
+    """
+    if not text or len(text) > 16384 or len(text.encode("utf-8")) > 32768:
+        return
+    async with database.session_factory() as session, session.begin():
+        turn = await session.get(AgentTurn, turn_id, with_for_update=True)
+        if turn is None or turn.status != "CLAIMED" or turn.claim_epoch != claim_epoch:
+            return
+        current = turn.partial_draft_text or ""
+        if text.startswith(current):
+            merged = text
+        elif current.endswith(text):
+            return
+        else:
+            merged = current + text
+        if (merged == current or len(merged) > 16384
+                or len(merged.encode("utf-8")) > 32768):
+            return
+        turn.partial_draft_text = merged
+        await session.flush()
+
+
 async def next_response(database: Database, principal: Principal, request: CallIdentity,
                         settings: Settings) -> ResponseCandidate:
     async with database.session_factory() as session, session.begin():
@@ -324,11 +369,35 @@ async def next_response(database: Database, principal: Principal, request: CallI
             VoiceResponse.terminal.is_(False),
         ).limit(1)) is not None:
             return ResponseCandidate(**request.model_dump(), turn_id=None)
-        turn_id = await session.scalar(select(AgentTurn.id).where(
-            AgentTurn.conversation_id == conversation.id, AgentTurn.status == "COMPLETED",
-            AgentTurn.outcome == "DRAFT_READY",
-            ~exists(select(VoiceResponse.id).where(VoiceResponse.turn_id == AgentTurn.id)),
-        ).order_by(AgentTurn.input_first_sequence).limit(1))
+        candidates = (await session.scalars(select(AgentTurn).where(
+            AgentTurn.conversation_id == conversation.id,
+            or_(
+                and_(
+                    AgentTurn.status == "CLAIMED",
+                    AgentTurn.partial_draft_text.is_not(None),
+                ),
+                and_(
+                    AgentTurn.status == "COMPLETED",
+                    AgentTurn.outcome == "DRAFT_READY",
+                    AgentTurn.draft_text.is_not(None),
+                    ~exists(select(VoiceResponse.id).where(
+                        VoiceResponse.turn_id == AgentTurn.id,
+                        VoiceResponse.is_partial.is_(False),
+                    )),
+                ),
+            ),
+        ).order_by(AgentTurn.input_first_sequence).limit(20))).all()
+        turn_id = None
+        for turn in candidates:
+            spoken = await authorized_prefix(session, turn.id)
+            if turn.status == "CLAIMED":
+                if remaining_speech(turn.partial_draft_text, spoken) is not None:
+                    turn_id = turn.id
+                    break
+                continue
+            # COMPLETED without a final lease: authorize remainder or seal history.
+            turn_id = turn.id
+            break
         return ResponseCandidate(**request.model_dump(), turn_id=turn_id)
 
 
@@ -359,26 +428,48 @@ def record_delivery(session: AsyncSession, delivery: DeliveryAttempt, state: str
 
 async def begin(database: Database, principal: Principal, request: ResponseBegin,
                 settings: Settings) -> ResponsePermission:
-    response_id = uuid5(RESPONSE_NAMESPACE, str(request.turn_id))
     async with database.session_factory() as session, session.begin():
         conversation, call = await locked_call(session, principal, request)
-        previous = await session.get(VoiceResponse, response_id)
-        if previous is not None:
-            if previous.call_id != call.id:
+        clock = await db_clock(session)
+        turn = await session.scalar(select(AgentTurn).where(
+            AgentTurn.id == request.turn_id, AgentTurn.conversation_id == conversation.id,
+        ).with_for_update())
+        if turn is None:
+            raise DomainError(ErrorCode.NO_DRAFT)
+        open_lease = await session.scalar(select(VoiceResponse).where(
+            VoiceResponse.turn_id == turn.id, VoiceResponse.send_authorized.is_(True),
+            VoiceResponse.terminal.is_(False),
+        ).limit(1))
+        if open_lease is not None:
+            if open_lease.call_id != call.id:
                 raise DomainError(ErrorCode.NOT_FOUND)
             # A lost permission response never permits a second playback.
-            return ResponsePermission(**request.model_dump(), response_id=response_id,
+            return ResponsePermission(**request.model_dump(), response_id=open_lease.id,
+                                      send=False, replayed=True)
+        final = await session.scalar(select(VoiceResponse).where(
+            VoiceResponse.turn_id == turn.id, VoiceResponse.is_partial.is_(False),
+        ).limit(1))
+        if final is not None:
+            if final.call_id != call.id:
+                raise DomainError(ErrorCode.NOT_FOUND)
+            return ResponsePermission(**request.model_dump(), response_id=final.id,
                                       send=False, replayed=True)
         if await session.scalar(select(VoiceResponse.id).where(
             VoiceResponse.call_id == call.id, VoiceResponse.send_authorized.is_(True),
             VoiceResponse.terminal.is_(False),
         ).limit(1)) is not None:
             raise DomainError(ErrorCode.LEASE_HELD)
-        clock = await db_clock(session)
-        turn = await session.scalar(select(AgentTurn).where(
-            AgentTurn.id == request.turn_id, AgentTurn.conversation_id == conversation.id,
-        ).with_for_update())
-        if turn is None or turn.status != "COMPLETED" or turn.draft_text is None:
+        spoken = await authorized_prefix(session, turn.id)
+        is_partial = False
+        text: str | None = None
+        if turn.status == "CLAIMED":
+            text = remaining_speech(turn.partial_draft_text, spoken)
+            if text is None:
+                raise DomainError(ErrorCode.NO_DRAFT)
+            is_partial = True
+        elif turn.status == "COMPLETED" and turn.outcome == "DRAFT_READY" and turn.draft_text:
+            text = remaining_speech(turn.draft_text, spoken)
+        else:
             raise DomainError(ErrorCode.NO_DRAFT)
         # Validate retained Voice input ownership even when the call is no longer live.
         count = await session.scalar(select(VoiceInput.message_id).join(
@@ -390,9 +481,13 @@ async def begin(database: Database, principal: Principal, request: ResponseBegin
                    and conversation.control_mode == "AGENT"
                    and conversation.authority_revision == turn.authority_revision
                    and conversation.settling_revision == turn.settling_revision)
-        if await session.scalar(select(DeliveryAttempt.id).where(
-            DeliveryAttempt.source_turn_id == turn.id)) is not None:
-            raise DomainError(ErrorCode.DELIVERY_INTENT_EXISTS)
+        send = bool(allowed and text)
+        seal_history = (
+            not is_partial and allowed and text is None and turn.draft_text is not None
+        )
+        ordinal = int(await session.scalar(select(func.count()).select_from(VoiceResponse).where(
+            VoiceResponse.turn_id == turn.id)) or 0)
+        response_id = uuid5(RESPONSE_NAMESPACE, f"{request.turn_id}:{ordinal}")
         delivery = DeliveryAttempt(
             id=uuid4(), conversation_id=conversation.id, source_turn_id=turn.id,
             delivery_key=response_id, creation_fingerprint=fingerprint({"voice": str(response_id)}),
@@ -401,17 +496,34 @@ async def begin(database: Database, principal: Principal, request: ResponseBegin
         )
         session.add(delivery)
         await session.flush()
-        record_delivery(session, delivery, "DISPATCH_REQUESTED" if allowed else "SUPERSEDED",
-                        response_id, clock, expected_settling=turn.settling_revision,
-                        current_settling=conversation.settling_revision)
-        session.add(VoiceResponse(id=response_id, call_id=call.id,
-                                  conversation_id=conversation.id, turn_id=turn.id,
-                                  delivery_id=delivery.id, send_authorized=allowed,
-                                  terminal=not allowed))
+        if send or seal_history:
+            record_delivery(session, delivery, "DISPATCH_REQUESTED", response_id, clock,
+                            expected_settling=turn.settling_revision,
+                            current_settling=conversation.settling_revision)
+        else:
+            record_delivery(session, delivery, "SUPERSEDED", response_id, clock,
+                            expected_settling=turn.settling_revision,
+                            current_settling=conversation.settling_revision)
+        if seal_history:
+            record_delivery(session, delivery, "PROVIDER_ACCEPTED",
+                            uuid5(response_id, "partial-covered"), clock)
+            conversation.last_message_sequence += 1
+            conversation.updated_at = clock
+            session.add(Message(
+                id=uuid4(), conversation_id=conversation.id,
+                sequence=conversation.last_message_sequence, actor="AGENT", direction="OUTBOUND",
+                content_type="TEXT", text=turn.draft_text, source_agent_turn_id=turn.id,
+                created_at=clock,
+            ))
+        session.add(VoiceResponse(
+            id=response_id, call_id=call.id, conversation_id=conversation.id, turn_id=turn.id,
+            delivery_id=delivery.id, send_authorized=send, ordinal=ordinal,
+            is_partial=is_partial, authorized_text=text if send else None,
+            terminal=not send,
+        ))
         await session.flush()
         result = ResponsePermission(**request.model_dump(), response_id=response_id,
-                                    send=allowed, text=turn.draft_text if allowed else None,
-                                    replayed=False)
+                                    send=send, text=text if send else None, replayed=False)
     return result
 
 
@@ -457,7 +569,7 @@ async def playback(database: Database, principal: Principal, request: Playback,
         response.generated_bytes = request.generated_bytes
         response.accepted_bytes = request.transport_accepted_bytes
         response.terminal = request.terminal
-        if request.state == "COMPLETED":
+        if request.state == "COMPLETED" and not response.is_partial:
             turn = await session.get(AgentTurn, response.turn_id)
             assert turn is not None and turn.draft_text is not None
             conversation.last_message_sequence += 1

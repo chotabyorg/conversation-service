@@ -136,7 +136,7 @@ Compose binds only `127.0.0.1:55585` (HTTP) and `127.0.0.1:55595` (PostgreSQL),
 using its own internal network rather than the existing microservices network.
 The application image runs as UID 10001 and Compose uses a read-only filesystem.
 Migrations are explicit; startup never substitutes `create_all`. `/ready` succeeds
-only against migration `0008_business_effect_permits` and the required table queries. `/health`
+only against migration `0009_voice_partial_drafts` and the required table queries. `/health`
 checks process liveness. Both return bounded public status only.
 
 ## Internal authentication
@@ -237,7 +237,8 @@ assigning settling policy retroactively. It refuses downgrade while retained
 burst ownership, supersede or send-permission evidence, settling fences, multiple
 response attempts, or non-reconstructible ownership/account history depends on the
 new schema. See the migration details in [durable turn settling](docs/turn-settling.md).
-Migration `0008_business_effect_permits` adds the authority input floor and
+Migration `0009_voice_partial_drafts` adds Voice partial-draft storage and per-lease
+response ordinals. Migration `0008_business_effect_permits` adds the authority input floor and
 append-only opaque effect permits. Existing nonzero authority epochs are backfilled
 to their current message tail, so their historical customer inputs cannot be
 reinterpreted as fresh business authority after upgrade.

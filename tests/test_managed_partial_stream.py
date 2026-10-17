@@ -59,13 +59,18 @@ def test_streaming_request_contract_defaults_and_version_gate():
     assert ManagedTurnRequest.model_validate(value).stream_partials is False
     with pytest.raises(ValidationError):
         ManagedTurnRequest.model_validate({**value, "stream_partials": True})
+    with pytest.raises(ValidationError):
+        ManagedTurnRequest.model_validate(
+            {**value, "contract_version": 2, "stream_partials": True, "max_partial_chars": 50}
+        )
     streamed = ManagedTurnRequest.model_validate(
-        {**value, "contract_version": 2, "stream_partials": True, "max_partial_chars": 50}
+        {**value, "channel": "VOICE", "contract_version": 2, "stream_partials": True,
+         "max_partial_chars": 50}
     )
     assert streamed.stream_partials is True
     with pytest.raises(ValidationError):
         ManagedTurnRequest.model_validate(
-            {**value, "stream_partials": True, "max_partial_chars": 0}
+            {**value, "channel": "VOICE", "stream_partials": True, "max_partial_chars": 0}
         )
     result = ManagedTurnResult.model_validate(
         dict(
@@ -91,7 +96,8 @@ def test_streaming_request_contract_defaults_and_version_gate():
 
 def streaming_request():
     value = wire_request()
-    value.update(contract_version=2, stream_partials=True, max_partial_chars=500)
+    value.update(channel="VOICE", contract_version=2, stream_partials=True,
+                 max_partial_chars=500)
     return ManagedTurnRequest.model_validate(value)
 
 

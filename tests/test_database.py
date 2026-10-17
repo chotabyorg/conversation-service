@@ -148,7 +148,7 @@ async def test_migrated_catalog_constraints_indexes_utc_and_exact_collation(h, s
         }
         assert (
             await connection.scalar(text("SELECT version_num FROM alembic_version"))
-            == "0008_business_effect_permits"
+            == "0009_voice_partial_drafts"
         )
         timestamps = (
             (
@@ -389,7 +389,7 @@ async def test_missing_or_wrong_revision_and_missing_table_are_not_ready(h, sql)
     finally:
         async with sql.begin() as connection:
             await connection.execute(
-                text("UPDATE alembic_version SET version_num='0008_business_effect_permits'")
+                text("UPDATE alembic_version SET version_num='0009_voice_partial_drafts'")
             )
     async with sql.begin() as connection:
         await connection.execute(
