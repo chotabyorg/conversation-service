@@ -84,6 +84,11 @@ PRE_GOAL5_COLUMNS["messages"] = PRE_GOAL5_COLUMNS["messages"] | {"input_revision
 PRE_GOAL5_COLUMNS["conversations"] = (
     PRE_GOAL5_COLUMNS["conversations"] | {"authority_input_floor_sequence"}
 )
+# Partial draft text was introduced in 0009 and must be omitted both from the
+# populated-0001 fixture projection and from cross-revision equality checks.
+PRE_GOAL5_COLUMNS["agent_turns"] = (
+    PRE_GOAL5_COLUMNS["agent_turns"] | {"partial_draft_text"}
+)
 GOAL5_TABLES = (
     *TABLES,
     "turn_input_messages",
@@ -162,6 +167,8 @@ async def goal4b_rows(sql):
         "settling_quiet_window_ms", "settling_max_wait_ms", "settling_burst_id",
     })
     omitted["agent_turns"].update({"settling_revision", "settling_burst_id"})
+    # Partial draft text arrived in 0009 and must not appear in a 0005 projection.
+    omitted["agent_turns"].add("partial_draft_text")
     omitted["delivery_attempts"].update({
         "expected_settling_revision", "fenced_settling_revision",
     })
