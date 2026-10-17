@@ -657,6 +657,51 @@ async def test_partial_draft_next_begin_before_completed_and_final_remainder(vh)
         assert rows[1].text == "First sentence. Second sentence."
 
 
+async def test_fenced_partial_begin_is_superseded_not_an_internal_error(vh):
+    await start(vh)
+    await post(vh, "utterances", sequence=1, text="hi")
+    first_partial, release = asyncio.Event(), asyncio.Event()
+
+    async def streaming(prepared, binding, request_id="", on_partial=None, caller_phone=""):
+        await on_partial("First sentence. ")
+        first_partial.set()
+        await release.wait()
+        request = prepared.request
+        return ManagedTurnResult(
+            contract_version=request.contract_version,
+            conversation_id=request.conversation_id,
+            turn_id=request.turn_id,
+            agent_id=request.agent_id,
+            input_revision=request.input_revision,
+            authority_revision=request.authority_revision,
+            input_first_sequence=request.input_first_sequence,
+            input_last_sequence=request.input_last_sequence,
+            context_last_sequence=request.context_last_sequence,
+            status="DRAFT_READY",
+            draft_text="First sentence. ",
+            error_code=None,
+            operation_refs=[],
+        )
+
+    vh["port"].execute = streaming
+    task = asyncio.create_task(vh["worker"].run_once())
+    await asyncio.wait_for(first_partial.wait(), 5)
+    turn_id = (await post(vh, "responses/next")).json()["turn_id"]
+    assert turn_id is not None
+    # A human takeover (or any settling change) fences the in-flight partial:
+    # the authorized-send condition is false while the turn is still CLAIMED.
+    async with vh["database"].session_factory() as session:
+        conversation = await session.scalar(select(Conversation))
+        assert conversation is not None
+        conversation.control_mode = "HUMAN"
+        await session.commit()
+    permission = await begin(vh, turn_id)
+    assert permission["send"] is False
+    assert permission["replayed"] is False
+    release.set()
+    assert await task
+
+
 async def test_partial_draft_appends_new_sentences_from_ai_events(vh):
     await start(vh)
     await post(vh, "utterances", sequence=1, text="hi")
