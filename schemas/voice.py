@@ -58,6 +58,8 @@ class ResponsePermission(ResponseBegin):
     send: bool
     text: TextContent | None = None
     replayed: bool
+    # A partial (leased) sentence: the same turn is still being written.
+    is_partial: bool = False
 
     @model_validator(mode="after")
     def permission_shape(self) -> "ResponsePermission":

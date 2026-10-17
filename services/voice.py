@@ -446,7 +446,8 @@ async def begin(database: Database, principal: Principal, request: ResponseBegin
                 raise DomainError(ErrorCode.NOT_FOUND)
             # A lost permission response never permits a second playback.
             return ResponsePermission(**request.model_dump(), response_id=open_lease.id,
-                                      send=False, replayed=True)
+                                      send=False, replayed=True,
+                                      is_partial=bool(open_lease.is_partial))
         final = await session.scalar(select(VoiceResponse).where(
             VoiceResponse.turn_id == turn.id, VoiceResponse.is_partial.is_(False),
         ).limit(1))
@@ -454,7 +455,8 @@ async def begin(database: Database, principal: Principal, request: ResponseBegin
             if final.call_id != call.id:
                 raise DomainError(ErrorCode.NOT_FOUND)
             return ResponsePermission(**request.model_dump(), response_id=final.id,
-                                      send=False, replayed=True)
+                                      send=False, replayed=True,
+                                      is_partial=bool(final.is_partial))
         if await session.scalar(select(VoiceResponse.id).where(
             VoiceResponse.call_id == call.id, VoiceResponse.send_authorized.is_(True),
             VoiceResponse.terminal.is_(False),
@@ -529,7 +531,8 @@ async def begin(database: Database, principal: Principal, request: ResponseBegin
         ))
         await session.flush()
         result = ResponsePermission(**request.model_dump(), response_id=response_id,
-                                    send=send, text=text if send else None, replayed=False)
+                                    send=send, text=text if send else None, replayed=False,
+                                    is_partial=bool(is_partial and send))
     return result
 
 
