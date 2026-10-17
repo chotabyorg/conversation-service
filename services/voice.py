@@ -319,7 +319,7 @@ async def authorized_prefix(session: AsyncSession, turn_id: UUID) -> str:
         VoiceResponse.turn_id == turn_id, VoiceResponse.send_authorized.is_(True),
         VoiceResponse.authorized_text.is_not(None),
     ).order_by(VoiceResponse.ordinal))).all()
-    return "".join(texts)
+    return "".join(text for text in texts if text is not None)
 
 
 def remaining_speech(source: str | None, spoken: str) -> str | None:
@@ -492,6 +492,7 @@ async def begin(database: Database, principal: Principal, request: ResponseBegin
             id=uuid4(), conversation_id=conversation.id, source_turn_id=turn.id,
             delivery_key=response_id, creation_fingerprint=fingerprint({"voice": str(response_id)}),
             authority_revision=turn.authority_revision, status="GENERATED", revision=0,
+            ordinal=ordinal,
             created_at=clock, updated_at=clock,
         )
         session.add(delivery)

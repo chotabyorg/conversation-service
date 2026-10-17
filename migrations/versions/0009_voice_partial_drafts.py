@@ -49,11 +49,25 @@ def upgrade() -> None:
         "(is_partial = false) OR (send_authorized = true AND authorized_text IS NOT NULL)",
     )
 
+    # Per-lease Speech deliveries share one source turn. The constraint keeps its
+    # name so non-Voice replay detection is unchanged; only the key is extended.
+    op.add_column(
+        "delivery_attempts",
+        sa.Column("ordinal", sa.BigInteger(), server_default=sa.text("0"), nullable=False),
+    )
+    op.drop_constraint("uq_delivery_source_turn", "delivery_attempts", type_="unique")
+    op.create_unique_constraint(
+        "uq_delivery_source_turn", "delivery_attempts", ["source_turn_id", "ordinal"]
+    )
+    op.create_check_constraint(
+        "ck_delivery_ordinal", "delivery_attempts", "ordinal >= 0"
+    )
+
 
 def downgrade() -> None:
     connection = op.get_bind()
     connection.execute(sa.text(
-        "LOCK TABLE agent_turns, voice_responses IN ACCESS EXCLUSIVE MODE"
+        "LOCK TABLE agent_turns, voice_responses, delivery_attempts IN ACCESS EXCLUSIVE MODE"
     ))
     multi = connection.scalar(sa.text(
         "SELECT EXISTS ("
@@ -62,8 +76,17 @@ def downgrade() -> None:
     partials = connection.scalar(sa.text(
         "SELECT EXISTS (SELECT 1 FROM agent_turns WHERE partial_draft_text IS NOT NULL)"
     ))
-    if multi or partials:
+    leases = connection.scalar(sa.text(
+        "SELECT EXISTS (SELECT 1 FROM delivery_attempts WHERE ordinal > 0)"
+    ))
+    if multi or partials or leases:
         raise RuntimeError("Voice partial draft evidence is retained; downgrade refused")
+    op.drop_constraint("ck_delivery_ordinal", "delivery_attempts", type_="check")
+    op.drop_constraint("uq_delivery_source_turn", "delivery_attempts", type_="unique")
+    op.create_unique_constraint(
+        "uq_delivery_source_turn", "delivery_attempts", ["source_turn_id"]
+    )
+    op.drop_column("delivery_attempts", "ordinal")
     op.drop_constraint("ck_voice_response_partial_shape", "voice_responses", type_="check")
     op.drop_constraint("ck_voice_response_authorized_text", "voice_responses", type_="check")
     op.drop_constraint("ck_voice_response_ordinal", "voice_responses", type_="check")

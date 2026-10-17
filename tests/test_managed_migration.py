@@ -89,6 +89,10 @@ PRE_GOAL5_COLUMNS["conversations"] = (
 PRE_GOAL5_COLUMNS["agent_turns"] = (
     PRE_GOAL5_COLUMNS["agent_turns"] | {"partial_draft_text"}
 )
+# The per-lease delivery ordinal arrived in 0009 and is likewise pre-Goal5.
+PRE_GOAL5_COLUMNS["delivery_attempts"] = (
+    PRE_GOAL5_COLUMNS["delivery_attempts"] | {"ordinal"}
+)
 GOAL5_TABLES = (
     *TABLES,
     "turn_input_messages",
@@ -170,7 +174,7 @@ async def goal4b_rows(sql):
     # Partial draft text arrived in 0009 and must not appear in a 0005 projection.
     omitted["agent_turns"].add("partial_draft_text")
     omitted["delivery_attempts"].update({
-        "expected_settling_revision", "fenced_settling_revision",
+        "expected_settling_revision", "fenced_settling_revision", "ordinal",
     })
     omitted["delivery_reconciliations"].update({
         "expected_settling_revision", "result_settling_revision",
