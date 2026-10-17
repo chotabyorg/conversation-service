@@ -520,7 +520,11 @@ async def begin(database: Database, principal: Principal, request: ResponseBegin
         session.add(VoiceResponse(
             id=response_id, call_id=call.id, conversation_id=conversation.id, turn_id=turn.id,
             delivery_id=delivery.id, send_authorized=send, ordinal=ordinal,
-            is_partial=is_partial, authorized_text=text if send else None,
+            # A fenced answer is never sent; recording it as a partial would
+            # require authorized text (ck_voice_response_partial_shape) and an
+            # unfenced send, so it is stored as a superseded final instead.
+            is_partial=is_partial and send,
+            authorized_text=text if send else None,
             terminal=not send,
         ))
         await session.flush()
