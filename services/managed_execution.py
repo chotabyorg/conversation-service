@@ -362,9 +362,19 @@ async def execute_claimed_turn(
         async def on_partial(text: str) -> None:
             await persist_partial_draft(database, turn_id, proof.claim_epoch, text)
 
+    from schemas.contracts import Channel
+
+    caller_phone = ""
+    if prepared.request.channel == Channel.VOICE:
+        from models import VoiceCall
+
+        async with database.session_factory() as session:
+            caller_phone = await session.scalar(select(VoiceCall.caller_number).where(
+                VoiceCall.conversation_id == prepared.request.conversation_id)) or ""
     try:
         result = await port.execute(
-            prepared, snapshot.binding, request_id, on_partial=on_partial
+            prepared, snapshot.binding, request_id, on_partial=on_partial,
+            caller_phone=caller_phone,
         )
         terminal = terminal_request(proof, result, prepared)
     except asyncio.CancelledError:

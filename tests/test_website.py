@@ -40,7 +40,7 @@ class FakeAI:
         self.evidence_calls = 0
         self.uncertain = False
 
-    async def execute(self, prepared, binding, request_id="", on_partial=None):
+    async def execute(self, prepared, binding, request_id="", on_partial=None, caller_phone=""):
         self.calls.append(prepared)
         if self.pause:
             await asyncio.sleep(self.pause)
