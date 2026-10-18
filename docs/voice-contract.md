@@ -114,6 +114,20 @@ remain retained. No Business effect is rolled back by superseding communication.
 
 ## Native verification and activation
 
+### Failed-turn speech
+
+An asynchronously failed managed Turn is eligible for one code-owned failure
+response through the same next/begin/playback protocol. Begin rechecks call,
+input/settling and control authority; the fallback never changes the Turn's FAILED
+status, failure code, operation references or fingerprint. UNKNOWN wording does
+not claim success, no effect, or permission to retry. Partial-to-failed and
+partial-to-NO_RESPONSE races do not become boundary errors. The latter seals a
+non-sending final response. A completed failure response appends only its actually
+authorized fallback text to canonical history; interrupted/unknown playback does
+not append a full assistant Message. A following caller utterance uses a new Turn.
+No business effect is retried by sending this communication fallback.
+
+
 Use Python 3.11 and a dedicated disposable PostgreSQL 16 database. Run migrations,
 the full suite, Ruff and mypy as documented in README. The explicit two-repository
 acceptance uses real local AudioSocket and HTTP connections and a deterministic
