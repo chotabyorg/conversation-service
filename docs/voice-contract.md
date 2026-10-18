@@ -117,7 +117,10 @@ remain retained. No Business effect is rolled back by superseding communication.
 ### Failed-turn speech
 
 An asynchronously failed managed Turn is eligible for one code-owned failure
-response through the same next/begin/playback protocol. Begin rechecks call,
+response through the same next/begin/playback protocol. Candidate selection first
+requires the same retained call/input ownership and projected agent as begin, so
+a generic terminal Turn without Voice ownership cannot block the response queue.
+Begin rechecks call,
 input/settling and control authority; the fallback never changes the Turn's FAILED
 status, failure code, operation references or fingerprint. UNKNOWN wording does
 not claim success, no effect, or permission to retry. Partial-to-failed and

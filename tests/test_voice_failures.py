@@ -1,13 +1,16 @@
 """Failed managed turns remain failed while the caller can continue speaking."""
 
 import asyncio
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
+from pydantic import SecretStr
 from sqlalchemy import select
 
 from models import AgentTurn, Conversation, Message, VoiceCall
+from schemas.contracts import TurnClaim, TurnComplete, TurnCreate, TurnFail
 from schemas.managed import ManagedTurnResult
+from services import turns
 from tests.test_voice import begin, fact, post, start
 from tests.test_voice import vh as vh_fixture
 
@@ -134,4 +137,35 @@ async def test_partial_candidate_that_finishes_without_response_does_not_fail_bo
     assert await asyncio.wait_for(task, 5)
     permission = await begin(vh, turn_id)
     assert not permission["send"] and permission["text"] is None
+    assert (await post(vh, "calls/heartbeat")).json()["state"] == "ACTIVE"
+
+
+@pytest.mark.parametrize("status", ["FAILED", "COMPLETED"])
+async def test_generic_turn_without_voice_projection_cannot_block_response_queue(vh, status):
+    """A generic terminal turn must not hide the next valid Voice response."""
+    await start(vh)
+    await post(vh, "utterances", sequence=1, text="Первый вопрос")
+    database, principal = vh["database"], vh["worker"].principal
+    async with database.session_factory() as session:
+        conversation = await session.scalar(select(Conversation))
+    selected = await turns.create_turn(database, principal, conversation.id, TurnCreate(
+        selection_key=uuid4(), input_first_sequence=1, input_last_sequence=1,
+        expected_input_revision=conversation.input_revision,
+        expected_authority_revision=conversation.authority_revision,
+    ))
+    claim = await turns.claim_turn(database, principal, selected.turn.id, TurnClaim(
+        worker_ref="generic-worker", lease_seconds=30,
+    ))
+    proof = dict(claim_epoch=claim.turn.claim_epoch, claim_token=SecretStr(claim.claim_token))
+    result = (TurnFail(**proof, failure_code="PROCESSING_ERROR") if status == "FAILED" else
+              TurnComplete(**proof, outcome="DRAFT_READY", draft_text="Generic answer"))
+    await turns.finish_turn(database, principal, selected.turn.id, result)
+    assert (await post(vh, "responses/next")).json()["turn_id"] is None
+    assert (await post(vh, "utterances", sequence=2, text="Следующий вопрос")).status_code == 200
+    assert await vh["worker"].run_once()
+    next_id = (await post(vh, "responses/next")).json()["turn_id"]
+    assert next_id and next_id != str(selected.turn.id)
+    permission = await begin(vh, next_id)
+    assert permission["send"] and permission["text"] != "Generic answer"
+    assert (await fact(vh, permission)).status_code == 200
     assert (await post(vh, "calls/heartbeat")).json()["state"] == "ACTIVE"

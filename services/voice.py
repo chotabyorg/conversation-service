@@ -381,6 +381,12 @@ async def next_response(database: Database, principal: Principal, request: CallI
             return ResponseCandidate(**request.model_dump(), turn_id=None)
         candidates = (await session.scalars(select(AgentTurn).where(
             AgentTurn.conversation_id == conversation.id,
+            # Match begin's immutable ownership proof before applying the limit.
+            # Generic turns cannot be authorized and must not block this queue.
+            AgentTurn.managed_projection_agent_id == call.agent_id,
+            exists(select(VoiceInput.message_id).join(
+                TurnInputMessage, TurnInputMessage.message_id == VoiceInput.message_id,
+            ).where(TurnInputMessage.turn_id == AgentTurn.id, VoiceInput.call_id == call.id)),
             or_(
                 and_(
                     AgentTurn.status == "CLAIMED",
@@ -408,7 +414,7 @@ async def next_response(database: Database, principal: Principal, request: CallI
                     turn_id = turn.id
                     break
                 continue
-            # COMPLETED without a final lease: authorize remainder or seal history.
+            # Terminal turn without a final lease: authorize response or seal history.
             turn_id = turn.id
             break
         return ResponseCandidate(**request.model_dump(), turn_id=turn_id)
