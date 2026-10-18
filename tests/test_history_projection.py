@@ -21,7 +21,11 @@ from schemas.contracts import ErrorCode, TurnClaim, TurnComplete, TurnCreate, Tu
 from schemas.managed import MAX_REQUEST_BYTES, ManagedTurnRequest, prepare_request
 from services import managed_execution, turns
 from services.common import fingerprint
-from services.history_projection import canonical_window, freeze_website_projection, projected_request
+from services.history_projection import (
+    canonical_window,
+    freeze_website_projection,
+    projected_request,
+)
 from services.website_worker import WebsiteWorker, select_immediate
 from tests.conftest import locked_race
 from tests.test_database import violation
@@ -372,7 +376,8 @@ async def test_historical_website_projection_replays_exact_pre_stream_body_and_m
     assert selected is not None and len(historical_hashes) == 1
 
     claim = await turns.claim_turn(
-        wh.database, wh.principal, selected, TurnClaim(worker_ref="history-replay", lease_seconds=30)
+        wh.database, wh.principal, selected,
+        TurnClaim(worker_ref="history-replay", lease_seconds=30),
     )
     proof = TurnExecute(claim_epoch=claim.turn.claim_epoch,
                         claim_token=SecretStr(claim.claim_token))

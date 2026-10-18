@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 from uuid import UUID
 
 from pydantic import ConfigDict, Field, field_validator, model_validator
@@ -184,7 +184,9 @@ def prepare_request(request: ManagedTurnRequest) -> PreparedManagedRequest:
     return _prepare_request_fields(request, fields)
 
 
-def _prepare_request_fields(request: ManagedTurnRequest, fields: dict) -> PreparedManagedRequest:
+def _prepare_request_fields(
+    request: ManagedTurnRequest, fields: dict[str, Any]
+) -> PreparedManagedRequest:
     body = json.dumps(
         fields, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
     ).encode("utf-8")

@@ -5,9 +5,8 @@ from uuid import UUID
 
 import pytest
 
-from schemas.managed import ManagedTurnRequest, prepare_request
 from schemas.contracts import Channel
-
+from schemas.managed import ManagedTurnRequest, prepare_request
 
 # These are frozen historical vectors generated with the pre-stream and
 # post-stream canonical schemas. Keep them literal so production code cannot
@@ -77,7 +76,9 @@ def historical_request(version=1, *, channel="WEBSITE_WIDGET", stream=False,
         (historical_request(2, channel="VOICE", stream=True), V2_EXT_TRUE_2000),
     ],
 )
-def test_retained_projection_chooses_only_the_exact_historical_wire_profile(managed_request, expected):
+def test_retained_projection_chooses_only_the_exact_historical_wire_profile(
+    managed_request, expected
+):
     from schemas.managed import prepare_request_for_fingerprint
 
     prepared = prepare_request_for_fingerprint(managed_request, expected)

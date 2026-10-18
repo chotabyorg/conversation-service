@@ -8,8 +8,8 @@ from core.errors import DomainError
 from models import AgentTurn, Conversation, Message
 from schemas.contracts import Channel, ErrorCode
 from schemas.managed import (
-    MAX_MESSAGES,
     DEFAULT_MAX_PARTIAL_CHARS,
+    MAX_MESSAGES,
     ManagedMessage,
     ManagedTurnRequest,
     PreparedManagedRequest,
