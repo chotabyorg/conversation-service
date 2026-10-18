@@ -338,8 +338,7 @@ def failure_speech(turn: AgentTurn) -> str:
     if turn.failure_code == "EXECUTION_UNKNOWN":
         return ("Пока не удалось подтвердить результат. "
                 "Повторять действие без проверки не буду. Я на линии.")
-    return ("Не удалось завершить запрос. Я на линии. "
-            "Уточните, пожалуйста, что нужно сделать дальше.")
+    return "Извините, произошёл технический сбой. Я на линии."
 
 
 async def persist_partial_draft(database: Database, turn_id: UUID, claim_epoch: int,
