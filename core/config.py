@@ -113,6 +113,7 @@ class Settings(BaseSettings):
     )
     voice_worker_lease_seconds: int = Field(default=30, ge=5, le=300)
     voice_worker_poll_seconds: float = Field(default=0.1, ge=0.05, le=10, allow_inf_nan=False)
+    voice_worker_concurrency: int = Field(default=1, ge=1, le=64)
     voice_worker_health_port: int = Field(default=8003, ge=1, le=65535)
     voice_call_lease_seconds: int = Field(default=15, ge=5, le=60)
     # Both constructor spellings use one source key, so explicit values outrank env/dotenv.
