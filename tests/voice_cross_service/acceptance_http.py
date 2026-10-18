@@ -57,10 +57,11 @@ async def feed(writer, amplitude, milliseconds):
         await writer.drain()
 
 
-@pytest.mark.parametrize("barge_in", [False, True])
+@pytest.mark.parametrize("scenario", ["complete", "barge_in", "failed_turn"])
 async def test_audio_through_http_conversation_and_managed_boundary(
-    vh, network_allowlist, barge_in,
+    vh, network_allowlist, scenario,
 ):
+    barge_in = scenario == "barge_in"
     source = os.environ.get("VOICE_CANDIDATE_ROOT")
     if not source or not (Path(source) / "voice_gateway/conversation_http.py").is_file():
         pytest.fail("VOICE_CANDIDATE_ROOT must select the reviewed Voice candidate")
@@ -80,6 +81,7 @@ async def test_audio_through_http_conversation_and_managed_boundary(
         value = ManagedTurnRequest.model_validate(await request.json())
         assert value.channel.value == "VOICE" and value.agent_id == AGENT
         managed_requests.append(value)
+        failed = scenario == "failed_turn" and len(managed_requests) == 1
         return ManagedTurnResult(
             contract_version=value.contract_version, conversation_id=value.conversation_id,
             turn_id=value.turn_id, agent_id=value.agent_id, input_revision=value.input_revision,
@@ -87,7 +89,9 @@ async def test_audio_through_http_conversation_and_managed_boundary(
             input_first_sequence=value.input_first_sequence,
             input_last_sequence=value.input_last_sequence,
             context_last_sequence=value.context_last_sequence,
-            status="DRAFT_READY", draft_text="Локальный ответ", error_code=None, operation_refs=[],
+            status="UNKNOWN" if failed else "DRAFT_READY",
+            draft_text=None if failed else "Локальный ответ",
+            error_code="TOOL_EXECUTION_UNKNOWN" if failed else None, operation_refs=[],
         )
 
     ai_socket, conversation_socket = listener(network_allowlist), listener(network_allowlist)
@@ -110,7 +114,9 @@ async def test_audio_through_http_conversation_and_managed_boundary(
 
         class ToneTTS(BaseTTS):
             async def synthesize(self, text):
-                assert text == "Локальный ответ"
+                assert text == "Локальный ответ" or (
+                    scenario == "failed_turn" and "Я на линии" in text
+                )
                 return struct.pack("<h", 1000) * (16000 if barge_in else 800)
 
             async def close(self):
@@ -153,6 +159,18 @@ async def test_audio_through_http_conversation_and_managed_boundary(
         assert managed_requests and fact.accepted_bytes > 0
         if barge_in:
             assert fact.accepted_bytes < fact.generated_bytes
+        if scenario == "failed_turn":
+            # The actual HTTP adapter and AudioSocket remain usable after the
+            # failed turn's authorized fallback, without re-executing that turn.
+            async with database.session_factory() as session:
+                active = await session.get(VoiceCall, call_id)
+                assert active is not None and active.ended_at is None
+            await feed(writer, 1500, 300)
+            await feed(writer, 0, 1000)
+            async with asyncio.timeout(8):
+                while len(managed_requests) < 2:
+                    await asyncio.sleep(0.02)
+            assert managed_requests[0].turn_id != managed_requests[1].turn_id
         writer.close()
         await writer.wait_closed()
         async with asyncio.timeout(5):

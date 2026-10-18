@@ -333,6 +333,15 @@ def remaining_speech(source: str | None, spoken: str) -> str | None:
     return None if spoken else source
 
 
+def failure_speech(turn: AgentTurn) -> str:
+    """Communication fallback only; never reinterpret retained business effects."""
+    if turn.failure_code == "EXECUTION_UNKNOWN":
+        return ("Пока не удалось подтвердить результат. "
+                "Повторять действие без проверки не буду. Я на линии.")
+    return ("Не удалось завершить запрос. Я на линии. "
+            "Уточните, пожалуйста, что нужно сделать дальше.")
+
+
 async def persist_partial_draft(database: Database, turn_id: UUID, claim_epoch: int,
                                 text: str) -> None:
     """Short independent write; never holds a claim lock across managed HTTP.
@@ -372,15 +381,24 @@ async def next_response(database: Database, principal: Principal, request: CallI
             return ResponseCandidate(**request.model_dump(), turn_id=None)
         candidates = (await session.scalars(select(AgentTurn).where(
             AgentTurn.conversation_id == conversation.id,
+            # Match begin's immutable ownership proof before applying the limit.
+            # Generic turns cannot be authorized and must not block this queue.
+            AgentTurn.managed_projection_agent_id == call.agent_id,
+            exists(select(VoiceInput.message_id).join(
+                TurnInputMessage, TurnInputMessage.message_id == VoiceInput.message_id,
+            ).where(TurnInputMessage.turn_id == AgentTurn.id, VoiceInput.call_id == call.id)),
             or_(
                 and_(
                     AgentTurn.status == "CLAIMED",
                     AgentTurn.partial_draft_text.is_not(None),
                 ),
                 and_(
-                    AgentTurn.status == "COMPLETED",
-                    AgentTurn.outcome == "DRAFT_READY",
-                    AgentTurn.draft_text.is_not(None),
+                    or_(
+                        and_(AgentTurn.status == "COMPLETED",
+                             AgentTurn.outcome == "DRAFT_READY",
+                             AgentTurn.draft_text.is_not(None)),
+                        AgentTurn.status == "FAILED",
+                    ),
                     ~exists(select(VoiceResponse.id).where(
                         VoiceResponse.turn_id == AgentTurn.id,
                         VoiceResponse.is_partial.is_(False),
@@ -396,7 +414,7 @@ async def next_response(database: Database, principal: Principal, request: CallI
                     turn_id = turn.id
                     break
                 continue
-            # COMPLETED without a final lease: authorize remainder or seal history.
+            # Terminal turn without a final lease: authorize response or seal history.
             turn_id = turn.id
             break
         return ResponseCandidate(**request.model_dump(), turn_id=turn_id)
@@ -472,6 +490,15 @@ async def begin(database: Database, principal: Principal, request: ResponseBegin
             is_partial = True
         elif turn.status == "COMPLETED" and turn.outcome == "DRAFT_READY" and turn.draft_text:
             text = remaining_speech(turn.draft_text, spoken)
+        elif turn.status == "FAILED":
+            # An accepted asynchronous turn can fail after next_response selected
+            # a partial. Deliver an authorized correction instead of a 409 that
+            # kills the media session. The failed turn and refs stay immutable.
+            text = failure_speech(turn)
+        elif turn.status == "COMPLETED" and turn.outcome == "NO_RESPONSE":
+            # A partial candidate can finish without an answer between next/begin.
+            # Seal a non-sending final lease; this is not a boundary failure.
+            text = None
         else:
             raise DomainError(ErrorCode.NO_DRAFT)
         # Validate retained Voice input ownership even when the call is no longer live.
@@ -580,13 +607,16 @@ async def playback(database: Database, principal: Principal, request: Playback,
         response.terminal = request.terminal
         if request.state == "COMPLETED" and not response.is_partial:
             turn = await session.get(AgentTurn, response.turn_id)
-            assert turn is not None and turn.draft_text is not None
+            assert turn is not None
+            history_text = (response.authorized_text if turn.status == "FAILED"
+                            else turn.draft_text)
+            assert history_text is not None
             conversation.last_message_sequence += 1
             conversation.updated_at = clock
             session.add(Message(
                 id=uuid4(), conversation_id=conversation.id,
                 sequence=conversation.last_message_sequence, actor="AGENT", direction="OUTBOUND",
-                content_type="TEXT", text=turn.draft_text, source_agent_turn_id=turn.id,
+                content_type="TEXT", text=history_text, source_agent_turn_id=turn.id,
                 created_at=clock,
             ))
         await session.flush()
