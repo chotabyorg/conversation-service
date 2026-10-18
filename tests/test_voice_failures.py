@@ -68,6 +68,8 @@ async def test_failure_is_spoken_once_without_rewriting_turn_or_ending_call(
     assert "Проверяю данные" not in permission["text"]
     if status == "UNKNOWN":
         assert "без проверки не буду" in permission["text"]
+    else:
+        assert permission["text"] == "Извините, произошёл технический сбой. Я на линии."
     assert not (await begin(vh, turn_id))["send"]
     for _ in range(2):
         assert (await fact(vh, permission)).status_code == 200
