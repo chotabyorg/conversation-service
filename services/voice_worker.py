@@ -44,16 +44,17 @@ class VoiceWorker:
         except TimeoutError:
             pass
 
-    async def run_once(self) -> bool:
+    async def _claim(self) -> tuple[UUID, TurnExecute] | None:
+        """Select and claim serially; PostgreSQL remains the fencing authority."""
         if (self.stop_requested.is_set() or not self.settings.voice_worker_enabled
                 or self.principal is None):
             self.last_poll = time.monotonic()
-            return False
+            return None
         await voice.expire_calls(self.database, self.principal)
         turn_id = await voice.select_turn(self.database, self.principal, self.settings)
         self.last_poll = time.monotonic()
         if turn_id is None or self.stop_requested.is_set():
-            return False
+            return None
         try:
             claim = await turns.claim_turn(self.database, self.principal, turn_id, TurnClaim(
                 worker_ref=self.principal.principal_id,
@@ -61,10 +62,22 @@ class VoiceWorker:
             ))
         except DomainError as exc:
             if exc.code in {ErrorCode.LEASE_HELD, ErrorCode.TURN_TERMINAL}:
-                return False
+                return None
             raise
         proof = TurnExecute(claim_epoch=claim.turn.claim_epoch,
                             claim_token=SecretStr(claim.claim_token))
+        return turn_id, proof
+
+    async def run_once(self) -> bool:
+        """Retain the one-turn entry point used by controlled callers/tests."""
+        claimed = await self._claim()
+        if claimed is None:
+            return False
+        await self._run_owned(*claimed)
+        return True
+
+    async def _run_owned(self, turn_id: UUID, proof: TurnExecute) -> None:
+        """Own execution and renewal until completion or bounded cancellation."""
         execution = asyncio.create_task(self.execute(turn_id, proof),
                                         name="voice-turn-execution")
         renewal = asyncio.create_task(self.renew(turn_id, proof, execution),
@@ -77,7 +90,6 @@ class VoiceWorker:
             if not execution.done():
                 execution.cancel()
             await asyncio.gather(execution, return_exceptions=True)
-        return True
 
     async def execute(self, turn_id: UUID, proof: TurnExecute) -> None:
         assert self.principal is not None
@@ -119,17 +131,50 @@ class VoiceWorker:
                 return
 
     async def run(self) -> None:
+        """Bound independent executions while retaining serialized admission.
+
+        Stop closes admission first, then drains every acquired claim with its
+        renewal. The existing lifecycle owner bounds the total drain deadline.
+        No semaphore task is created for work that has not been claimed.
+        """
         self.running = True
+        active: set[asyncio.Task[None]] = set()
+        stopped = asyncio.create_task(self.stop_requested.wait(), name="voice-worker-stop")
+
+        def reap(completed: set[asyncio.Task[None]]) -> None:
+            for task in completed:
+                active.discard(task)
+                try:
+                    task.result()
+                except (Exception, asyncio.CancelledError):
+                    logger.warning("", extra={"stage": "turn", "code": "SERVICE_UNAVAILABLE"})
+
         try:
             while not self.stop_requested.is_set():
-                try:
-                    worked = await self.run_once()
-                except Exception:
-                    logger.warning("", extra={"stage": "turn", "code": "SERVICE_UNAVAILABLE"})
-                    worked = False
-                if not worked:
-                    await self.wait_for_poll()
+                reap({task for task in active if task.done()})
+                if len(active) < self.settings.voice_worker_concurrency:
+                    try:
+                        claimed = await self._claim()
+                    except Exception:
+                        logger.warning("", extra={"stage": "turn", "code": "SERVICE_UNAVAILABLE"})
+                        claimed = None
+                    if claimed is not None:
+                        # A claim already committing when stop was requested is
+                        # owned work, even though admission is now closed.
+                        active.add(asyncio.create_task(
+                            self._run_owned(*claimed), name="voice-owned-turn"))
+                        continue
+                await asyncio.wait(active | {stopped},
+                                   timeout=self.settings.voice_worker_poll_seconds,
+                                   return_when=asyncio.FIRST_COMPLETED)
+            if active:
+                await asyncio.gather(*active, return_exceptions=True)
+                reap(set(active))
         finally:
+            stopped.cancel()
+            for task in active:
+                task.cancel()
+            await asyncio.gather(stopped, *active, return_exceptions=True)
             self.running = False
 
     async def ready(self) -> bool:

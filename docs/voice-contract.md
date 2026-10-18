@@ -26,6 +26,16 @@ Both the cohort and Voice worker are disabled by default. Configuration registri
 follow the existing private bootstrap model; automated provisioning must come from
 the platform rather than a separate gateway customer/number registry.
 
+`VOICE_WORKER_CONCURRENCY` bounds managed executions across independent calls in
+one worker process (default 1, range 1–64). Selection and claiming use one dispatcher;
+each acquired turn owns its execution and lease-renewal tasks. PostgreSQL retains
+the one-active-turn constraint, per-Conversation order and claim fencing, including
+when multiple worker processes contend. No task is queued ahead of a claim.
+Shutdown closes admission, drains all acquired turns with lease renewal, then uses
+the existing shared shutdown deadline. Dispatched uncertain work is never retried
+as a new model execution. An increased setting requires measured database, AI and
+provider capacity; this does not increase the gateway or SIP admission limits.
+
 ## Private API
 
 All paths below are POST under `/internal/v1/voice`, require exactly one
