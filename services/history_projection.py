@@ -9,6 +9,7 @@ from models import AgentTurn, Conversation, Message
 from schemas.contracts import Channel, ErrorCode
 from schemas.managed import (
     MAX_MESSAGES,
+    DEFAULT_MAX_PARTIAL_CHARS,
     ManagedMessage,
     ManagedTurnRequest,
     PreparedManagedRequest,
@@ -37,6 +38,7 @@ def projected_request(turn: AgentTurn, conversation: Conversation, agent_id: UUI
         selected_input_message_ids=tuple(m.id for m in messages
             if turn.input_first_sequence <= m.sequence <= turn.input_last_sequence),
         stream_partials=stream_partials_for(channel, turn.managed_contract_version),
+        max_partial_chars=DEFAULT_MAX_PARTIAL_CHARS,
     ))
 
 

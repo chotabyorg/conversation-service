@@ -519,7 +519,13 @@ async def cross(
                         "agent_owner_id": ids[f"owner_{name}"],
                     }
                     for name in ["a", "b"]
-                ],
+                ] + [{
+                    "owner_id": grants["a"]["owner_id"],
+                    "integration_id": ids["integration_a"],
+                    "channel": "WEBSITE_WIDGET",
+                    "agent_id": ids["agent_a"],
+                    "agent_owner_id": ids["owner_a"],
+                }],
             }
         ]
         harness.cs_env = clean_env()
@@ -527,9 +533,23 @@ async def cross(
             DATABASE_URL=database_url,
             LOG_LEVEL="WARNING",
             GOAL2_BOOTSTRAP_CONFIG=str(tmp_path / "cs-config.json"),
+            WEBSITE_BINDINGS=json.dumps([{
+                "owner_id": grants["a"]["owner_id"],
+                "integration_id": ids["integration_a"],
+                "agent_id": ids["agent_a"],
+            }]),
             CONVERSATION_AUTH_PRINCIPALS=json.dumps(
                 [
-                    {"principal_id": name, "token": tokens[name], "grants": [grants[name]]}
+                    {
+                        "principal_id": name,
+                        "token": tokens[name],
+                        "grants": [grants[name]] + ([{
+                            "owner_id": grants[name]["owner_id"],
+                            "integration_id": ids["integration_a"],
+                            "channel": "WEBSITE_WIDGET",
+                            "provider_namespace": "main-chota.website-widget.v1",
+                        }] if name == "a" else []),
+                    }
                     for name in ["a", "b"]
                 ]
             ),
@@ -548,7 +568,13 @@ async def cross(
                         "service_token": tokens["managed"],
                     }
                     for name in ["a", "b"]
-                ]
+                ] + [{
+                    "owner_id": grants["a"]["owner_id"],
+                    "integration_id": ids["integration_a"],
+                    "channel": "WEBSITE_WIDGET",
+                    "agent_id": ids["agent_a"],
+                    "service_token": tokens["managed"],
+                }]
             ),
         )
         url = make_url(ai_url)

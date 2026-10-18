@@ -1,4 +1,6 @@
 """Real-PG frozen windows, physical evidence, provenance and concurrency."""
+import hashlib
+import json
 from dataclasses import replace
 from uuid import UUID, uuid4
 
@@ -19,7 +21,7 @@ from schemas.contracts import ErrorCode, TurnClaim, TurnComplete, TurnCreate, Tu
 from schemas.managed import MAX_REQUEST_BYTES, ManagedTurnRequest, prepare_request
 from services import managed_execution, turns
 from services.common import fingerprint
-from services.history_projection import freeze_website_projection, projected_request
+from services.history_projection import canonical_window, freeze_website_projection, projected_request
 from services.website_worker import WebsiteWorker, select_immediate
 from tests.conftest import locked_race
 from tests.test_database import violation
@@ -336,6 +338,67 @@ async def test_predispatch_snapshot_and_final_fence_detect_changed_canonical_row
     assert not wh.ai.calls
     async with sql.connect() as conn:
         assert await conn.scalar(select(AgentTurn.managed_dispatch_epoch)) is None
+
+
+async def test_historical_website_projection_replays_exact_pre_stream_body_and_marks_same_hash(
+    wh, sql, monkeypatch
+):
+    """A retained pre-stream v2 digest selects its old body through both fences."""
+    import services.website_worker as website_worker_module
+
+    original_freeze = website_worker_module.freeze_website_projection
+    historical_hashes = []
+
+    async def freeze_pre_stream(session, conversation, turn, agent_id):
+        await original_freeze(session, conversation, turn, agent_id)
+        messages = await canonical_window(
+            session, conversation.id, turn.managed_context_first_sequence,
+            turn.context_last_sequence,
+        )
+        current = projected_request(turn, conversation, agent_id, messages)
+        fields = current.request.model_dump(mode="json")
+        fields.pop("stream_partials")
+        fields.pop("max_partial_chars")
+        identity = json.dumps(
+            {"execution_namespace": "main-chota.conversation.v1", "request": fields},
+            sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False,
+        ).encode("utf-8")
+        turn.managed_projection_fingerprint = hashlib.sha256(identity).hexdigest()
+        historical_hashes.append(turn.managed_projection_fingerprint)
+
+    monkeypatch.setattr(website_worker_module, "freeze_website_projection", freeze_pre_stream)
+    await admit(wh, payload(wh))
+    selected = await select_immediate(wh.database, wh.principal, wh.settings)
+    assert selected is not None and len(historical_hashes) == 1
+
+    claim = await turns.claim_turn(
+        wh.database, wh.principal, selected, TurnClaim(worker_ref="history-replay", lease_seconds=30)
+    )
+    proof = TurnExecute(claim_epoch=claim.turn.claim_epoch,
+                        claim_token=SecretStr(claim.claim_token))
+    snapshot = await managed_execution.take_snapshot(
+        wh.database, wh.principal, selected, proof, wh.settings
+    )
+    prepared = managed_execution.prepare_snapshot(snapshot)
+    assert prepared.fingerprint == historical_hashes[0]
+    assert "stream_partials" not in json.loads(prepared.body)
+    assert "max_partial_chars" not in json.loads(prepared.body)
+    assert prepared.request.stream_partials is False
+
+    # execute_claimed_turn performs the second locked projection fence before
+    # sending the request to the fake local AI port.
+    await managed_execution.execute_claimed_turn(
+        wh.database, wh.principal, selected, proof, wh.settings, wh.ai
+    )
+    assert len(wh.ai.calls) == 1
+    sent = wh.ai.calls[0]
+    assert sent.fingerprint == historical_hashes[0]
+    assert sent.body == prepared.body
+    async with sql.connect() as conn:
+        projection, dispatch = (await conn.execute(text(
+            "SELECT managed_projection_fingerprint,managed_request_fingerprint "
+            "FROM agent_turns WHERE id=:id"), {"id": selected})).one()
+    assert projection == dispatch == sent.fingerprint
 
 
 async def test_binding_agent_cannot_override_immutable_website_admission(wh):
