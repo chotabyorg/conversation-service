@@ -187,6 +187,54 @@ async def test_A_simple_same_turn_draft_and_terminal_replay(cross):
     cross.safe_logs(SENTINEL)
 
 
+async def test_current_website_v2_profile_crosses_real_cs_ai_http_and_replays(cross):
+    from schemas.managed import ManagedTurnRequest, prepare_request
+
+    cross.model.queue(completion("Current Website profile draft"))
+    turn, historical_digest = await _create_website_turn(cross)
+    assert historical_digest is None
+    claim = await cross.claim(turn)
+
+    response = await cross.execute(claim)
+    result = draft(response, "Current Website profile draft")
+    observations = cross.observations()
+    assert observations["managed_http_requests"] == 1
+    assert len(observations["managed_projections"]) == 1
+
+    projection = observations["managed_projections"][0]
+    assert projection["channel"] == "WEBSITE_WIDGET"
+    assert projection["contract_version"] == 2
+    assert projection["stream_partials"] is False
+    assert projection["max_partial_chars"] == 2000
+    assert {"stream_partials", "max_partial_chars"} <= set(
+        observations["managed_projection_fields_set"][0]
+    )
+
+    prepared = prepare_request(ManagedTurnRequest.model_validate(projection))
+    expected_body_hash = hashlib.sha256(prepared.body).hexdigest()
+    async with cross.sql.connect() as connection:
+        retained_hash = await connection.scalar(text(
+            "SELECT managed_projection_fingerprint FROM agent_turns WHERE id=:id"
+        ), {"id": claim["turn"]["id"]})
+        contract_version = await connection.scalar(text(
+            "SELECT managed_contract_version FROM agent_turns WHERE id=:id"
+        ), {"id": claim["turn"]["id"]})
+    assert contract_version == 2
+    assert retained_hash == prepared.fingerprint
+    assert retained_hash == result["managed_request_fingerprint"]
+    assert observations["managed_request_body_sha256"] == [expected_body_hash]
+    assert observations["managed_request_canonical_sha256"] == [expected_body_hash]
+    assert observations["managed_request_body_sizes"] == [{
+        "raw": len(prepared.body), "canonical": len(prepared.body),
+    }]
+    assert cross.model.calls[0].get("stream", False) is False
+
+    replay = await cross.execute(claim)
+    assert replay.json() == {"turn": result, "replayed": True}
+    assert cross.observations()["managed_http_requests"] == 1
+    assert len(cross.model.calls) == 1
+
+
 async def test_historical_pre_stream_projection_crosses_real_cs_ai_http_after_restart(cross):
     cross.model.queue(completion("Legacy-profile draft"))
     turn, legacy_fingerprint = await _create_website_turn(cross, pre_stream_profile=True)
