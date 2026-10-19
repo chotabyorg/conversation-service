@@ -80,6 +80,8 @@ async def test_audio_through_http_conversation_and_managed_boundary(
         assert request.headers["X-Service-Token"] == ai_token
         value = ManagedTurnRequest.model_validate(await request.json())
         assert value.channel.value == "VOICE" and value.agent_id == AGENT
+        assert value.contract_version == 2
+        assert value.stream_partials is True and value.max_partial_chars == 2000
         managed_requests.append(value)
         failed = scenario == "failed_turn" and len(managed_requests) == 1
         return ManagedTurnResult(

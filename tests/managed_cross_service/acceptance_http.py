@@ -8,7 +8,7 @@ from uuid import uuid4
 import pytest
 from sqlalchemy import text
 
-from schemas.managed import ManagedTurnRequest
+from schemas.managed import EXECUTION_NAMESPACE
 from tests.managed_cross_service.conftest import unknown
 from tests.managed_cross_service.fake_http import call, completion, descriptor
 
@@ -29,66 +29,7 @@ async def assert_separated(cross, conversation_id, before):
     assert cross.observations().get("managed_forbidden_store", 0) == 0
 
 
-async def _install_pre_stream_projection(cross, turn_id):
-    """Restore one immutable historical digest in this disposable HTTP fixture."""
-    async with cross.sql.connect() as connection:
-        turn = (await connection.execute(
-            text("SELECT * FROM agent_turns WHERE id=:id"), {"id": turn_id}
-        )).mappings().one()
-        conversation = (await connection.execute(
-            text("SELECT * FROM conversations WHERE id=:id"), {"id": turn["conversation_id"]}
-        )).mappings().one()
-        rows = (await connection.execute(text(
-            "SELECT id,sequence,actor,direction,content_type,text FROM messages "
-            "WHERE conversation_id=:id AND sequence BETWEEN :first AND :last ORDER BY sequence"
-        ), {"id": turn["conversation_id"], "first": turn["managed_context_first_sequence"],
-            "last": turn["context_last_sequence"]})).mappings().all()
-    assert turn["managed_contract_version"] == 2
-    request = ManagedTurnRequest.model_validate({
-        "contract_version": turn["managed_contract_version"],
-        "conversation_id": str(turn["conversation_id"]),
-        "turn_id": str(turn["id"]),
-        "owner_id": conversation["owner_id"],
-        "integration_id": str(conversation["integration_id"]),
-        "agent_id": str(turn["managed_projection_agent_id"]),
-        "channel": conversation["channel"],
-        "input_revision": turn["input_revision"],
-        "authority_revision": turn["authority_revision"],
-        "input_first_sequence": turn["input_first_sequence"],
-        "input_last_sequence": turn["input_last_sequence"],
-        "context_last_sequence": turn["context_last_sequence"],
-        "messages": [{**dict(row), "id": str(row["id"])} for row in rows],
-        "selected_input_message_ids": [str(row["id"]) for row in rows
-            if turn["input_first_sequence"] <= row["sequence"] <= turn["input_last_sequence"]],
-        "stream_partials": False,
-        "max_partial_chars": 2000,
-    })
-    old_wire_fields = request.model_dump(
-        mode="json", exclude={"stream_partials", "max_partial_chars"}
-    )
-    identity = json.dumps(
-        {"execution_namespace": "main-chota.conversation.v1", "request": old_wire_fields},
-        sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False,
-    ).encode("utf-8")
-    digest = hashlib.sha256(identity).hexdigest()
-    # The table trigger normally protects this immutable snapshot. This test
-    # models an old stored profile only in its task-owned disposable database.
-    async with cross.sql.begin() as connection:
-        await connection.execute(text(
-            "ALTER TABLE agent_turns DISABLE TRIGGER preserve_website_projection"
-        ))
-        try:
-            await connection.execute(text(
-                "UPDATE agent_turns SET managed_projection_fingerprint=:digest WHERE id=:id"
-            ), {"digest": digest, "id": turn_id})
-        finally:
-            await connection.execute(text(
-                "ALTER TABLE agent_turns ENABLE TRIGGER preserve_website_projection"
-            ))
-    return digest
-
-
-async def _create_website_turn(cross):
+async def _create_website_turn(cross, *, pre_stream_profile=False):
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
     from models import (
@@ -99,6 +40,7 @@ async def _create_website_turn(cross):
         WebsiteAdmission,
         WebsiteImmediateTurn,
     )
+    from schemas.managed import ManagedMessage, ManagedTurnRequest
     from services.common import db_clock, fingerprint
     from services.history_projection import freeze_website_projection
 
@@ -147,6 +89,37 @@ async def _create_website_turn(cross):
             status="PENDING", claim_epoch=0, operation_refs=[], created_at=clock,
         )
         await freeze_website_projection(session, conversation, turn, admission.agent_id)
+        historical_digest = None
+        if pre_stream_profile:
+            legacy_request = ManagedTurnRequest(
+                contract_version=turn.managed_contract_version,
+                conversation_id=conversation.id,
+                turn_id=turn.id,
+                owner_id=conversation.owner_id,
+                integration_id=conversation.integration_id,
+                agent_id=admission.agent_id,
+                channel=conversation.channel,
+                input_revision=turn.input_revision,
+                authority_revision=turn.authority_revision,
+                input_first_sequence=turn.input_first_sequence,
+                input_last_sequence=turn.input_last_sequence,
+                context_last_sequence=turn.context_last_sequence,
+                messages=(ManagedMessage.model_validate(message),),
+                selected_input_message_ids=(message.id,),
+                stream_partials=False,
+                max_partial_chars=2000,
+            )
+            fields = legacy_request.model_dump(mode="json")
+            fields.pop("stream_partials")
+            fields.pop("max_partial_chars")
+            identity = json.dumps(
+                {"execution_namespace": EXECUTION_NAMESPACE, "request": fields},
+                sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False,
+            ).encode("utf-8")
+            historical_digest = hashlib.sha256(identity).hexdigest()
+            # Seed the old immutable hash before the insert; no trigger or
+            # persisted snapshot is changed after creation.
+            turn.managed_projection_fingerprint = historical_digest
         session.add(turn)
         await session.flush()
         session.add(WebsiteImmediateTurn(
@@ -159,7 +132,7 @@ async def _create_website_turn(cross):
         turn_id = str(turn.id)
     read_response = await cross.request("GET", f"/turns/{turn_id}")
     assert read_response.status_code == 200
-    return read_response.json()
+    return read_response.json(), historical_digest
 
 
 async def test_A_simple_same_turn_draft_and_terminal_replay(cross):
@@ -183,7 +156,12 @@ async def test_A_simple_same_turn_draft_and_terminal_replay(cross):
     assert turn["draft_text"] == "Готово" and turn["operation_refs"] == []
     assert turn["managed_agent_id"] == cross.ids["agent_a"]
     assert turn["managed_dispatch_epoch"] == 1
-    projection = cross.observations()["managed_projections"][0]
+    observations = cross.observations()
+    projection = observations["managed_projections"][0]
+    projection_fields = observations["managed_projection_fields_set"][0]
+    assert "stream_partials" in projection_fields and "max_partial_chars" in projection_fields
+    assert projection["stream_partials"] is False
+    assert projection["max_partial_chars"] == 2000
     for key in [
         "conversation_id",
         "input_revision",
@@ -211,10 +189,8 @@ async def test_A_simple_same_turn_draft_and_terminal_replay(cross):
 
 async def test_historical_pre_stream_projection_crosses_real_cs_ai_http_after_restart(cross):
     cross.model.queue(completion("Legacy-profile draft"))
-    turn = await _create_website_turn(cross)
+    turn, legacy_fingerprint = await _create_website_turn(cross, pre_stream_profile=True)
     claim = await cross.claim(turn)
-    turn_id = claim["turn"]["id"]
-    legacy_fingerprint = await _install_pre_stream_projection(cross, turn_id)
 
     # A fresh Conversation worker restores the persisted profile. It must send
     # the exact pre-stream JSON body and the real AI process must parse both
@@ -663,7 +639,6 @@ async def test_G_abrupt_conversation_process_restart_recovers_retained_marker(cr
 
 
 async def test_G_R1_application_error_result_lost_at_real_pg_commit_wait(cross):
-    from sqlalchemy import text
 
     from tests.conftest import observed_waiters
 

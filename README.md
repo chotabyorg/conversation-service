@@ -26,10 +26,13 @@ Goal4B adds a channel-isolated Telegram admission and immediate worker described
 [Telegram canary](docs/telegram-canary.md); its cohort defaults empty.
 
 Managed request fingerprints resolve retained hashes by exact wire profile:
-pre-stream, explicit `false/2000`, or Voice-v2-only `true/2000`. AI should be
-updated first so both shapes are accepted during rollout; Conversation then
-writes the extension values explicitly. The [history projection contract](docs/history-projection.md)
-describes the locked checks. Existing rows need no migration or rewrite.
+pre-stream, explicit `false/2000`, or Voice-v2-only `true/2000`. Current
+Conversation already writes the explicit text and Voice-v2 profiles. Update the
+AI reader first so it accepts both current bodies and historical omitted fields;
+then this Conversation reader can restore historical bodies from their stored
+hashes. New freezes keep the same serialized bytes. The [history projection
+contract](docs/history-projection.md) describes the locked checks. Existing rows
+need no migration or rewrite.
 
 **Source implementation; production rollout requires separate evidence.** There
 is no public KrakenD route or provider webhook. The manual publisher builds only

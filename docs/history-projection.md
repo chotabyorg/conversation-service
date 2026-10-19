@@ -69,8 +69,11 @@ projection fingerprint, and reject no-match or inconsistent projection/dispatch
 hashes before marking or HTTP. The selected request object's runtime stream value
 matches its serialized body. New freezes write the extension values explicitly.
 This exact-hash compatibility needs no migration, timestamp choice or data rewrite.
-For a cross-service rollout, update AI first, then Conversation; the AI reader
-accepts both historical and explicit wire shapes during that interval.
+Current Conversation already writes the explicit text and Voice-v2 wire profiles.
+For a cross-service rollout, update the AI reader first so it accepts both those
+current profiles and historical omitted fields. Then update the Conversation
+reader to restore omitted historical bodies; new freezes remain byte-for-byte the
+same.
 
 Response cap remains262144 bytes. AI owns model context budgeting after this
 communication projection. Changed settings, new admissions and late delivery
