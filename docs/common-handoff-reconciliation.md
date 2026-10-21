@@ -13,6 +13,7 @@ authorize merging that old head unchanged.
 | AI | `f570d1e3c6e23075b899379e0e23895df512947f` | #59 `4f535432ad023f1675d81195c62a7d7bd33c5c13` |
 | Control Plane | `e477f04bd5e8d72d60e6f0250f3830b44b4ca44b` | #25 `d684db9e7bbd9b3425fa1ad6d4bb65710b38a7bb` |
 | Telegram gateway | `a94256b1ce71b21e5337ca3fa98a6e0dc64d83ce` | #16 `f0d21f318f58cc29515d85036a7c46fb445503be` |
+| Website gateway | `df3b2002bb3c7e48d111098fe7db1b60257850fe` | current managed HTTP response path |
 | Chota site | `9db8a21e8231a9df2a907649515ba0b180b85b32` | #69 `787b547a040c2885c7b96beb5b56baf695bb4acb` |
 | API gateway | `145efad491d02b6a0932e2210cc806be582fa539` | #42 `def39a00414fffc497e642117a3583ddb9c2e286` |
 
@@ -91,6 +92,15 @@ Generic FULL delivery/control routes must not bypass enrolled channel checks or
 make a case disagree with Conversation authority. Existing exact outcomes and
 original late evidence must remain replayable after authority/identity changes.
 Retain additive receipts rather than mutating earlier observed evidence.
+
+Website currently returns a reply inside a customer's outstanding HTTP request;
+that alone cannot deliver a later owner reply to an idle browser. Add an explicit
+bounded poll or stream transport for the same canonical session and outbound
+intent journal, with stable message/attempt IDs and browser deduplication. Verify
+the existing trusted session-delivery authorization before exposing any history;
+a public widget key plus an arbitrary client-supplied session ID must not grant
+access to another session. Reconcile this narrow transport requirement with the
+separately owned security work; it does not authorize a platform auth redesign.
 
 ## Grants and transaction order
 
