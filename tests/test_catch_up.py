@@ -348,10 +348,10 @@ async def test_return_requires_fresh_input_and_separates_original_authority_burs
     async with h["database"].session_factory() as session:
         conversation = await session.scalar(select(Conversation))
     await authority.transition_control(h["database"], principal(h), conversation.id,
-        ControlTransition(control_mode="HUMAN", expected_authority_revision=0))
+        ControlTransition(control_mode="HUMAN", expected_authority_revision=0), settings)
     await add(h, sql, 1, close=False)
     await authority.transition_control(h["database"], principal(h), conversation.id,
-        ControlTransition(control_mode="AGENT", expected_authority_revision=1))
+        ControlTransition(control_mode="AGENT", expected_authority_revision=1), settings)
     worker = TelegramWorker(h["database"], settings, DeterministicManagedPort())
     assert await worker.run_once() is False
     await add(h, sql, 2)
