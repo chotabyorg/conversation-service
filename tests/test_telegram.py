@@ -159,7 +159,7 @@ async def test_revocation_keeps_acquired_v1_completion_and_no_send_recovery(
                              source_agent_lifecycle_generation=1,
                              target_agent_lifecycle_generation=2))
     await inbox_lifecycle.revoke_grant(h["database"], settings, request)
-    work = await h["client"].post("/internal/v1/telegram/delivery-work",
+    work = await h["client"].post("/internal/v1/telegram/responses/work",
         json={"owner_id": OWNER, "integration_id": str(INTEGRATION),
               "agent_id": str(AGENT), "bot_id": 999}, headers=h["gateway_headers"])
     assert work.status_code == 200
