@@ -146,6 +146,10 @@ class Conversation(Base):
         UniqueConstraint(
             "id", "owner_id", "integration_id", "channel", name="uq_conversation_id_scope"
         ),
+        UniqueConstraint(
+            "id", "owner_id", "integration_id", "channel", "provider_thread_id",
+            name="uq_conversation_transport_identity",
+        ),
         CheckConstraint(OWNER_BOUNDS, name="ck_conversation_owner_bounds"),
         CheckConstraint(CHANNELS, name="ck_conversation_channel"),
         CheckConstraint(
