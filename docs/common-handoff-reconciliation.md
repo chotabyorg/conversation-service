@@ -58,6 +58,9 @@ The lifecycle is:
    of the same outbound journal; it is not a third authority mode or a separate
    Handoff lifecycle. Queued HUMAN text is not proof that the customer received it.
 4. Claim and send commands use stable UUIDs plus authority/case/assignment CAS.
+   Bind each command UUID to an immutable fingerprint of its original request.
+   Reusing it with different text, action or revisions returns a deterministic
+   command-conflict error, never the old receipt as if it matched the new request.
    Exact replay returns the original immutable receipt before new eligibility.
    Canonical HUMAN text and its outbound intent commit together exactly once.
 5. The channel adapter acquires the intent through the common Conversation send
@@ -89,6 +92,35 @@ original task's positive join/end evidence, or another explicitly designed
 authoritative adapter mechanism, releases that writer barrier. Permanent writer
 loss must have an operationally reviewable recovery path before production;
 silently aging it out is not that path.
+
+The required recovery is a retirement command in this same outbound journal.
+A dedicated trusted adapter supervisor must first fence the exact supplier and
+process incarnation against further sends and positively establish that all of
+its provider tasks have ended (or the old process has terminated). A replacement
+poller, an owner click, a lease timeout or a missing heartbeat is not that proof.
+The command carries the exact scope, original attempt/supplier/incarnation IDs,
+an immutable proof reference, command UUID and request fingerprint. Its separate
+internal credential is scoped to retirement evidence; it grants neither HUMAN
+authority nor a provider send permit.
+
+Conversation locks the scope/root and original attempt, validates that evidence
+against the supervisor, records an idempotent retirement receipt and changes only
+that writer from LIVE to RETIRED. The provider outcome remains UNKNOWN unless
+original provider evidence already proves otherwise. Retained late evidence may
+reconcile that original attempt, but cannot reopen its writer or trigger a resend.
+The supervisor proof call runs outside database transactions; the final commit
+rechecks the exact incarnation and journal revision. Conflicting command reuse or
+stale/wrong-scope proof fails closed. This is an extension of writer evidence,
+not another Handoff authority or operation ledger.
+
+Before enrollment, implement and prove this adapter-supervisor port with process
+loss after acquire, repeated retirement, mismatched proof, late provider outcome,
+and a HUMAN send/Return waiting until positive retirement. If the deployment
+cannot supply authoritative termination/fencing evidence, retain LIVE and show
+recovery-required in Inbox; production enrollment stays blocked. Legacy v1
+writers without incarnation IDs additionally require a proved complete drain of
+their original gateway cohort before enrollment; assigning a new UUID to an old
+writer does not prove it ended.
 
 Generic FULL delivery/control routes must not bypass enrolled channel checks or
 make a case disagree with Conversation authority. Existing exact outcomes and
