@@ -298,7 +298,8 @@ async def test_bounded_prefix_never_gains_effect_eligibility_after_residual_is_c
     assert await worker.run_once() is False
 
 
-async def test_website_coalesces_bursts_and_writes_once(wh, sql, test_database_clock):
+@pytest.mark.parametrize("drift", ["none", "new_input", "authority", "proof", "fence"])
+async def test_website_coalesces_bursts_and_writes_once(wh, sql, test_database_clock, drift):
     from core.config import SettlingPolicy
     from services.website_worker import WebsiteWorker
 
@@ -334,6 +335,32 @@ async def test_website_coalesces_bursts_and_writes_once(wh, sql, test_database_c
     assert replay.status_code == 200 and replay.json()["send"] is False
     assert replay.json()["action"] == "REPLAY_COMPLETED"
     assert await worker.run_once() is False
+    if drift == "new_input":
+        await test_website.admit(wh, test_website.payload(wh, session_id=session_id))
+    elif drift == "authority":
+        async with sql.begin() as conn:
+            await conn.execute(text("UPDATE conversations SET control_mode='HUMAN', "
+                                    "authority_revision=authority_revision+1"))
+    elif drift == "proof":
+        async with sql.begin() as conn:
+            await conn.execute(text("UPDATE website_admissions SET fingerprint=:fingerprint "
+                                    "WHERE message_id=:message_id"),
+                               {"fingerprint": "d" * 64, "message_id": first["message_id"]})
+    elif drift == "fence":
+        async with sql.begin() as conn:
+            await conn.execute(text("UPDATE delivery_attempts SET fenced_settling_revision=NULL"))
+    after_drift = await wh.call("POST", "/website/responses/begin", body)
+    assert after_drift.status_code == 200 and after_drift.json()["send"] is False
+    if drift in {"none", "new_input"}:
+        assert after_drift.json()["action"] == "REPLAY_COMPLETED"
+        assert after_drift.json()["replay_source_attempt_id"] == body["response_attempt_id"]
+        assert after_drift.json()["draft_text"] == begun.json()["draft_text"]
+    else:
+        assert after_drift.json()["action"] == "DENY"
+    async with sql.connect() as conn:
+        assert await conn.scalar(text("SELECT count(*) FROM delivery_attempts")) == 1
+        assert await conn.scalar(text("SELECT count(*) FROM website_response_attempts")) == 1
+        assert await conn.scalar(text("SELECT count(*) FROM messages WHERE actor='AGENT'")) == 1
     async with wh.database.session_factory() as session:
         header = await session.get(CatchUpSelection, request.turn_id)
         assert header.member_count == 3
