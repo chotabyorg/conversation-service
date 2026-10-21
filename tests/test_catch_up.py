@@ -173,7 +173,9 @@ async def test_committed_send_recovers_original_evidence_after_identity_drift(
     assert begun.status_code == 200 and begun.json()["send"] is True
     async with sql.begin() as connection:
         if drift == "account":
-            await connection.execute(update(TelegramProviderAccount).values(state="CONFLICT"))
+            await connection.execute(update(TelegramProviderAccount).values(
+                state="CONFLICT", bot_id=None,
+            ))
         else:
             await connection.execute(update(TelegramAdmission).values(update_id=9999))
     binding = settings.managed_ai_bindings[0]
