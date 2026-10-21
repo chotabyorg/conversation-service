@@ -1,6 +1,7 @@
 """Commit positive supervisor evidence to the existing outbound writer journal."""
 from __future__ import annotations
 
+import asyncio
 from uuid import uuid5
 
 from sqlalchemy import select
@@ -16,6 +17,8 @@ from services.common import db_clock, fingerprint
 from services.inbox_lifecycle import _post_proof
 from services.telegram import _record_reconciliation
 from services.telegram_delivery_v2 import V2_NAMESPACE, _load_intent
+
+WRITER_PROOF_DEADLINE_SECONDS = 8.0
 
 
 def _authorize(principal: Principal, request: WriterRetireCommand, settings: Settings) -> None:
@@ -65,10 +68,14 @@ async def _termination_proof(
 ) -> WriterTerminationProof:
     if settings.writer_supervisor_base_url is None or settings.writer_supervisor_token is None:
         raise DomainError(ErrorCode.SERVICE_UNAVAILABLE)
-    proof = await _post_proof(settings.writer_supervisor_base_url,
-        "/internal/v1/writer-termination/proof",
-        {"X-Writer-Supervisor-Token": settings.writer_supervisor_token.get_secret_value()},
-        request, WriterTerminationProof)
+    try:
+        async with asyncio.timeout(WRITER_PROOF_DEADLINE_SECONDS):
+            proof = await _post_proof(settings.writer_supervisor_base_url,
+                "/internal/v1/writer-termination/proof",
+                {"X-Writer-Supervisor-Token": settings.writer_supervisor_token.get_secret_value()},
+                request, WriterTerminationProof)
+    except TimeoutError:
+        raise DomainError(ErrorCode.SERVICE_UNAVAILABLE) from None
     if (proof.request_fingerprint != digest or any(
         proof.model_dump(mode="json").get(key) != value
         for key, value in request.model_dump(mode="json").items()

@@ -1,6 +1,7 @@
 """Positive writer termination, original-attempt recovery and authority fencing."""
 from __future__ import annotations
 
+import asyncio
 import json
 import secrets
 from datetime import UTC, datetime
@@ -13,6 +14,7 @@ from pydantic import SecretStr, ValidationError
 from sqlalchemy import func, select
 
 import services.inbox_lifecycle as lifecycle
+import services.writer_retirement as retirement
 from core.config import Settings
 from models import Conversation, DeliveryAttempt, ExternalEffectPermit, Message
 from services.common import fingerprint
@@ -294,6 +296,67 @@ async def test_retained_command_rejects_payload_changes_without_proof(
             headers=h.retirement_headers)
         assert result.status_code == 409
     assert proof_transport.calls == 1
+
+
+async def test_same_command_cannot_retire_a_different_intent_in_the_root(
+    writer_harness, proof_transport, user_me_transport,
+):
+    h = writer_harness
+    ids, sent, _, command = await acquired(h)
+    assert (await h.client.post(RETIRE, json=command,
+        headers=h.retirement_headers)).status_code == 200
+    case = sent["case"]
+    second = await h.client.post(f"/public/v1/inbox/cases/{ids['case_id']}/messages",
+        json=dict(command_id=str(uuid4()), text="Another human update.",
+            expected_authority_revision=case["authority_revision"],
+            expected_case_revision=case["case_revision"],
+            expected_assignment_revision=case["assignment_revision"]),
+        headers=browser_headers("session-a", write=True))
+    assert second.status_code == 200, second.text
+    items = await telegram_work(h)
+    assert len(items) == 1
+    second_begin = begin_request(items[0])
+    assert (await h.client.post("/internal/v2/telegram/delivery/begin",
+        json=second_begin, headers=h.service_headers)).json()["send"] is True
+    other = dict(second_begin, work_kind="RECOVER_ONLY", command_id=command["command_id"],
+        expected_delivery_revision=1, proof_ref=str(uuid4()))
+    denied = await h.client.post(RETIRE, json=other, headers=h.retirement_headers)
+    assert denied.status_code == 409, denied.text
+    assert (await intent(h, other)).writer_state == "LIVE"
+    assert proof_transport.calls == 1
+
+
+@pytest.mark.parametrize("status,expected", [(404, 404), (409, 409), (503, 503), (302, 503)])
+async def test_unavailable_or_redirected_supervisor_keeps_writer_live(
+    writer_harness, proof_transport, user_me_transport, status, expected,
+):
+    h = writer_harness
+    _, _, _, command = await acquired(h)
+    proof_transport.status = status
+    response = await h.client.post(RETIRE, json=command, headers=h.retirement_headers)
+    assert response.status_code == expected
+    assert (await intent(h, command)).writer_state == "LIVE"
+
+
+async def test_stalled_proof_has_a_total_deadline_without_retirement(
+    writer_harness, proof_transport, user_me_transport, monkeypatch,
+):
+    h = writer_harness
+    _, _, _, command = await acquired(h)
+    cancelled = asyncio.Event()
+
+    async def stalled():
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    monkeypatch.setattr(retirement, "WRITER_PROOF_DEADLINE_SECONDS", 0.025)
+    proof_transport.hook = stalled
+    response = await asyncio.wait_for(h.client.post(RETIRE,
+        json=command, headers=h.retirement_headers), timeout=2)
+    assert response.status_code == 503 and cancelled.is_set()
+    assert (await intent(h, command)).writer_state == "LIVE"
 
 
 async def test_supervisor_credential_is_exclusive_and_has_no_other_write_authority(

@@ -309,7 +309,8 @@ UUID `proof_ref` (no text). It never grants another send.
 
 After preflight it releases all DB checkouts/locks and reads
 `POST {WRITER_SUPERVISOR_BASE_URL}/internal/v1/writer-termination/proof` using the
-separate `X-Writer-Supervisor-Token`. The strict bounded JSON response must echo
+separate `X-Writer-Supervisor-Token`, with an eight-second total deadline and a
+16 KiB response cap. The strict JSON response must echo
 every request field and the canonical SHA256 `request_fingerprint`, with
 `proof_kind:PROCESS_TERMINATED|TASKS_FENCED_AND_JOINED`, strict booleans
 `fenced:true,tasks_ended:true`, and UTC `observed_at`. The supervisor must have
