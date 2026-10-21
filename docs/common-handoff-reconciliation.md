@@ -9,8 +9,8 @@ authorize merging that old head unchanged.
 
 | Service | Current main inspected on 2026-10-21 | Old source reference |
 | --- | --- | --- |
-| Conversation | `bdb6e138a7e58bd38c189446574be45fe3e05627` | #17 `081c5b2040139285eab703c8411b09a5065e4013` |
-| AI | `f570d1e3c6e23075b899379e0e23895df512947f` | #59 `4f535432ad023f1675d81195c62a7d7bd33c5c13` |
+| Conversation | `431481ad670db114fcbd4b273bfbb41bc5f23054` | #17 `081c5b2040139285eab703c8411b09a5065e4013` |
+| AI | `3ee6e4b806cefbfbfeecef1a3715465f8f32d9d9` | #59 `4f535432ad023f1675d81195c62a7d7bd33c5c13` |
 | Control Plane | `e477f04bd5e8d72d60e6f0250f3830b44b4ca44b` | #25 `d684db9e7bbd9b3425fa1ad6d4bb65710b38a7bb` |
 | Telegram gateway | `a94256b1ce71b21e5337ca3fa98a6e0dc64d83ce` | #16 `f0d21f318f58cc29515d85036a7c46fb445503be` |
 | Website gateway | `df3b2002bb3c7e48d111098fe7db1b60257850fe` | current managed HTTP response path |
@@ -52,9 +52,11 @@ The lifecycle is:
 2. New AI dispatch, fresh Business permits and new AI send acquisitions stop.
    Previously committed Business permits and original writer evidence retain
    their established recovery precedence; no permit is revoked or reissued.
-3. If an older acquired channel writer is still LIVE, authority is HUMAN_PENDING.
-   The case is visible and claimable, but human send waits for its positive end.
-   Once drained, authority becomes HUMAN through the same durable lifecycle.
+3. Authority is already HUMAN when the case opens. If an older acquired channel
+   writer is still LIVE, the case is visible and claimable, but acquiring a new
+   human send waits for its positive end. The pending-writer phase is a projection
+   of the same outbound journal; it is not a third authority mode or a separate
+   Handoff lifecycle. Queued HUMAN text is not proof that the customer received it.
 4. Claim and send commands use stable UUIDs plus authority/case/assignment CAS.
    Exact replay returns the original immutable receipt before new eligibility.
    Canonical HUMAN text and its outbound intent commit together exactly once.
