@@ -35,10 +35,12 @@ user_me_transport = user_me_fixture
 @pytest.fixture
 def writer_harness(inbox_harness):
     token = secrets.token_urlsafe(32)
-    settings = inbox_harness.settings
-    settings.writer_retirement_token = SecretStr(token)
-    settings.writer_supervisor_token = SecretStr(secrets.token_urlsafe(32))
-    settings.writer_supervisor_base_url = "http://writer-supervisor.test"
+    values = inbox_harness.settings.model_dump()
+    values.update(writer_retirement_token=SecretStr(token),
+        writer_supervisor_token=SecretStr(secrets.token_urlsafe(32)),
+        writer_supervisor_base_url="http://writer-supervisor.test")
+    settings = Settings(**values, _env_file=None)
+    inbox_harness.settings = inbox_harness.app.state.settings = settings
     inbox_harness.retirement_headers = {"X-Writer-Retirement-Token": token}
     return inbox_harness
 
@@ -312,7 +314,7 @@ async def test_supervisor_credential_is_exclusive_and_has_no_other_write_authori
         assert (await h.client.post(path, json={}, headers=h.retirement_headers)).status_code == 404
     for suffix in ("claim", "messages", "return-to-agent"):
         response = await h.client.post(f"/public/v1/inbox/cases/{ids['case_id']}/{suffix}",
-            json={}, headers=h.retirement_headers)
+            json={}, headers=dict(h.retirement_headers, Origin="https://agents.chota.by"))
         assert response.status_code == 401
     assert proof_transport.calls == 0
     assert (await intent(h, command)).writer_state == "LIVE"
