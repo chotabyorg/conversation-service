@@ -373,7 +373,7 @@ def test_native_migration_database_source_priority_and_no_auth_requirement(
             timeout=30,
         )
         assert smoke.returncode == 0
-        assert "0013_writer_retirement" in smoke.stdout
+        assert "0014_website_session" in smoke.stdout
     else:
         assert result.returncode != 0
         assert "DATABASE_URL must be a dedicated PostgreSQL asyncpg URL" in result.stderr
