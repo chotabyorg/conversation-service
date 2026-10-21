@@ -59,10 +59,12 @@ pages. New arrivals create later work and cannot rewrite a committed selection.
 
 Propose additive Conversation-owned selection evidence:
 
-- `CatchUpSelection`: one immutable row per catch-up Turn, with selection version,
+- `CatchUpSelection`: one immutable row per newly selected opt-in SETTLING text
+  Turn, including single-burst selections and bounded prefixes, with selection version,
   Conversation/Turn identity, authority revision and authority input floor,
   selection-time accepted-input/settling revisions, selected range, observed
-  latest-customer tail, and a canonical membership digest.
+  latest-customer tail, a canonical membership digest, and a frozen admitted
+  identity proof/digest as defined below.
 - `CatchUpMember`: ordered immutable references to original bursts, including the
   exact selected first/last sequences and the closed burst's tail/policy snapshot.
   Composite foreign keys fence Conversation, Turn and original burst identity.
@@ -75,6 +77,36 @@ Recompute and validate exact membership under the lock before commit. A failed
 projection/assignment rolls back all new rows. A restart reclaims the same Turn
 and reads its retained selection; it never infers a new group from today's clock.
 Database immutability and downgrade refusal must cover the new evidence.
+
+### Admitted identity proof
+
+The current admission tables have exact canonical-message links and scope foreign
+keys, but do not have database immutability triggers. Do not assume that their
+current contents alone prove a historical selection. Freeze a bounded canonical
+identity-proof value in `CatchUpSelection`, with one ordered entry per selected
+`TurnInputMessage`: message ID/sequence/ordinal, admission ID and fingerprint,
+route, owner/integration/agent/channel/namespace and channel identity fields.
+Hash this value with the membership proof; do not include customer text, tokens
+or credentials. Its length is bounded by the same 256-input limit.
+
+For Website, join `WebsiteAdmission.canonical_message_id=Message.id` and equal
+Conversation ID, require MANAGED, exact scope/agent/namespace, and
+`session_id=UUID(Conversation.provider_thread_id)`. Retain message/session IDs.
+For Telegram, use the corresponding exact `TelegramAdmission` join, require
+MANAGED and exact scope/agent/namespace; retain bot/chat/sender/message/update/event
+and thread IDs. Validate the existing private-chat/event-ID relationships and
+require the same BOUND `TelegramProviderAccount` bot ID for all selected inputs.
+Retain that account decision in the proof. A later CONFLICT fences fresh work;
+it cannot rewrite the selected identity.
+
+Recompute these joins and compare the entire frozen proof before projection,
+each fresh dispatch fence, fresh effect eligibility/permit, and each communication
+send/replay decision under the parent lock. Missing, changed or mismatched evidence
+fails closed. Include the supplied/current agent in the comparison. Terminal result,
+committed permit, and exact original delivery-evidence recovery retain precedence;
+none of these comparisons permits a new provider call on UNKNOWN. Every fresh send
+entry point, including generic delivery reconciliation, must enforce the same proof
+or reject catch-up Turns; channel APIs cannot be bypassed through a FULL principal.
 
 ## Bounds and incomplete residuals
 
@@ -160,8 +192,10 @@ refuse while non-representable evidence remains. Never delete evidence to force 
 
 ## Architecture review decisions
 
-Before implementation, independently confirm the additive membership model, the
+Before implementation, independently confirm the additive membership/identity model, the
 non-first-burst split proof, incomplete-prefix communication behavior, the authority
 floor interaction, and reader/enablement/rollback ordering. In particular, review
-whether an explicit selection row should also cover single-burst bounded prefixes
-to make the incomplete-input proof uniform without rewriting historical Turns.
+the decision to cover all new opt-in SETTLING selections, including single-burst
+bounded prefixes, to make the incomplete-input proof uniform without rewriting
+historical Turns. The admitted-identity refinement follows the independent review
+of revision `05ae43c4f26b64e37749ea87be4d6f34d4ad8c38`.
