@@ -26,6 +26,7 @@ from models import (
 )
 from schemas.contracts import Channel, ErrorCode, Principal
 from schemas.managed import MAX_MESSAGES
+from services import catch_up
 from services.common import db_clock, fingerprint, message_is_consumed, scope_filter
 from services.history_projection import freeze_website_projection
 
@@ -39,6 +40,8 @@ async def freeze_admission_membership(
     conversation: Conversation,
     policy: SettlingPolicy | None,
     sequence: int,
+    *,
+    separate_authority_epoch: bool = False,
 ) -> tuple[datetime, UUID | None, str | None, int | None, int | None]:
     """Freeze one accepted input into the open burst or create a new burst."""
     burst = await session.scalar(select(SettlingBurst).where(
@@ -46,6 +49,13 @@ async def freeze_admission_membership(
         SettlingBurst.closed_at.is_(None),
     ).with_for_update())
     clock = await db_clock(session)
+    if (burst is not None and separate_authority_epoch
+            and burst.tail_sequence <= conversation.authority_input_floor_sequence):
+        # Seal the old deadline without moving it or admitting post-Return input
+        # to a burst from a previous authority epoch.
+        burst.closed_at = burst.ready_at
+        await session.flush()
+        burst = None
     if burst is not None and clock < burst.ready_at:
         if sequence <= burst.tail_sequence:
             raise RuntimeError("Settling burst tail is not monotonic")
@@ -119,17 +129,20 @@ async def _record_selection(
         ) for message in selected)
 
 
-async def _pending_messages(session: AsyncSession, conversation_id: UUID) -> list[Message]:
+async def _pending_messages(session: AsyncSession, conversation_id: UUID,
+                            input_floor: int = 0) -> list[Message]:
     return list((await session.scalars(select(Message).where(
         Message.conversation_id == conversation_id,
         Message.actor == "CUSTOMER",
         Message.direction == "INBOUND",
+        Message.sequence > input_floor,
         ~message_is_consumed(),
     ).order_by(Message.sequence).limit(MAX_BURST_MESSAGES + 1))).all())
 
 
 def _turn_for_selection(
-    conversation: Conversation, selected: list[Message], clock: datetime
+    conversation: Conversation, selected: list[Message], clock: datetime,
+    catch_up_digest: str | None = None,
 ) -> AgentTurn:
     first, last = selected[0], selected[-1]
     selection_key = uuid5(_SELECTION_NAMESPACE, f"{conversation.id}:{first.id}:{last.id}")
@@ -150,6 +163,8 @@ def _turn_for_selection(
         "message_ids": [str(message.id) for message in selected],
         "policy_version": first.settling_policy_version,
     }
+    if catch_up_digest is not None:
+        boundaries.update(catch_up_version=1, catch_up_digest=catch_up_digest)
     return AgentTurn(
         id=uuid4(), conversation_id=conversation.id, selection_key=selection_key,
         creation_fingerprint=fingerprint(boundaries),
@@ -157,6 +172,7 @@ def _turn_for_selection(
         context_last_sequence=last.sequence, input_revision=conversation.input_revision,
         settling_revision=conversation.settling_revision,
         settling_burst_id=first.settling_burst_id,
+        catch_up_version=1 if catch_up_digest is not None else 0,
         authority_revision=conversation.authority_revision, status="PENDING", claim_epoch=0,
         operation_refs=[], created_at=clock,
     )
@@ -186,7 +202,7 @@ async def _maximal_projectable_prefix(
     return messages[:best]
 
 
-def _validate_settled_members(messages: list[Message]) -> None:
+def _validate_settled_members(messages: list[Message], *, multiple_bursts: bool = False) -> None:
     """Reject malformed persisted snapshots before projection or ownership writes."""
     if not messages:
         raise DomainError(ErrorCode.VALIDATION_ERROR)
@@ -194,7 +210,7 @@ def _validate_settled_members(messages: list[Message]) -> None:
     for index, message in enumerate(messages):
         if (message.input_revision is None or message.input_revision < 1
                 or message.settling_revision is None or message.settling_revision < 0
-                or message.settling_burst_id != first.settling_burst_id
+                or (not multiple_bursts and message.settling_burst_id != first.settling_burst_id)
                 or message.settling_policy_version != first.settling_policy_version
                 or message.settling_quiet_window_ms != first.settling_quiet_window_ms
                 or message.settling_max_wait_ms != first.settling_max_wait_ms
@@ -209,15 +225,22 @@ async def _create_turn(
     binding: ManagedBinding,
     channel: Channel,
     clock: datetime,
+    catch_up_enabled: bool = False,
 ) -> UUID:
-    _validate_settled_members(selected)
-    turn = _turn_for_selection(conversation, selected, clock)
+    _validate_settled_members(selected, multiple_bursts=catch_up_enabled)
+    evidence = (await catch_up.prepare(session, conversation, selected, binding.agent_id)
+                if catch_up_enabled else None)
+    turn = _turn_for_selection(conversation, selected, clock,
+                               evidence.digest if evidence is not None else None)
     if channel == Channel.WEBSITE_WIDGET or channel == Channel.TELEGRAM:
         await freeze_website_projection(session, conversation, turn, binding.agent_id)
     session.add(turn)
     await session.flush()
     await _record_selection(session, turn, selected, channel)
     await session.flush()
+    if evidence is not None:
+        await catch_up.persist(session, turn, evidence, clock)
+        await session.flush()
     return turn.id
 
 
@@ -281,15 +304,19 @@ async def select_settled_turn(
                     ).with_for_update())
                     if active is not None:
                         continue
-                    rows = await _pending_messages(session, conversation.id)
-                    if not rows or rows[0].settling_burst_id is None:
-                        continue
                     channel = Channel(conversation.channel)
                     binding = next((candidate for candidate in _bindings(settings, channel)
                                     if candidate.owner_id == conversation.owner_id
                                     and candidate.integration_id ==
                                     conversation.integration_id), None)
                     if binding is None:
+                        continue
+                    catch_up_enabled = catch_up.enabled(settings, binding)
+                    rows = await _pending_messages(
+                        session, conversation.id,
+                        conversation.authority_input_floor_sequence if catch_up_enabled else 0,
+                    )
+                    if not rows or rows[0].settling_burst_id is None:
                         continue
                     burst = await session.scalar(select(SettlingBurst).where(
                         SettlingBurst.id == rows[0].settling_burst_id,
@@ -305,7 +332,11 @@ async def select_settled_turn(
                     if clock < burst.closed_at:
                         continue
                     due_messages: list[Message] = []
-                    for message in rows:
+                    if catch_up_enabled:
+                        due_messages = await catch_up.due_prefix(
+                            session, conversation, rows, binding, clock,
+                        )
+                    for message in (() if catch_up_enabled else rows):
                         if message.settling_burst_id != burst.id:
                             break
                         if (message.settling_policy_version != burst.policy_version
@@ -319,7 +350,7 @@ async def select_settled_turn(
                             break
                     if not due_messages:
                         continue
-                    _validate_settled_members(due_messages)
+                    _validate_settled_members(due_messages, multiple_bursts=catch_up_enabled)
                     if channel == Channel.TELEGRAM:
                         account = await session.scalar(select(TelegramProviderAccount).where(
                             TelegramProviderAccount.owner_id == conversation.owner_id,
@@ -378,7 +409,7 @@ async def select_settled_turn(
                         # and cannot prevent later Conversations from making progress.
                         continue
                     return await _create_turn(session, conversation, selected, binding,
-                                              channel, clock)
+                                              channel, clock, catch_up_enabled)
             except DomainError as exc:
                 if exc.code == ErrorCode.VALIDATION_ERROR:
                     # This candidate transaction has rolled back before advancing.

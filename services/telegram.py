@@ -47,6 +47,7 @@ from schemas.telegram import (
 from schemas.telegram import (
     TelegramAdmission as AdmissionRequest,
 )
+from services import catch_up
 from services.common import (
     authorized_conversation,
     db_clock,
@@ -195,7 +196,11 @@ async def admit(database: Database, principal: Principal, request: AdmissionRequ
                 policy = settings.settling_policy_for(Channel.TELEGRAM, request.integration_id)
                 clock, burst_id, policy_version, quiet_ms, max_ms = (
                     await freeze_admission_membership(
-                        session, conversation, policy, conversation.last_message_sequence
+                        session, conversation, policy, conversation.last_message_sequence,
+                        separate_authority_epoch=catch_up.scope_enabled(
+                            settings, request.owner_id, request.integration_id,
+                            "TELEGRAM", request.agent_id,
+                        ),
                     )
                 )
                 conversation.updated_at = clock
@@ -390,7 +395,12 @@ async def _validated_turn_admissions(
     conversation: Conversation,
     turn: AgentTurn,
     agent_id: UUID,
+    *,
+    require_catch_up_proof: bool = True,
 ) -> list[TelegramAdmissionRow]:
+    if (require_catch_up_proof and turn.catch_up_version
+            and not await catch_up.validate(session, conversation, turn, agent_id)):
+        raise DomainError(ErrorCode.VALIDATION_ERROR)
     mapped = (await session.execute(select(TurnInputMessage, Message).join(
         Message, and_(Message.id == TurnInputMessage.message_id,
                       Message.conversation_id == TurnInputMessage.conversation_id),
@@ -419,7 +429,8 @@ async def _validated_turn_admissions(
     admissions: list[TelegramAdmissionRow] = []
     for _, message in mapped:
         if (message.actor != "CUSTOMER" or message.direction != "INBOUND"
-                or message.settling_burst_id != turn.settling_burst_id):
+                or (not turn.catch_up_version
+                    and message.settling_burst_id != turn.settling_burst_id)):
             raise DomainError(ErrorCode.VALIDATION_ERROR)
         admission = await session.scalar(select(TelegramAdmissionRow).where(
             TelegramAdmissionRow.canonical_message_id == message.id,
@@ -561,6 +572,8 @@ async def begin_response(database: Database, principal: Principal,
 
         settling = turn.settling_burst_id is not None
         stale = settling and conversation.settling_revision > turn.settling_revision
+        if turn.catch_up_version:
+            stale = stale or not await catch_up.communication_current(session, conversation, turn)
         expected_settling = turn.settling_revision if settling else None
         fenced_settling = conversation.settling_revision if settling else None
         if stale:
@@ -747,7 +760,8 @@ async def delivery_work(database: Database, principal: Principal,
                             or turn.draft_text is None):
                         continue
                     members = await _validated_turn_admissions(
-                        session, conversation, turn, request.agent_id
+                        session, conversation, turn, request.agent_id,
+                        require_catch_up_proof=False,
                     )
                     representative = members[0]
                     if (representative.owner_id != request.owner_id
@@ -799,6 +813,10 @@ async def delivery_work(database: Database, principal: Principal,
                         item_admission = recovery[1]
                         work_kind: Literal["SEND_CANDIDATE", "RECOVER_ONLY"] = "RECOVER_ONLY"
                     else:
+                        if turn.catch_up_version and not await catch_up.validate(
+                            session, conversation, turn, request.agent_id,
+                        ):
+                            raise DomainError(ErrorCode.VALIDATION_ERROR)
                         if (account is None or account.state != "BOUND"
                                 or account.bot_id != str(request.bot_id)
                                 or conversation.control_mode != "AGENT"

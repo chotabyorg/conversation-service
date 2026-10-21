@@ -20,7 +20,7 @@ runtime databases:
 | GOAL2_AI_PYTHON | absolute Python executable with that candidate's dependencies |
 
 ```text
-python -m pytest -q -p no:cacheprovider tests/managed_cross_service/acceptance_http.py
+python -m pytest -q -p no:cacheprovider tests/managed_cross_service/acceptance_http.py tests/managed_cross_service/fingerprint_profiles_http.py
 ```
 
 Missing inputs fail setup. There is no auto-fetch/main fallback, test skip, .env
@@ -29,7 +29,7 @@ run before seed. The two DBs must be PG16; per-case cleanup truncates only these
 explicitly designated DBs. Provision the Docker DB resources before runtime socket
 guards; clean up only the resources created for your run after tests finish.
 
-`acceptance_http.py` intentionally sits outside pytest's default `test_*.py` filename
+`acceptance_http.py` and `fingerprint_profiles_http.py` intentionally sit outside pytest's default `test_*.py` filename
 pattern. The standard `python -m pytest` service gate and unchanged Quality workflow
 therefore run the ordinary service suite without requiring the paired AI checkout.
 The exact explicit-file command above is the separate mandatory paired gate and

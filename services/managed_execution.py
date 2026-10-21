@@ -44,7 +44,7 @@ from schemas.managed import (
     prepare_request,
     prepare_request_for_fingerprint,
 )
-from services import telegram, turns
+from services import catch_up, telegram, turns
 from services.common import db_clock, locked_turn
 from services.history_projection import (
     canonical_window,
@@ -78,6 +78,11 @@ class RecoverMarked:
 async def validate_website_agent(
     session: AsyncSession, turn: AgentTurn, agent_id: UUID, conversation_channel: str
 ) -> None:
+    if turn.catch_up_version:
+        conversation = await session.get(Conversation, turn.conversation_id)
+        if (conversation is None or not await catch_up.validate(
+                session, conversation, turn, agent_id)):
+            raise DomainError(ErrorCode.VALIDATION_ERROR)
     if conversation_channel == Channel.VOICE.value:
         from services.voice import validate_dispatch
         conversation = await session.get(Conversation, turn.conversation_id)

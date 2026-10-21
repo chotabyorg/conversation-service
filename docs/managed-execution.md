@@ -133,7 +133,7 @@ Use a compatible Goal2 image or forward fix; erase neither marker nor uncertaint
 to make old source/schema serve again.
 
 Service tests require explicit disposable PG16 URL and exact endpoint guards. The
-separate mandatory `python -m pytest tests/managed_cross_service/acceptance_http.py`
+separate mandatory `python -m pytest -q -p no:cacheprovider tests/managed_cross_service/acceptance_http.py tests/managed_cross_service/fingerprint_profiles_http.py`
 gate requires explicit AI candidate/runtime and separate disposable PG inputs,
 runs real apps/client over HTTP with fake model/KB/MCP only and fails missing inputs.
 The standard service suite remains runnable independently. Goal4A real-process
