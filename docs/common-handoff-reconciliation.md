@@ -24,7 +24,7 @@ before every source merge and release. Source, image digest, desired GitOps
 revision and observed runtime revision are distinct acceptance facts.
 
 The old Conversation source adds about ten thousand lines across forty files.
-Its migration `0012_shared_handoff -> 0008_business_effect_permits`
+Its migration `0009_telegram_handoff_inbox -> 0008_business_effect_permits`
 collides with retained Voice migrations. Reimplement an additive migration after
 `0011_turn_catch_up`, keeping one Alembic head, all current Voice fields, immutable
 catch-up evidence, wire-profile readers, authority floors and permit journals.
