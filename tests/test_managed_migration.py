@@ -63,36 +63,81 @@ MARKERS = {
     "managed_request_fingerprint",
 }
 HISTORY_COLUMNS = {
-    "source_agent_turn_id", "managed_contract_version", "managed_context_first_sequence",
-    "managed_projection_agent_id", "managed_projection_fingerprint",
+    "source_agent_turn_id",
+    "managed_contract_version",
+    "managed_context_first_sequence",
+    "managed_projection_agent_id",
+    "managed_projection_fingerprint",
 }
 SETTLING_COLUMNS = {
-    "settling_revision", "settling_burst_id", "settling_policy_version",
-    "settling_quiet_window_ms", "settling_max_wait_ms",
-    "expected_settling_revision", "fenced_settling_revision", "result_settling_revision",
+    "settling_revision",
+    "settling_burst_id",
+    "settling_policy_version",
+    "settling_quiet_window_ms",
+    "settling_max_wait_ms",
+    "expected_settling_revision",
+    "fenced_settling_revision",
+    "result_settling_revision",
 }
 PRE_GOAL5_COLUMNS = {
-    table: HISTORY_COLUMNS | (SETTLING_COLUMNS if table in {
-        "conversations", "messages", "agent_turns", "delivery_attempts",
-        "delivery_reconciliations",
-    } else set())
+    table: HISTORY_COLUMNS
+    | (
+        SETTLING_COLUMNS
+        if table
+        in {
+            "conversations",
+            "messages",
+            "agent_turns",
+            "delivery_attempts",
+            "delivery_reconciliations",
+        }
+        else set()
+    )
     for table in TABLES
 }
 PRE_GOAL5_COLUMNS["messages"] = PRE_GOAL5_COLUMNS["messages"] | {"input_revision"}
 # Authority floors were introduced in 0008 and must be omitted both from the
 # populated-0001 fixture projection and from cross-revision equality checks.
-PRE_GOAL5_COLUMNS["conversations"] = (
-    PRE_GOAL5_COLUMNS["conversations"] | {"authority_input_floor_sequence"}
-)
+PRE_GOAL5_COLUMNS["conversations"] = PRE_GOAL5_COLUMNS["conversations"] | {
+    "authority_input_floor_sequence",
+    "handoff_resume_floor_sequence",
+}
 # Partial draft text was introduced in 0009 and must be omitted both from the
 # populated-0001 fixture projection and from cross-revision equality checks.
-PRE_GOAL5_COLUMNS["agent_turns"] = (
-    PRE_GOAL5_COLUMNS["agent_turns"] | {"partial_draft_text", "catch_up_version"}
-)
+PRE_GOAL5_COLUMNS["agent_turns"] = PRE_GOAL5_COLUMNS["agent_turns"] | {
+    "partial_draft_text",
+    "catch_up_version",
+}
 # The per-lease delivery ordinal arrived in 0009 and is likewise pre-Goal5.
-PRE_GOAL5_COLUMNS["delivery_attempts"] = (
-    PRE_GOAL5_COLUMNS["delivery_attempts"] | {"ordinal"}
-)
+PRE_GOAL5_COLUMNS["delivery_attempts"] = PRE_GOAL5_COLUMNS["delivery_attempts"] | {"ordinal"}
+PRE_GOAL5_COLUMNS["messages"] |= {
+    "source_agent_turn_id",
+}
+PRE_GOAL5_COLUMNS["agent_turns"] |= {
+    "settling_revision",
+    "settling_burst_id",
+    "retired_at",
+    "managed_v3_snapshot",
+    "managed_v3_request_fingerprint",
+    "managed_v3_dispatch_id",
+}
+PRE_GOAL5_COLUMNS["delivery_attempts"] |= {
+    "source_message_id",
+    "outbound_ordinal",
+    "case_id",
+    "case_revision",
+    "assignment_revision",
+    "grant_generation",
+    "writer_state",
+    "writer_supplier_instance_id",
+    "writer_process_incarnation_id",
+    "writer_started_at",
+    "writer_ended_at",
+}
+PRE_GOAL5_COLUMNS["delivery_reconciliations"] |= {
+    "expected_settling_revision",
+    "result_settling_revision",
+}
 GOAL5_TABLES = (
     *TABLES,
     "turn_input_messages",
@@ -139,14 +184,22 @@ async def goal5_rows(sql):
     result = {}
     async with sql.connect() as connection:
         for table in GOAL5_TABLES:
-            primary_key = "message_id" if table in {
-                "turn_input_messages", "website_immediate_turns", "telegram_immediate_turns",
-            } else "id"
-            result[table] = [dict(row) for row in (
-                await connection.execute(text(
-                    f"SELECT * FROM {table} ORDER BY {primary_key}"
-                ))
-            ).mappings()]
+            primary_key = (
+                "message_id"
+                if table
+                in {
+                    "turn_input_messages",
+                    "website_immediate_turns",
+                    "telegram_immediate_turns",
+                }
+                else "id"
+            )
+            result[table] = [
+                dict(row)
+                for row in (
+                    await connection.execute(text(f"SELECT * FROM {table} ORDER BY {primary_key}"))
+                ).mappings()
+            ]
     return result
 
 
@@ -165,20 +218,58 @@ async def goal4b_rows(sql):
     """Project retained facts onto the exact 0005 schema before comparing an upgrade."""
     result = {}
     omitted = {table: set() for table in GOAL4B_TABLES}
-    omitted["conversations"].update({"settling_revision", "authority_input_floor_sequence"})
-    omitted["messages"].update({
-        "input_revision", "settling_revision", "settling_policy_version",
-        "settling_quiet_window_ms", "settling_max_wait_ms", "settling_burst_id",
-    })
-    omitted["agent_turns"].update({"settling_revision", "settling_burst_id"})
-    # Partial draft text arrived in 0009 and must not appear in a 0005 projection.
+    omitted["conversations"].update(
+        {
+            "settling_revision",
+            "authority_input_floor_sequence",
+            "handoff_resume_floor_sequence",
+        }
+    )
+    omitted["messages"].update(
+        {
+            "input_revision",
+            "settling_revision",
+            "settling_policy_version",
+            "settling_quiet_window_ms",
+            "settling_max_wait_ms",
+            "settling_burst_id",
+        }
+    )
     omitted["agent_turns"].update({"partial_draft_text", "catch_up_version"})
-    omitted["delivery_attempts"].update({
-        "expected_settling_revision", "fenced_settling_revision", "ordinal",
-    })
-    omitted["delivery_reconciliations"].update({
-        "expected_settling_revision", "result_settling_revision",
-    })
+    omitted["delivery_attempts"].add("ordinal")
+    omitted["agent_turns"].update(
+        {
+            "settling_revision",
+            "settling_burst_id",
+            "retired_at",
+            "managed_v3_snapshot",
+            "managed_v3_request_fingerprint",
+            "managed_v3_dispatch_id",
+        }
+    )
+    omitted["delivery_attempts"].update(
+        {
+            "expected_settling_revision",
+            "fenced_settling_revision",
+            "source_message_id",
+            "outbound_ordinal",
+            "case_id",
+            "case_revision",
+            "assignment_revision",
+            "grant_generation",
+            "writer_state",
+            "writer_supplier_instance_id",
+            "writer_process_incarnation_id",
+            "writer_started_at",
+            "writer_ended_at",
+        }
+    )
+    omitted["delivery_reconciliations"].update(
+        {
+            "expected_settling_revision",
+            "result_settling_revision",
+        }
+    )
     omitted["website_response_attempts"].add("send_authorized")
     omitted["telegram_response_attempts"].add("send_authorized")
     primary_keys = {
@@ -190,9 +281,9 @@ async def goal4b_rows(sql):
             primary_key = primary_keys.get(table, "id")
             result[table] = [
                 {key: value for key, value in row.items() if key not in omitted[table]}
-                for row in (await connection.execute(text(
-                    f"SELECT * FROM {table} ORDER BY {primary_key}"
-                ))).mappings()
+                for row in (
+                    await connection.execute(text(f"SELECT * FROM {table} ORDER BY {primary_key}"))
+                ).mappings()
             ]
     return result
 
@@ -244,10 +335,15 @@ async def test_populated_goal1_upgrade_preserves_every_journal_claim_fingerprint
     original = await rows(sql, exclude=PRE_GOAL5_COLUMNS)
     # Capture real complete Goal1 values, then downgrade only the emptied designated DB.
     old_rows = {
-        table: [{k: v for k, v in row.items()
-                 if k not in PRE_GOAL5_COLUMNS[table]
-                 and not (table == "agent_turns" and k in MARKERS)}
-                for row in values]
+        table: [
+            {
+                k: v
+                for k, v in row.items()
+                if k not in PRE_GOAL5_COLUMNS[table]
+                and not (table == "agent_turns" and k in MARKERS)
+            }
+            for row in values
+        ]
         for table, values in original.items()
     }
     await h.database.dispose()
@@ -297,28 +393,40 @@ async def test_goal5_policy_snapshot_blocks_downgrade_without_losing_schema_or_d
     accepted = await h.ingest()
     burst_id = uuid4()
     async with sql.begin() as connection:
-        await connection.execute(text(
-            "INSERT INTO settling_bursts "
-            "(id,conversation_id,policy_version,quiet_window_ms,max_wait_ms,opened_at,"
-            "max_cutoff_at,last_input_at,tail_sequence,ready_at) "
-            "SELECT :id,:conversation,'migration-policy',250,1500,clock.opened,"
-            "clock.opened+interval '1500 milliseconds',clock.opened,2,"
-            "clock.opened+interval '250 milliseconds' FROM "
-            "(SELECT clock_timestamp() AS opened) AS clock"
-        ), {"id": str(burst_id), "conversation": accepted["conversation"]["id"]})
-        await connection.execute(text(
-            "INSERT INTO messages "
-            "(id,conversation_id,sequence,input_revision,settling_revision,"
-            "settling_policy_version,settling_quiet_window_ms,settling_max_wait_ms,"
-            "settling_burst_id,actor,direction,content_type,text,created_at) "
-            "VALUES (:id,:conversation,2,2,0,'migration-policy',250,1500,:burst_id,"
-            "'CUSTOMER','INBOUND','TEXT','retained settling snapshot',clock_timestamp())"
-        ), {"id": str(uuid4()), "conversation": accepted["conversation"]["id"],
-             "burst_id": str(burst_id)})
-        await connection.execute(text(
-            "UPDATE conversations SET last_message_sequence=2,input_revision=2,"
-            "settling_revision=0 WHERE id=:id"
-        ), {"id": accepted["conversation"]["id"]})
+        await connection.execute(
+            text(
+                "INSERT INTO settling_bursts "
+                "(id,conversation_id,policy_version,quiet_window_ms,max_wait_ms,opened_at,"
+                "max_cutoff_at,last_input_at,tail_sequence,ready_at) "
+                "SELECT :id,:conversation,'migration-policy',250,1500,clock.opened,"
+                "clock.opened+interval '1500 milliseconds',clock.opened,2,"
+                "clock.opened+interval '250 milliseconds' FROM "
+                "(SELECT clock_timestamp() AS opened) AS clock"
+            ),
+            {"id": str(burst_id), "conversation": accepted["conversation"]["id"]},
+        )
+        await connection.execute(
+            text(
+                "INSERT INTO messages "
+                "(id,conversation_id,sequence,input_revision,settling_revision,"
+                "settling_policy_version,settling_quiet_window_ms,settling_max_wait_ms,"
+                "settling_burst_id,actor,direction,content_type,text,created_at) "
+                "VALUES (:id,:conversation,2,2,0,'migration-policy',250,1500,:burst_id,"
+                "'CUSTOMER','INBOUND','TEXT','retained settling snapshot',clock_timestamp())"
+            ),
+            {
+                "id": str(uuid4()),
+                "conversation": accepted["conversation"]["id"],
+                "burst_id": str(burst_id),
+            },
+        )
+        await connection.execute(
+            text(
+                "UPDATE conversations SET last_message_sequence=2,input_revision=2,"
+                "settling_revision=0 WHERE id=:id"
+            ),
+            {"id": accepted["conversation"]["id"]},
+        )
     await assert_downgrade_refused(
         h, sql, database_url, "Retained Message settling snapshots prevent downgrade."
     )
@@ -329,21 +437,23 @@ async def test_goal5_superseded_delivery_blocks_downgrade_without_losing_evidenc
 ):
     accepted, attempt, _ = await h.delivery()
     async with sql.begin() as connection:
-        await connection.execute(text(
-            "UPDATE conversations SET settling_revision=0 WHERE id=:id"),
+        await connection.execute(
+            text("UPDATE conversations SET settling_revision=0 WHERE id=:id"),
             {"id": accepted["conversation"]["id"]},
         )
-        await connection.execute(text(
-            "UPDATE messages SET settling_revision=0 WHERE conversation_id=:id"),
+        await connection.execute(
+            text("UPDATE messages SET settling_revision=0 WHERE conversation_id=:id"),
             {"id": accepted["conversation"]["id"]},
         )
-        await connection.execute(text(
-            "UPDATE agent_turns SET settling_revision=0 WHERE conversation_id=:id"),
+        await connection.execute(
+            text("UPDATE agent_turns SET settling_revision=0 WHERE conversation_id=:id"),
             {"id": accepted["conversation"]["id"]},
         )
-        await connection.execute(text(
-            "UPDATE delivery_attempts SET status='SUPERSEDED',revision=1,"
-            "dispatch_requested_at=clock_timestamp() WHERE id=:id"),
+        await connection.execute(
+            text(
+                "UPDATE delivery_attempts SET status='SUPERSEDED',revision=1,"
+                "dispatch_requested_at=clock_timestamp() WHERE id=:id"
+            ),
             {"id": attempt["id"]},
         )
     await assert_downgrade_refused(
@@ -351,26 +461,26 @@ async def test_goal5_superseded_delivery_blocks_downgrade_without_losing_evidenc
     )
 
 
-async def test_goal5_no_policy_delivery_fence_blocks_downgrade(
-    h, sql, database_url
-):
+async def test_goal5_no_policy_delivery_fence_blocks_downgrade(h, sql, database_url):
     accepted, attempt, _ = await h.delivery()
     _, dispatch = await h.reconcile(
-        attempt, "DISPATCH_REQUESTED",
-        expected_settling_revision=1, result_settling_revision=1,
+        attempt,
+        "DISPATCH_REQUESTED",
+        expected_settling_revision=1,
+        result_settling_revision=1,
     )
     assert dispatch["expected_settling_revision"] == 1
     async with sql.begin() as connection:
-        await connection.execute(text(
-            "UPDATE conversations SET settling_revision=0 WHERE id=:id"),
+        await connection.execute(
+            text("UPDATE conversations SET settling_revision=0 WHERE id=:id"),
             {"id": accepted["conversation"]["id"]},
         )
-        await connection.execute(text(
-            "UPDATE messages SET settling_revision=0 WHERE conversation_id=:id"),
+        await connection.execute(
+            text("UPDATE messages SET settling_revision=0 WHERE conversation_id=:id"),
             {"id": accepted["conversation"]["id"]},
         )
-        await connection.execute(text(
-            "UPDATE agent_turns SET settling_revision=0 WHERE conversation_id=:id"),
+        await connection.execute(
+            text("UPDATE agent_turns SET settling_revision=0 WHERE conversation_id=:id"),
             {"id": accepted["conversation"]["id"]},
         )
     await assert_downgrade_refused(
@@ -381,14 +491,20 @@ async def test_goal5_no_policy_delivery_fence_blocks_downgrade(
 async def test_no_policy_inbound_settling_revision_blocks_downgrade(h, sql, database_url):
     accepted = await h.ingest()
     async with sql.connect() as connection:
-        assert await connection.scalar(text(
-            "SELECT settling_policy_version FROM messages WHERE id=:id"),
-            {"id": accepted["message"]["id"]},
-        ) is None
-        assert await connection.scalar(text(
-            "SELECT settling_revision FROM conversations WHERE id=:id"),
-            {"id": accepted["conversation"]["id"]},
-        ) > 0
+        assert (
+            await connection.scalar(
+                text("SELECT settling_policy_version FROM messages WHERE id=:id"),
+                {"id": accepted["message"]["id"]},
+            )
+            is None
+        )
+        assert (
+            await connection.scalar(
+                text("SELECT settling_revision FROM conversations WHERE id=:id"),
+                {"id": accepted["conversation"]["id"]},
+            )
+            > 0
+        )
     await assert_downgrade_refused(
         h, sql, database_url, "Conversation settling revisions prevent downgrade."
     )
@@ -398,34 +514,46 @@ async def test_denied_response_send_permission_blocks_downgrade(h, sql, database
     accepted, attempt, _ = await h.delivery()
     admission_id = uuid4()
     async with sql.begin() as connection:
-        await connection.execute(text(
-            "INSERT INTO telegram_admissions "
-            "(id,owner_id,integration_id,agent_id,channel,provider_namespace,"
-            "provider_thread_id,provider_event_id,update_id,chat_id,message_id,sender_id,bot_id,"
-            "fingerprint,route,conversation_id,canonical_message_id) "
-            "VALUES (:id,'owner-a',:integration,:agent,'TELEGRAM','main-chota.telegram.v1',"
-            "'thread','event',1,'1','1','1','1',repeat('a',64),'MANAGED',:conversation,:message)"),
-            {"id": admission_id, "integration": h.grants["a"]["integration_id"],
-             "agent": uuid4(), "conversation": accepted["conversation"]["id"],
-             "message": accepted["message"]["id"]},
+        await connection.execute(
+            text(
+                "INSERT INTO telegram_admissions "
+                "(id,owner_id,integration_id,agent_id,channel,provider_namespace,"
+                "provider_thread_id,provider_event_id,update_id,chat_id,message_id,sender_id,bot_id,"
+                "fingerprint,route,conversation_id,canonical_message_id) "
+                "VALUES (:id,'owner-a',:integration,:agent,'TELEGRAM','main-chota.telegram.v1',"
+                "'thread','event',1,'1','1','1','1',repeat('a',64),'MANAGED',:conversation,:message)"
+            ),
+            {
+                "id": admission_id,
+                "integration": h.grants["a"]["integration_id"],
+                "agent": uuid4(),
+                "conversation": accepted["conversation"]["id"],
+                "message": accepted["message"]["id"],
+            },
         )
-        await connection.execute(text(
-            "INSERT INTO telegram_response_attempts "
-            "(id,admission_id,delivery_id,conversation_id,send_authorized) "
-            "VALUES (:id,:admission,:delivery,:conversation,false)"),
-            {"id": uuid4(), "admission": admission_id, "delivery": attempt["id"],
-             "conversation": attempt["conversation_id"]},
+        await connection.execute(
+            text(
+                "INSERT INTO telegram_response_attempts "
+                "(id,admission_id,delivery_id,conversation_id,send_authorized) "
+                "VALUES (:id,:admission,:delivery,:conversation,false)"
+            ),
+            {
+                "id": uuid4(),
+                "admission": admission_id,
+                "delivery": attempt["id"],
+                "conversation": attempt["conversation_id"],
+            },
         )
-        await connection.execute(text(
-            "UPDATE conversations SET settling_revision=0 WHERE id=:id"),
+        await connection.execute(
+            text("UPDATE conversations SET settling_revision=0 WHERE id=:id"),
             {"id": attempt["conversation_id"]},
         )
-        await connection.execute(text(
-            "UPDATE messages SET settling_revision=0 WHERE conversation_id=:id"),
+        await connection.execute(
+            text("UPDATE messages SET settling_revision=0 WHERE conversation_id=:id"),
             {"id": attempt["conversation_id"]},
         )
-        await connection.execute(text(
-            "UPDATE agent_turns SET settling_revision=0 WHERE conversation_id=:id"),
+        await connection.execute(
+            text("UPDATE agent_turns SET settling_revision=0 WHERE conversation_id=:id"),
             {"id": attempt["conversation_id"]},
         )
     await assert_downgrade_refused(
@@ -450,7 +578,9 @@ async def test_actual_goal4b_reconciliation_replays_after_0005_to_0006(
     # workflow so the accepted Goal4B source remains available by exact SHA.
     archive = subprocess.run(
         ["git", "archive", GOAL4B_CONVERSATION_SHA],
-        cwd=ROOT, check=True, capture_output=True,
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
     ).stdout
     old_source = tmp_path / "conversation-goal4b"
     old_source.mkdir()
@@ -462,11 +592,13 @@ async def test_actual_goal4b_reconciliation_replays_after_0005_to_0006(
     port = int(listener.getsockname()[1])
     listener.close()
     network_allowlist.add(("127.0.0.1", port))
-    principals = [{
-        "principal_id": "goal4b-legacy-replay",
-        "token": h.tokens["a"],
-        "grants": [h.grants["a"]],
-    }]
+    principals = [
+        {
+            "principal_id": "goal4b-legacy-replay",
+            "token": h.tokens["a"],
+            "grants": [h.grants["a"]],
+        }
+    ]
     env = {
         **os.environ,
         "DATABASE_URL": database_url,
@@ -489,9 +621,23 @@ async def test_actual_goal4b_reconciliation_replays_after_0005_to_0006(
         migrate(database_url, "downgrade", "0005_telegram_canary")
         downgraded = True
         process = subprocess.Popen(
-            [old_python, "-m", "uvicorn", "main:app", "--host", "127.0.0.1",
-             "--port", str(port), "--no-access-log", "--log-level", "critical"],
-            cwd=old_source, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            [
+                old_python,
+                "-m",
+                "uvicorn",
+                "main:app",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                str(port),
+                "--no-access-log",
+                "--log-level",
+                "critical",
+            ],
+            cwd=old_source,
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
         )
         async with httpx.AsyncClient(timeout=5, trust_env=False) as old_client:
             deadline = asyncio.get_running_loop().time() + 8
@@ -509,8 +655,7 @@ async def test_actual_goal4b_reconciliation_replays_after_0005_to_0006(
                 pytest.fail("Goal4B source process did not become ready")
 
             response = await old_client.post(
-                f"http://127.0.0.1:{port}/internal/v1/delivery-attempts/"
-                f"{attempt['id']}/reconcile",
+                f"http://127.0.0.1:{port}/internal/v1/delivery-attempts/{attempt['id']}/reconcile",
                 json=old_body,
                 headers={"X-Service-Token": h.tokens["a"]},
             )
@@ -521,20 +666,32 @@ async def test_actual_goal4b_reconciliation_replays_after_0005_to_0006(
         process = None
 
         async with sql.connect() as connection:
-            old_reconciliation = (await connection.execute(text(
-                "SELECT id,fingerprint,result_revision,status FROM delivery_reconciliations "
-                "WHERE delivery_attempt_id=:id"), {"id": attempt["id"]})).one()
+            old_reconciliation = (
+                await connection.execute(
+                    text(
+                        "SELECT id,fingerprint,result_revision,status "
+                        "FROM delivery_reconciliations "
+                        "WHERE delivery_attempt_id=:id"
+                    ),
+                    {"id": attempt["id"]},
+                )
+            ).one()
         migrate(database_url, "upgrade", "head")
         downgraded = False
-        replay = await h.call(
-            "POST", f"/delivery-attempts/{attempt['id']}/reconcile", old_body
-        )
+        replay = await h.call("POST", f"/delivery-attempts/{attempt['id']}/reconcile", old_body)
         assert replay.status_code == 200, replay.text
         assert replay.json()["replayed"] is True
         async with sql.connect() as connection:
-            retained = (await connection.execute(text(
-                "SELECT id,fingerprint,result_revision,status FROM delivery_reconciliations "
-                "WHERE delivery_attempt_id=:id"), {"id": attempt["id"]})).all()
+            retained = (
+                await connection.execute(
+                    text(
+                        "SELECT id,fingerprint,result_revision,status "
+                        "FROM delivery_reconciliations "
+                        "WHERE delivery_attempt_id=:id"
+                    ),
+                    {"id": attempt["id"]},
+                )
+            ).all()
         assert retained == [old_reconciliation]
         assert await h.database.ready()
     finally:
@@ -559,8 +716,9 @@ async def test_goal4b_retained_state_matrix_upgrades_without_rewriting_history(
     )
     begun = await wh.call("POST", WEBSITE_BASE + "/responses/begin", website_begin)
     assert begun.status_code == 200 and begun.json()["send"] is True
-    written = await wh.call("POST", WEBSITE_BASE + "/responses/complete",
-                            dict(website_begin, outcome="WRITE_COMPLETED"))
+    written = await wh.call(
+        "POST", WEBSITE_BASE + "/responses/complete", dict(website_begin, outcome="WRITE_COMPLETED")
+    )
     assert written.status_code == 200
 
     # Goal4B Telegram managed admission and provider-accepted response.
@@ -571,17 +729,30 @@ async def test_goal4b_retained_state_matrix_upgrades_without_rewriting_history(
     )
     assert tg_admission.status_code == 200
     from services.telegram_worker import TelegramWorker
+
     tg_worker = TelegramWorker(tg["database"], tg["settings"], DeterministicManagedPort())
     assert await tg_worker.run_once()
     from services.telegram import expected_response_attempt_id
-    tg_identity = {key: tg_value[key] for key in (
-        "owner_id", "integration_id", "agent_id", "provider_thread_id", "provider_event_id",
-    )}
-    tg_begin = dict(tg_identity, response_attempt_id=str(
-        expected_response_attempt_id(UUID(tg_admission.json()["admission_id"]))
-    ))
+
+    tg_identity = {
+        key: tg_value[key]
+        for key in (
+            "owner_id",
+            "integration_id",
+            "agent_id",
+            "provider_thread_id",
+            "provider_event_id",
+        )
+    }
+    tg_begin = dict(
+        tg_identity,
+        response_attempt_id=str(
+            expected_response_attempt_id(UUID(tg_admission.json()["admission_id"]))
+        ),
+    )
     tg_begun = await tg["client"].post(
-        "/internal/v1/telegram/responses/begin", json=tg_begin,
+        "/internal/v1/telegram/responses/begin",
+        json=tg_begin,
         headers=tg["gateway_headers"],
     )
     assert tg_begun.status_code == 200 and tg_begun.json()["send"] is True
@@ -600,8 +771,9 @@ async def test_goal4b_retained_state_matrix_upgrades_without_rewriting_history(
     await h.draft(await h.ingest(provider_thread_id="matrix-completed"))
     failed, _ = await h.select(await h.ingest(provider_thread_id="matrix-failed"))
     failed_claim = await h.claim(failed)
-    failure = await h.call("POST", f"/turns/{failed['id']}/fail",
-                           dict(h.proof(failed_claim), failure_code="TIMEOUT"))
+    failure = await h.call(
+        "POST", f"/turns/{failed['id']}/fail", dict(h.proof(failed_claim), failure_code="TIMEOUT")
+    )
     assert failure.status_code == 200
 
     # Keep one real old-shape reconciliation for replay after the schema upgrade.
@@ -609,9 +781,11 @@ async def test_goal4b_retained_state_matrix_upgrades_without_rewriting_history(
         accepted = await h.ingest(provider_thread_id=thread)
         _, turn = await h.draft(accepted)
         response = await h.call(
-            "POST", f"/conversations/{accepted['conversation']['id']}/delivery-attempts",
-            dict(delivery_key=str(uuid4()), source_turn_id=turn["id"],
-                 expected_authority_revision=0),
+            "POST",
+            f"/conversations/{accepted['conversation']['id']}/delivery-attempts",
+            dict(
+                delivery_key=str(uuid4()), source_turn_id=turn["id"], expected_authority_revision=0
+            ),
         )
         assert response.status_code == 201, response.text
         return response.json()["attempt"]
@@ -632,7 +806,8 @@ async def test_goal4b_retained_state_matrix_upgrades_without_rewriting_history(
     overlap_message_id = UUID(overlap_accepted["message"]["id"])
     duplicate_turn_id = uuid4()
     async with sql.begin() as connection:
-        await connection.execute(text("""
+        await connection.execute(
+            text("""
             INSERT INTO agent_turns (
               id,conversation_id,selection_key,creation_fingerprint,
               input_first_sequence,input_last_sequence,context_last_sequence,
@@ -648,21 +823,24 @@ async def test_goal4b_retained_state_matrix_upgrades_without_rewriting_history(
                    completed_at,outcome,draft_text,failure_code,operation_refs,terminal_fingerprint,
                    managed_contract_version,managed_context_first_sequence
             FROM agent_turns WHERE id=:source
-        """), {
-            "id": duplicate_turn_id,
-            "selection": uuid4(),
-            "fingerprint": "a" * 64,
-            "source": overlap_turn["id"],
-        })
-        await connection.execute(text(
-            "DELETE FROM turn_input_messages WHERE message_id=:id"),
+        """),
+            {
+                "id": duplicate_turn_id,
+                "selection": uuid4(),
+                "fingerprint": "a" * 64,
+                "source": overlap_turn["id"],
+            },
+        )
+        await connection.execute(
+            text("DELETE FROM turn_input_messages WHERE message_id=:id"),
             {"id": overlap_message_id},
         )
 
     # Model the fields that did not exist in 0005, keeping the prior input order.
     async with sql.begin() as connection:
         await connection.execute(text("UPDATE conversations SET settling_revision=0"))
-        await connection.execute(text("""
+        await connection.execute(
+            text("""
             WITH ranked AS (
               SELECT id,row_number() OVER (PARTITION BY conversation_id ORDER BY sequence) AS rev
               FROM messages WHERE actor='CUSTOMER' AND direction='INBOUND'
@@ -670,27 +848,38 @@ async def test_goal4b_retained_state_matrix_upgrades_without_rewriting_history(
             UPDATE messages m SET input_revision=r.rev,settling_revision=0,
               settling_policy_version=NULL,settling_quiet_window_ms=NULL,
               settling_max_wait_ms=NULL FROM ranked r WHERE r.id=m.id
-        """))
-        await connection.execute(text("""
+        """)
+        )
+        await connection.execute(
+            text("""
             UPDATE messages SET input_revision=NULL,settling_revision=NULL,
               settling_policy_version=NULL,settling_quiet_window_ms=NULL,
               settling_max_wait_ms=NULL
             WHERE actor<>'CUSTOMER' OR direction<>'INBOUND'
-        """))
+        """)
+        )
         # A Goal4B fixture has no settling revision; temporarily remove the
         # Goal5 projection trigger while restoring that 0005-only default.
-        await connection.execute(text(
-            "DROP TRIGGER preserve_website_projection ON agent_turns"))
+        await connection.execute(text("DROP TRIGGER preserve_website_projection ON agent_turns"))
         await connection.execute(text("UPDATE agent_turns SET settling_revision=0"))
-        await connection.execute(text(
-            "CREATE TRIGGER preserve_website_projection BEFORE UPDATE ON agent_turns "
-            "FOR EACH ROW EXECUTE FUNCTION preserve_website_projection()"))
-        await connection.execute(text(
-            "UPDATE delivery_attempts SET expected_settling_revision=NULL,"
-            "fenced_settling_revision=NULL"))
-        await connection.execute(text(
-            "UPDATE delivery_reconciliations SET expected_settling_revision=NULL,"
-            "result_settling_revision=NULL"))
+        await connection.execute(
+            text(
+                "CREATE TRIGGER preserve_website_projection BEFORE UPDATE ON agent_turns "
+                "FOR EACH ROW EXECUTE FUNCTION preserve_website_projection()"
+            )
+        )
+        await connection.execute(
+            text(
+                "UPDATE delivery_attempts SET expected_settling_revision=NULL,"
+                "fenced_settling_revision=NULL"
+            )
+        )
+        await connection.execute(
+            text(
+                "UPDATE delivery_reconciliations SET expected_settling_revision=NULL,"
+                "result_settling_revision=NULL"
+            )
+        )
 
     retained_0005 = await goal4b_rows(sql)
     await h.database.dispose()
@@ -702,29 +891,45 @@ async def test_goal4b_retained_state_matrix_upgrades_without_rewriting_history(
     assert await goal4b_rows(sql) == retained_0005
 
     async with sql.connect() as connection:
-        statuses = set((await connection.scalars(text(
-            "SELECT status FROM agent_turns"
-        ))).all())
+        statuses = set((await connection.scalars(text("SELECT status FROM agent_turns"))).all())
         assert {"PENDING", "CLAIMED", "COMPLETED", "FAILED"} <= statuses
         # Goal4B Website keeps transport status UNKNOWN while retaining a
         # separate WRITE_COMPLETED response fact; the generic row is also UNKNOWN.
-        assert await connection.scalar(text(
-            "SELECT count(*) FROM delivery_attempts WHERE status='UNKNOWN'"
-        )) == 2
-        assert await connection.scalar(text(
-            "SELECT count(*) FROM delivery_attempts WHERE status='PROVIDER_ACCEPTED'"
-        )) >= 2
-        assert await connection.scalar(text(
-            "SELECT count(*) FROM messages WHERE actor='AGENT' AND source_agent_turn_id IS NOT NULL"
-        )) >= 2
-        assert await connection.scalar(text(
-            "SELECT count(*) FROM turn_input_messages WHERE message_id=:id"
-        ), {"id": overlap_message_id}) == 0
-        assert await connection.scalar(text(
-            "SELECT count(*) FROM turn_input_messages"
-        )) == await connection.scalar(text(
-            "SELECT count(*) FROM messages WHERE actor='CUSTOMER' AND direction='INBOUND'"
-        )) - 1
+        assert (
+            await connection.scalar(
+                text("SELECT count(*) FROM delivery_attempts WHERE status='UNKNOWN'")
+            )
+            == 2
+        )
+        assert (
+            await connection.scalar(
+                text("SELECT count(*) FROM delivery_attempts WHERE status='PROVIDER_ACCEPTED'")
+            )
+            >= 2
+        )
+        assert (
+            await connection.scalar(
+                text(
+                    "SELECT count(*) FROM messages WHERE actor='AGENT' "
+                    "AND source_agent_turn_id IS NOT NULL"
+                )
+            )
+            >= 2
+        )
+        assert (
+            await connection.scalar(
+                text("SELECT count(*) FROM turn_input_messages WHERE message_id=:id"),
+                {"id": overlap_message_id},
+            )
+            == 0
+        )
+        assert (
+            await connection.scalar(text("SELECT count(*) FROM turn_input_messages"))
+            == await connection.scalar(
+                text("SELECT count(*) FROM messages WHERE actor='CUSTOMER' AND direction='INBOUND'")
+            )
+            - 1
+        )
 
     replay = await h.call(
         "POST", f"/delivery-attempts/{unknown_attempt['id']}/reconcile", legacy_replay
@@ -737,9 +942,10 @@ async def test_goal4b_retained_state_matrix_upgrades_without_rewriting_history(
 async def test_goal5_reconciliation_fingerprint_replay_is_stable(h, sql):
     accepted, attempt, _ = await h.delivery()
     async with sql.connect() as connection:
-        settling_revision = await connection.scalar(text(
-            "SELECT settling_revision FROM conversations WHERE id=:id"
-        ), {"id": accepted["conversation"]["id"]})
+        settling_revision = await connection.scalar(
+            text("SELECT settling_revision FROM conversations WHERE id=:id"),
+            {"id": accepted["conversation"]["id"]},
+        )
     body = {
         "reconciliation_key": str(uuid4()),
         "expected_revision": attempt["revision"],
@@ -753,10 +959,15 @@ async def test_goal5_reconciliation_fingerprint_replay_is_stable(h, sql):
     replay = await h.call("POST", f"/delivery-attempts/{attempt['id']}/reconcile", body)
     assert replay.status_code == 200 and replay.json()["replayed"] is True
     async with sql.connect() as connection:
-        retained = (await connection.execute(text(
-            "SELECT fingerprint,expected_settling_revision,result_settling_revision "
-            "FROM delivery_reconciliations WHERE delivery_attempt_id=:id"),
-            {"id": attempt["id"]})).all()
+        retained = (
+            await connection.execute(
+                text(
+                    "SELECT fingerprint,expected_settling_revision,result_settling_revision "
+                    "FROM delivery_reconciliations WHERE delivery_attempt_id=:id"
+                ),
+                {"id": attempt["id"]},
+            )
+        ).all()
     assert len(retained) == 1
     assert retained[0][1:] == (settling_revision, settling_revision)
 
@@ -862,27 +1073,65 @@ async def test_0008_backfills_and_retains_nonzero_authority_input_floor(h, sql, 
     await h.database.dispose()
     migrate(database_url, "downgrade", "0007_voice_bridge")
     async with sql.begin() as connection:
-        await connection.execute(text(
-            "UPDATE conversations SET authority_revision=2 "
-            "WHERE id=:id"
-        ), {"id": conversation_id})
+        await connection.execute(
+            text("UPDATE conversations SET authority_revision=2 WHERE id=:id"),
+            {"id": conversation_id},
+        )
     migrate(database_url, "upgrade", "head")
     assert await h.database.ready()
     async with sql.connect() as connection:
-        floor, tail = (await connection.execute(text(
-            "SELECT authority_input_floor_sequence,last_message_sequence "
-            "FROM conversations WHERE id=:id"
-        ), {"id": conversation_id})).one()
+        floor, tail = (
+            await connection.execute(
+                text(
+                    "SELECT authority_input_floor_sequence,last_message_sequence "
+                    "FROM conversations WHERE id=:id"
+                ),
+                {"id": conversation_id},
+            )
+        ).one()
     assert floor == tail == 2
 
     rejected = migrate(database_url, "downgrade", "0007_voice_bridge", expected=1)
     assert "Business effect authority evidence is retained" in rejected.stderr
     assert await h.database.ready()
     async with sql.connect() as connection:
-        retained = await connection.scalar(text(
-            "SELECT authority_input_floor_sequence FROM conversations WHERE id=:id"
-        ), {"id": conversation_id})
+        retained = await connection.scalar(
+            text("SELECT authority_input_floor_sequence FROM conversations WHERE id=:id"),
+            {"id": conversation_id},
+        )
     assert retained == 2
+
+
+async def test_0009_keeps_historical_delivery_outside_telegram_fifo(h, sql, database_url):
+    accepted, turn = await h.draft()
+    await h.database.dispose()
+    migrate(database_url, "downgrade", "0008_business_effect_permits")
+    attempt_id, delivery_key = uuid4(), uuid4()
+    async with sql.begin() as connection:
+        await connection.execute(
+            text(
+                "INSERT INTO delivery_attempts "
+                "(id,conversation_id,delivery_key,source_turn_id,creation_fingerprint,"
+                "authority_revision,status,revision,created_at,updated_at) "
+                "VALUES (:id,:conversation,:key,:turn,:fingerprint,0,'GENERATED',0,"
+                "clock_timestamp(),clock_timestamp())"
+            ),
+            {
+                "id": attempt_id,
+                "conversation": accepted["conversation"]["id"],
+                "key": delivery_key,
+                "turn": turn["id"],
+                "fingerprint": "e" * 64,
+            },
+        )
+    migrate(database_url, "upgrade", "head")
+    assert await h.database.ready()
+    async with sql.connect() as connection:
+        ordinal = await connection.scalar(
+            text("SELECT outbound_ordinal FROM delivery_attempts WHERE id=:id"),
+            {"id": attempt_id},
+        )
+    assert ordinal is None
 
 
 async def test_0008_downgrade_refuses_retained_immutable_permit(h, sql, database_url):

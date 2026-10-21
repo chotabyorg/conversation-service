@@ -109,6 +109,12 @@ class DeliveryErrorCode(str, Enum):
 
 class ErrorCode(str, Enum):
     UNAUTHENTICATED = "UNAUTHENTICATED"
+    FORBIDDEN = "FORBIDDEN"
+    COMMAND_CONFLICT = "COMMAND_CONFLICT"
+    REVISION_CONFLICT = "REVISION_CONFLICT"
+    GRANT_CONFLICT = "GRANT_CONFLICT"
+    HANDOFF_CONFLICT = "HANDOFF_CONFLICT"
+    TELEGRAM_WRITER_LIVE = "TELEGRAM_WRITER_LIVE"
     NOT_FOUND = "NOT_FOUND"
     EVENT_CONFLICT = "EVENT_CONFLICT"
     TURN_SELECTION_CONFLICT = "TURN_SELECTION_CONFLICT"
@@ -273,9 +279,18 @@ class ScopeGrant(Contract):
 class Principal(Contract):
     model_config = ConfigDict(extra="forbid", frozen=True)
     principal_id: WorkerRef
-    role: Literal["FULL", "WEBSITE", "PROCESSING", "TELEGRAM", "TELEGRAM_PROCESSING",
-                  "VOICE", "VOICE_PROCESSING", "BUSINESS_EFFECT"] = "FULL"
-    grants: tuple[ScopeGrant, ...] = Field(min_length=1, max_length=64)
+    role: Literal[
+        "FULL",
+        "WEBSITE",
+        "PROCESSING",
+        "TELEGRAM",
+        "TELEGRAM_PROCESSING",
+        "VOICE",
+        "VOICE_PROCESSING",
+        "BUSINESS_EFFECT",
+        "INBOX_LIFECYCLE",
+    ] = "FULL"
+    grants: tuple[ScopeGrant, ...] = Field(default=(), max_length=64)
 
 
 class OperationReference(Contract):
@@ -478,9 +493,11 @@ class DeliveryReconcile(Contract):
             raise ValueError("invalid authority evidence")
         if (self.expected_settling_revision is None) != (self.result_settling_revision is None):
             raise ValueError("invalid settling evidence")
-        if (self.expected_settling_revision is not None
+        if (
+            self.expected_settling_revision is not None
                 and self.result_settling_revision is not None
-                and self.result_settling_revision < self.expected_settling_revision):
+            and self.result_settling_revision < self.expected_settling_revision
+        ):
             raise ValueError("invalid settling evidence")
         if self.error_code is not None and self.status not in {
             DeliveryStatus.FAILED,

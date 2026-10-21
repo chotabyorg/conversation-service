@@ -5,9 +5,10 @@ from uuid import UUID, uuid4
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
+from core.config import Settings
 from core.errors import DomainError
 from db.database import Database
-from models import AgentTurn, Conversation, DeliveryAttempt, DeliveryReconciliation
+from models import AgentTurn, Conversation, DeliveryAttempt, DeliveryReconciliation, InboxGrantScope
 from schemas.contracts import (
     DeliveryAttemptRead,
     DeliveryCreate,
@@ -23,6 +24,7 @@ from services.common import (
     fingerprint,
     locked_delivery,
     scope_filter,
+    telegram_handoff_was_ever_enrolled,
     unique_violation,
 )
 
@@ -70,7 +72,12 @@ def _reconciliation_fingerprint(delivery_attempt_id: UUID, request: DeliveryReco
 
 
 async def create_delivery(
-    database: Database, principal: Principal, conversation_id: UUID, request: DeliveryCreate
+    database: Database,
+    principal: Principal,
+    conversation_id: UUID,
+    request: DeliveryCreate,
+    *,
+    settings: Settings | None = None,
 ) -> DeliveryResult:
     digest = fingerprint(
         {
@@ -81,12 +88,10 @@ async def create_delivery(
     )
     try:
         async with database.session_factory() as session, session.begin():
-            conversation = await authorized_conversation(
-                session, principal, conversation_id, lock=True
-            )
+            probe = await authorized_conversation(session, principal, conversation_id)
             existing = await session.scalar(
                 select(DeliveryAttempt).where(
-                    DeliveryAttempt.conversation_id == conversation.id,
+                    DeliveryAttempt.conversation_id == probe.id,
                     DeliveryAttempt.delivery_key == request.delivery_key,
                 )
             )
@@ -97,6 +102,65 @@ async def create_delivery(
                     attempt=DeliveryAttemptRead.model_validate(existing), replayed=True
                 )
             else:
+                source_probe = await session.scalar(
+                    select(AgentTurn).where(
+                        AgentTurn.id == request.source_turn_id,
+                        AgentTurn.conversation_id == probe.id,
+                    )
+                )
+                if source_probe is None:
+                    raise DomainError(ErrorCode.NOT_FOUND)
+                if probe.channel == "TELEGRAM":
+                    from services.telegram import _ever_enrolled, _locked_handoff_scope_values
+
+                    agent_ids = set(
+                        (
+                            await session.scalars(
+                                select(InboxGrantScope.agent_id).where(
+                                    InboxGrantScope.owner_id == probe.owner_id,
+                                    InboxGrantScope.integration_id == probe.integration_id,
+                                    InboxGrantScope.channel == "TELEGRAM",
+                                )
+                            )
+                        ).all()
+                    )
+                    if source_probe.managed_projection_agent_id is not None:
+                        agent_ids.add(source_probe.managed_projection_agent_id)
+                    if settings is not None:
+                        agent_ids.update(
+                            binding.agent_id
+                            for binding in settings.managed_ai_bindings
+                            if binding.channel.value == "TELEGRAM"
+                            and binding.owner_id == probe.owner_id
+                            and binding.integration_id == probe.integration_id
+                        )
+                    handoff_scopes = [
+                        await _locked_handoff_scope_values(
+                            session, probe.owner_id, probe.integration_id, agent_id
+                        )
+                        for agent_id in sorted(agent_ids, key=str)
+                    ]
+                    if any(_ever_enrolled(scope) for scope in handoff_scopes):
+                        raise DomainError(ErrorCode.HANDOFF_CONFLICT)
+
+                conversation = await authorized_conversation(
+                    session, principal, conversation_id, lock=True
+                )
+                existing = await session.scalar(
+                    select(DeliveryAttempt).where(
+                        DeliveryAttempt.conversation_id == conversation.id,
+                        DeliveryAttempt.delivery_key == request.delivery_key,
+                    )
+                )
+                if existing is not None:
+                    if existing.creation_fingerprint != digest:
+                        raise DomainError(ErrorCode.DELIVERY_IDENTITY_CONFLICT)
+                    result = DeliveryResult(
+                        attempt=DeliveryAttemptRead.model_validate(existing), replayed=True
+                    )
+                    return result
+                if await telegram_handoff_was_ever_enrolled(session, conversation):
+                    raise DomainError(ErrorCode.HANDOFF_CONFLICT)
                 source = await session.scalar(
                     select(AgentTurn)
                     .where(
@@ -178,12 +242,42 @@ def merged_reference(current: str | None, reported: str | None) -> str | None:
     return reported if reported is not None else current
 
 
+def _telegram_v2_owned(attempt: DeliveryAttempt) -> bool:
+    """Keep supplier-owned v2 intents out of the legacy operator reconciler."""
+    return bool(
+        attempt.source_message_id is not None
+        or attempt.case_id is not None
+        or attempt.case_revision is not None
+        or attempt.assignment_revision is not None
+        or attempt.grant_generation is not None
+        or attempt.writer_state != "NONE"
+        or attempt.writer_supplier_instance_id is not None
+        or attempt.writer_process_incarnation_id is not None
+    )
+
+
 async def reconcile_delivery(
     database: Database, principal: Principal, delivery_attempt_id: UUID, request: DeliveryReconcile
 ) -> DeliveryReconcileResult:
     digest = _reconciliation_fingerprint(delivery_attempt_id, request)
     async with database.session_factory() as session, session.begin():
+        # v2 supplier attempts have a different owner for provider truth and
+        # writer retirement. Reject before taking the parent lock so this
+        # endpoint cannot deadlock with the v2 scope -> Conversation -> intent
+        # order or fabricate evidence that strands a LIVE writer.
+        probe = await session.scalar(
+            select(DeliveryAttempt).where(
+                DeliveryAttempt.id == delivery_attempt_id,
+                DeliveryAttempt.conversation_id.in_(
+                    select(Conversation.id).where(scope_filter(principal))
+                ),
+            )
+        )
+        if probe is None or _telegram_v2_owned(probe):
+            raise DomainError(ErrorCode.NOT_FOUND)
         conversation, attempt = await locked_delivery(session, principal, delivery_attempt_id)
+        if _telegram_v2_owned(attempt):
+            raise DomainError(ErrorCode.NOT_FOUND)
         previous = await session.scalar(
             select(DeliveryReconciliation).where(
                 DeliveryReconciliation.delivery_attempt_id == attempt.id,
