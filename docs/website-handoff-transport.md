@@ -26,12 +26,16 @@ unchanged. They cannot be promoted to a private mailbox by knowing their UUID.
 1. A new public `POST /v1/sessions` accepts only the widget key, not a requested
    existing session ID. Gateway revalidates the integration with Control Plane
    and derives owner/integration/agent from that trusted response.
-2. Gateway generates a fresh cryptographic session UUID and 256-bit random
-   bearer capability. A dedicated private Conversation creation call atomically
-   reserves that exact new canonical session/root and its capability digest.
+2. Gateway requests a fresh session from a dedicated private Conversation port.
+   Conversation generates the cryptographic UUID and 256-bit random bearer
+   capability and atomically reserves that new canonical root and credential.
    An existing root or credential collision fails; there is no attach/takeover
-   branch. The database retains only the digest, scope, issue/expiry times and
-   binding generation. The raw secret is returned once, never logged or placed
+   branch. The credential retains only the digest, exact scope, issue/expiry
+   times and the common grant epoch with both supplier proof generations at
+   issuance (`cp_binding_generation`, `agent_lifecycle_generation`). Their
+   independent revocation high-water marks remain durable in the same shared
+   `InboxGrantScope`; do not create a second Website lifecycle store. The raw
+   secret is returned once, never logged or placed
    in a URL. A lost create response may create another empty session, not recover
    access to the first session's history.
 3. Browser keeps session ID and capability together in tab sessionStorage under
@@ -41,12 +45,23 @@ unchanged. They cannot be promoted to a private mailbox by knowing their UUID.
 4. New mailbox/chat requests carry `X-Widget-Session-Token`. Gateway validates the
    current widget binding and passes the capability through a restricted private
    Website port. Conversation verifies its digest in constant time and the exact
-   owner/integration/channel/agent/session/generation before any content read,
-   admission or send acquisition. Possessing the public key alone is insufficient.
+   owner/integration/channel/agent/session before any content read, admission or
+   send acquisition. In that same scope-before-root transaction, require the
+   common grant to be active at the credential's grant epoch and both retained
+   proof generations to match the current shared grant and exceed their
+   independent retained revocation high-water marks. Both current supplier
+   proofs must validate through the common lifecycle path. Restart, rolled-back
+   static config, re-enrollment or one fresh supplier proof cannot revive an
+   old capability. Possessing the public key alone is insufficient.
    Capability checks do not grant HUMAN authority, an AI permit or owner access.
 5. Expiry/revocation blocks fresh work. The matching original adapter may still
    submit late evidence for an already acquired attempt through its internal
    principal. Evidence replay cannot disclose text to an unauthenticated browser.
+   Revoked session bindings and the common grant high-water marks survive restart;
+   revocation and re-enrollment never reset or delete those floors. A fresh grant
+   epoch requires a fresh session credential, not automatic promotion of an old
+   credential. A credential-only issuance/check helper is not content access
+   authorization and cannot be exposed until these shared checks are composed.
 
 The additive session table is a credential binding, not a second history or
 authority table. Creation and enrollment must retain grant-scope before root
