@@ -226,13 +226,17 @@ async def test_nonpositive_or_mismatched_proof_keeps_writer_live(
     assert (await return_to_agent(h, ids, return_command(sent))).status_code == 409
 
 
-@pytest.mark.parametrize("raw", [b'{"fenced":true,"fenced":false}', b"not-json",
-                                     b"x" * 16_385])
+@pytest.mark.parametrize("raw", [b'{"fenced":true,"fenced":false}', b"not-json", None])
 async def test_invalid_or_oversized_proof_cannot_release_writer(
     writer_harness, proof_transport, user_me_transport, raw,
 ):
     h = writer_harness
     _, _, _, command = await acquired(h)
+    if raw is None:
+        raw = json.dumps(dict(command,
+            request_fingerprint=fingerprint(command),
+            proof_kind="PROCESS_TERMINATED", fenced=True, tasks_ended=True,
+            observed_at=datetime.now(UTC).isoformat())).encode() + b" " * 16_385
     proof_transport.raw = raw
     response = await h.client.post(RETIRE, json=command, headers=h.retirement_headers)
     assert response.status_code == 503
