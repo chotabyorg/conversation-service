@@ -1,0 +1,75 @@
+name: Managed Business compatibility pair
+
+on:
+  pull_request:
+    paths:
+      - api/**
+      - core/**
+      - db/**
+      - migrations/**
+      - models/**
+      - schemas/**
+      - services/**
+      - tests/**
+      - main.py
+      - worker.py
+      - voice_worker.py
+      - requirements*.txt
+      - alembic.ini
+      - .github/workflows/managed-business-pair.yml
+
+permissions:
+  contents: read
+
+jobs:
+  paired-native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      AI_REVISION: b90b19cdf6f203ab1716bce04c01fe77c641559a
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: conversation
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: chotabyorg/ai-agent-service
+          ref: ${{ env.AI_REVISION }}
+          path: ai
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.11'
+      - name: Install separate pinned environments
+        run: |
+          python -m venv ai/.venv
+          python -m venv conversation/.venv
+          ai/.venv/bin/python -m pip install -r ai/requirements.txt
+          conversation/.venv/bin/python -m pip install -r conversation/requirements-dev.txt
+          ai/.venv/bin/python -m pip check
+          conversation/.venv/bin/python -m pip check
+      - name: Start native disposable PostgreSQL 16
+        run: |
+          sudo systemctl start postgresql
+          sudo -u postgres psql -v ON_ERROR_STOP=1 -c "CREATE ROLE compatibility_ci LOGIN SUPERUSER PASSWORD 'isolated_compatibility_fixture';"
+      - name: Verify exact HTTP and Business pair
+        working-directory: ai
+        run: |
+          test "$(git rev-parse HEAD)" = "$AI_REVISION"
+          .venv/bin/python tests/run_managed_compatibility_ci.py \
+            --cs-root "$GITHUB_WORKSPACE/conversation" \
+            --expected-cs-revision "${{ github.event.pull_request.head.sha }}" \
+            --pg-bin /usr/lib/postgresql/16/bin \
+            --output "$RUNNER_TEMP/managed-business-pair"
+      - name: Upload sanitized pair evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: managed-business-pair-${{ github.event.pull_request.head.sha }}
+          path: ${{ runner.temp }}/managed-business-pair/summary.json
+          if-no-files-found: error
+          retention-days: 30
