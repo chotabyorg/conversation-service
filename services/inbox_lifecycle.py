@@ -575,15 +575,24 @@ async def revoke_grant(
         if prior is not None:
             result = _replay(prior, digest, kind, ack_model)
         else:
+            already_fenced = False
             if isinstance(request, CpGrantRevoke):
                 source = request.source_binding_generation
                 target = request.target_binding_generation
                 high_water = scope.cp_binding_high_water
-                if target <= (high_water if high_water is not None else -1) or (
-                    scope.cp_binding_generation is not None and scope.cp_binding_generation > source
+                already_fenced = (
+                    not scope.active and high_water is not None and high_water >= target
+                )
+                if not already_fenced and (
+                    target <= (high_water if high_water is not None else -1)
+                    or (
+                        scope.cp_binding_generation is not None
+                        and scope.cp_binding_generation > source
+                    )
                 ):
                     raise DomainError(ErrorCode.GRANT_CONFLICT)
-                scope.cp_binding_high_water = target
+                if not already_fenced:
+                    scope.cp_binding_high_water = target
                 source_binding_generation = source
                 target_binding_generation = target
             else:
@@ -606,13 +615,14 @@ async def revoke_grant(
                 agent_owner_id = request.agent_owner_id
                 source_agent_lifecycle_generation = source
                 target_agent_lifecycle_generation = target
-            clock = await db_clock(session)
-            scope.active = False
-            # The source high-water transition is itself an effective revoke even
-            # when no Conversation or active grant existed yet.
-            scope.grant_generation += 1
-            scope.updated_at = clock
-            await _fence_grant_outbound(session, scope, clock)
+            if not already_fenced:
+                clock = await db_clock(session)
+                scope.active = False
+                # The source high-water transition is itself an effective revoke even
+                # when no Conversation or active grant existed yet.
+                scope.grant_generation += 1
+                scope.updated_at = clock
+                await _fence_grant_outbound(session, scope, clock)
             if isinstance(request, CpGrantRevoke):
                 ack: CpGrantRevoked | AiGrantRevoked = CpGrantRevoked(
                     contract_version=1,
@@ -628,6 +638,7 @@ async def revoke_grant(
                     lifecycle_source="CONTROL_PLANE_BINDING",
                     source_binding_generation=source_binding_generation,
                     target_binding_generation=target_binding_generation,
+                    binding_generation_fence=scope.cp_binding_high_water,
                 )
             else:
                 ack = AiGrantRevoked(

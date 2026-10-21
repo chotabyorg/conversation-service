@@ -258,6 +258,13 @@ fingerprint, command ID and replay flag. Revoke holds scope then sorted root loc
 advances each root's shared Goal5 authority/input floor, retires fresh sends and
 preserves previously acquired writers/evidence. Pending CP/AI lifecycle state
 denies proof until the exact matching ACK is committed.
+For a new CP command whose target is already covered by the retained CP high-water,
+Conversation may ACK only while that exact scope is inactive under its scope lock.
+The ACK includes `binding_generation_fence`; CP retains this floor before a later
+activation/enrollment. This records a receipt in the same lifecycle journal without
+advancing authority again, changing an UNKNOWN outcome, or releasing a LIVE writer.
+An active scope still conflicts. A 409 or missing/invalid ACK never clears CP's hold.
+Old immutable ACKs without the additional floor retain their original target fence.
 After an AI-only revoke, CP may still cache its grant as active. CP must
 complete its deactivate/activate lifecycle before a fresh provision can enroll
 the binding again.

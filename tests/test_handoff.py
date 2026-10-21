@@ -1502,6 +1502,71 @@ async def test_cp_revoke_hides_case_and_denies_applied_owner_command_replay(
         assert receipt_count == 2
 
 
+@pytest.mark.asyncio
+async def test_covered_cp_revoke_acknowledges_only_inactive_scope_without_refencing(
+    inbox_harness, monkeypatch
+):
+    ids = await seed_case(inbox_harness.database)
+    scope_id = (OWNER, INTEGRATION, "TELEGRAM", AGENT)
+    base = dict(contract_version=1, lifecycle_source="CONTROL_PLANE_BINDING",
+                owner_id=OWNER, integration_id=INTEGRATION, channel="TELEGRAM", agent_id=AGENT)
+    ahead = CpGrantRevoke(**base, command_id=uuid4(),
+                         source_binding_generation=4, target_binding_generation=5)
+    await inbox_lifecycle.revoke_grant(inbox_harness.database, inbox_harness.settings, ahead)
+    async with inbox_harness.database.session_factory() as session:
+        root = await session.get(Conversation, ids["conversation_id"])
+        assert root is not None
+        revision = root.authority_revision
+
+    covered = CpGrantRevoke(**base, command_id=uuid4(),
+                           source_binding_generation=1, target_binding_generation=2)
+    path = "/internal/v1/inbox-grants/revoke"
+    ack = await inbox_harness.client.post(path, json=covered.model_dump(mode="json"),
+                                          headers=inbox_harness.cp_lifecycle_headers)
+    assert ack.status_code == 200
+    assert ack.json()["binding_generation_fence"] == 5
+    assert ack.json()["grant_generation"] == 2 and ack.json()["active"] is False
+    replay = await inbox_harness.client.post(path, json=covered.model_dump(mode="json"),
+                                             headers=inbox_harness.cp_lifecycle_headers)
+    assert replay.status_code == 200 and replay.json()["replayed"] is True
+    assert replay.json()["request_fingerprint"] == ack.json()["request_fingerprint"]
+    changed = covered.model_copy(update={"source_binding_generation": 2,
+                                         "target_binding_generation": 3})
+    conflict = await inbox_harness.client.post(path, json=changed.model_dump(mode="json"),
+                                               headers=inbox_harness.cp_lifecycle_headers)
+    assert conflict.status_code == 409
+    async with inbox_harness.database.session_factory() as session:
+        scope = await session.get(InboxGrantScope, scope_id)
+        root = await session.get(Conversation, ids["conversation_id"])
+        assert scope is not None and not scope.active and scope.cp_binding_high_water == 5
+        assert scope.grant_generation == 2
+        assert root is not None and root.authority_revision == revision
+
+    async def proofs(_settings, request):
+        return lifecycle_proofs(request, binding_generation=request.expected_binding_generation)
+
+    monkeypatch.setattr(inbox_lifecycle, "_current_proofs", proofs)
+    provision = InboxGrantProvision(contract_version=1, command_id=uuid4(), owner_id=OWNER,
+        integration_id=INTEGRATION, channel="TELEGRAM", agent_id=AGENT,
+        expected_binding_generation=3)
+    with pytest.raises(DomainError) as stale:
+        await inbox_lifecycle.provision_grant(
+            inbox_harness.database, inbox_harness.settings, provision)
+    assert stale.value.code == ErrorCode.GRANT_CONFLICT
+    fresh = provision.model_copy(update={"command_id": uuid4(), "expected_binding_generation": 6})
+    enrolled = await inbox_lifecycle.provision_grant(
+        inbox_harness.database, inbox_harness.settings, fresh)
+    assert enrolled.active and enrolled.grant_generation == 3
+    active_conflict = await inbox_harness.client.post(path,
+        json=covered.model_copy(update={"command_id": uuid4()}).model_dump(mode="json"),
+        headers=inbox_harness.cp_lifecycle_headers)
+    assert active_conflict.status_code == 409
+    async with inbox_harness.database.session_factory() as session:
+        scope = await session.get(InboxGrantScope, scope_id)
+        assert scope is not None and scope.active and scope.cp_binding_generation == 6
+        assert scope.grant_generation == 3 and scope.cp_binding_high_water == 5
+
+
 @pytest.mark.parametrize("managed_version", [1, 2])
 @pytest.mark.asyncio
 async def test_revoke_retires_unmarked_legacy_claim_before_first_dispatch(

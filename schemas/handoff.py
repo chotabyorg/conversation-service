@@ -241,6 +241,16 @@ class CpGrantRevoked(InboxGrantRevokedBase):
     lifecycle_source: Literal["CONTROL_PLANE_BINDING"]
     source_binding_generation: Generation
     target_binding_generation: PositiveGeneration
+    # Absent on immutable receipts written by an older reader.
+    binding_generation_fence: Generation | None = None
+
+    @model_validator(mode="after")
+    def retained_fence_covers_target(self) -> CpGrantRevoked:
+        if self.binding_generation_fence is None:
+            self.binding_generation_fence = self.target_binding_generation
+        if self.binding_generation_fence < self.target_binding_generation:
+            raise ValueError("invalid lifecycle fence")
+        return self
 
 
 class AiGrantRevoked(InboxGrantRevokedBase):
