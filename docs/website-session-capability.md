@@ -23,7 +23,7 @@ or disabling the port also denies access. The gateway's dynamic CP validation is
 still required in the transport implementation; this source slice is not proof
 of live CP freshness.
 
-`WEBSITE_SESSION_TTL_SECONDS` is server controlled, 60–86400 seconds (default24h).
+`WEBSITE_SESSION_TTL_SECONDS` is server controlled, 60вЂ“86400 seconds (default 24h).
 The DB clock sets issue/expiry and is checked after the canonical root lock.
 `locked_access` checks the full grant, current server generation, agent, session,
 digest, revocation and expiry inside the caller's transaction. All credential
@@ -41,3 +41,7 @@ CP-backed generation lifecycle, authenticated canonical history, shared Website
 Inbox enrollment and writer barriers, bounded idle delivery and original-intent
 recovery. Those must ship together behind their own empty cohort; do not enable
 Handoff merely because this issuance port exists.
+
+Credential validation alone grants no content access. The transport must also check
+the shared active grant epoch, both supplier proofs and their durable revocation
+floors before any content read/admit/send; this helper is not that combined gate.

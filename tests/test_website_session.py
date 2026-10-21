@@ -57,7 +57,7 @@ def access(sh, created, **changes):
 
 async def authorized(sh, request, settings=None):
     async with sh.database.session_factory() as session, session.begin():
-        return await website_session.locked_access(
+        return await website_session.locked_credential(
             session, sh.settings.auth_principals[0].principal(), request, settings or sh.settings,
         )
 
@@ -86,7 +86,7 @@ async def test_create_only_no_history_raw_secret_or_recoverable_response(sh, sql
     # A new app/engine sees retained authorization; no in-process token registry.
     async with app_client(sh.settings, database_url) as (_, database):
         async with database.session_factory() as session, session.begin():
-            restored = await website_session.locked_access(
+            restored = await website_session.locked_credential(
                 session, sh.settings.auth_principals[0].principal(), access(sh, first), sh.settings)
             assert restored.id == root.id
     response = await sh.call("POST", "/website/sessions", dict(

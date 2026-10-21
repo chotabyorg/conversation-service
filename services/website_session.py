@@ -80,13 +80,15 @@ async def create(
     )
 
 
-async def locked_access(
+async def locked_credential(
     session: AsyncSession, principal: Principal, request: WebsiteSessionAccess, settings: Settings,
 ) -> Conversation:
-    """Check digest, full scope and post-lock DB expiry before accessing content.
+    """Check only the visitor credential; this does not authorize content access.
 
     Caller owns the transaction and must keep it through the protected operation.
     Revocation takes this same root lock. A failed check exposes no root metadata.
+    Future content paths must also validate the common active grant epoch, both
+    supplier proofs and their durable revocation floors in this transaction.
     """
     if not session.in_transaction():
         raise RuntimeError("Website capability access requires the caller transaction")
