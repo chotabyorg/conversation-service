@@ -4,14 +4,14 @@ from uuid import UUID
 
 from pydantic import Field, SecretStr, field_serializer
 
-from schemas.contracts import Contract, OwnerId
+from schemas.contracts import Contract, OwnerId, PositiveCounter
 
 
 class WebsiteSessionScope(Contract):
     owner_id: OwnerId
     integration_id: UUID
     agent_id: UUID
-    binding_generation: int = Field(ge=1, le=9223372036854775807)
+    binding_generation: PositiveCounter
 
 
 class WebsiteSessionCreated(Contract):
