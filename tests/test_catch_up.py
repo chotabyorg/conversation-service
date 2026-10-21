@@ -376,7 +376,7 @@ async def test_malformed_oldest_candidate_does_not_block_another_conversation(
     settings = enable(h)
     await add(h, sql, 0)
     async with sql.begin() as connection:
-        await connection.execute(update(TelegramAdmission).values(route="LEGACY"))
+        await connection.execute(update(TelegramAdmission).values(agent_id=uuid4()))
     other = await telegram_admit(h["client"], h["gateway_headers"],
                                  message_id=8, update_id=56, chat_id=456)
     assert other.status_code == 200
