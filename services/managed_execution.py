@@ -35,12 +35,14 @@ from schemas.contracts import (
     TurnResult,
 )
 from schemas.managed import (
+    DEFAULT_MAX_PARTIAL_CHARS,
     MAX_RESULT_BYTES,
     ManagedMessage,
     ManagedTurnRequest,
     ManagedTurnResult,
     PreparedManagedRequest,
     prepare_request,
+    prepare_request_for_fingerprint,
 )
 from services import telegram, turns
 from services.common import db_clock, locked_turn
@@ -65,6 +67,7 @@ class Snapshot:
     messages: tuple[ManagedMessage, ...]
     contract_version: int
     projection_fingerprint: str | None
+    dispatch_fingerprint: str | None
 
 
 @dataclass(frozen=True)
@@ -176,7 +179,8 @@ async def take_snapshot(
         messages = await canonical_window(session, conversation.id,
             turn.managed_context_first_sequence, turn.context_last_sequence)
         snapshot = Snapshot(TurnRead.model_validate(turn), *scope, binding, messages,
-                            turn.managed_contract_version, turn.managed_projection_fingerprint)
+                            turn.managed_contract_version, turn.managed_projection_fingerprint,
+                            turn.managed_request_fingerprint)
         prepare_snapshot(snapshot)
         return snapshot
 
@@ -204,12 +208,17 @@ def prepare_snapshot(snapshot: Snapshot) -> PreparedManagedRequest:
                 if turn.input_first_sequence <= message.sequence <= turn.input_last_sequence
             ),
             stream_partials=stream_partials_for(snapshot.channel, snapshot.contract_version),
+            max_partial_chars=DEFAULT_MAX_PARTIAL_CHARS,
         )
-        prepared = prepare_request(request)
-        if ((snapshot.projection_fingerprint is not None
-                and prepared.fingerprint != snapshot.projection_fingerprint)
-                or (snapshot.contract_version == 2 and snapshot.projection_fingerprint is None)):
+        if (snapshot.projection_fingerprint is not None
+                and snapshot.dispatch_fingerprint is not None
+                and snapshot.projection_fingerprint != snapshot.dispatch_fingerprint):
+            raise ValueError("projection and dispatch fingerprints disagree")
+        expected = snapshot.projection_fingerprint or snapshot.dispatch_fingerprint
+        if snapshot.contract_version == 2 and snapshot.projection_fingerprint is None:
             raise ValueError("frozen projection changed")
+        prepared = (prepare_request_for_fingerprint(request, expected)
+                    if expected is not None else prepare_request(request))
         return prepared
     except (ValueError, TypeError):
         raise DomainError(ErrorCode.VALIDATION_ERROR) from None
@@ -243,9 +252,19 @@ async def mark_dispatch(
             current = projected_request(turn, conversation, prepared.request.agent_id, messages)
         except ValueError:
             raise DomainError(ErrorCode.VALIDATION_ERROR) from None
-        if (current.fingerprint != prepared.fingerprint or current.body != prepared.body
-                or (turn.managed_contract_version == 2
-                    and current.fingerprint != turn.managed_projection_fingerprint)):
+        if (turn.managed_projection_fingerprint is not None
+                and turn.managed_request_fingerprint is not None
+                and turn.managed_projection_fingerprint != turn.managed_request_fingerprint):
+            raise DomainError(ErrorCode.VALIDATION_ERROR)
+        expected = turn.managed_projection_fingerprint or turn.managed_request_fingerprint
+        if turn.managed_contract_version == 2 and turn.managed_projection_fingerprint is None:
+            raise DomainError(ErrorCode.VALIDATION_ERROR)
+        try:
+            selected = (prepare_request_for_fingerprint(current.request, expected)
+                        if expected is not None else current)
+        except ValueError:
+            raise DomainError(ErrorCode.VALIDATION_ERROR) from None
+        if selected.fingerprint != prepared.fingerprint or selected.body != prepared.body:
             raise DomainError(ErrorCode.VALIDATION_ERROR)
         turn.managed_agent_id = prepared.request.agent_id
         turn.managed_dispatch_epoch = proof.claim_epoch

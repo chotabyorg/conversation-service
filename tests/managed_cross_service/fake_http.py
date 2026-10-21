@@ -21,6 +21,28 @@ def completion(text="Fixture draft", calls=None):
     }
 
 
+def stream_completion(*text_deltas, completion_id="fixture-stream-completion"):
+    """OpenAI-compatible SSE chunks for the real SDK streaming path."""
+    chunks = [
+        {
+            "id": completion_id,
+            "object": "chat.completion.chunk",
+            "created": 1,
+            "model": "fixture-model",
+            "choices": [{"index": 0, "delta": {"content": part}, "finish_reason": None}],
+        }
+        for part in text_deltas
+    ]
+    chunks.append({
+        "id": completion_id,
+        "object": "chat.completion.chunk",
+        "created": 1,
+        "model": "fixture-model",
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+    })
+    return {"_sse_chunks": chunks}
+
+
 def call(name, arguments="{}", identifier="fixture-tool"):
     return {
         "id": identifier,
@@ -78,10 +100,19 @@ class ScriptedServer:
                     controller.entered.set()
                     if not controller.release.wait(25):
                         controller.errors.append("barrier-deadline")
-                body = json.dumps(script.get("body", {}), ensure_ascii=False).encode()
+                chunks = script.get("body", {}).get("_sse_chunks")
+                if chunks is None:
+                    body = json.dumps(script.get("body", {}), ensure_ascii=False).encode()
+                    content_type = "application/json"
+                else:
+                    body = b"".join(
+                        b"data: " + json.dumps(chunk, ensure_ascii=False).encode() + b"\n\n"
+                        for chunk in chunks
+                    ) + b"data: [DONE]\n\n"
+                    content_type = "text/event-stream"
                 try:
                     self.send_response(script.get("status", 200))
-                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Type", content_type)
                     self.send_header("Content-Length", str(len(body)))
                     self.end_headers()
                     self.wfile.write(body)
@@ -100,6 +131,9 @@ class ScriptedServer:
 
     def queue(self, *bodies, barrier=False, status=200):
         self.scripts.extend({"body": body, "barrier": barrier, "status": status} for body in bodies)
+
+    def queue_stream(self, *text_deltas, barrier=False, status=200):
+        self.queue(stream_completion(*text_deltas), barrier=barrier, status=status)
 
     def close(self):
         self.release.set()

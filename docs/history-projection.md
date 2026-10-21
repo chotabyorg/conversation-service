@@ -60,6 +60,21 @@ configured agents cannot replace admission authority.
    Existing dispatch marker fingerprints remain authoritative after marking;
    marked recovery remains UNKNOWN without another AI execution.
 
+Managed request fingerprints also pin the wire profile. `PRE_STREAM` omits
+`stream_partials` and `max_partial_chars`; `EXT_FALSE_2000` includes `false` and
+`2000`; Voice v2 may also use `EXT_TRUE_2000` with `true` and `2000`. Snapshot and
+final-lock checks reconstruct these complete candidates from the same immutable
+request core, select only the candidate whose full digest equals the stored
+projection fingerprint, and reject no-match or inconsistent projection/dispatch
+hashes before marking or HTTP. The selected request object's runtime stream value
+matches its serialized body. New freezes write the extension values explicitly.
+This exact-hash compatibility needs no migration, timestamp choice or data rewrite.
+Current Conversation already writes the explicit text and Voice-v2 wire profiles.
+For a cross-service rollout, update the AI reader first so it accepts both those
+current profiles and historical omitted fields. Then update the Conversation
+reader to restore omitted historical bodies; new freezes remain byte-for-byte the
+same.
+
 Response cap remains262144 bytes. AI owns model context budgeting after this
 communication projection. Changed settings, new admissions and late delivery
 evidence never change frozen windows. Scope resolves through the principal's actual

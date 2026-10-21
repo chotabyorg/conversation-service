@@ -1,11 +1,14 @@
 """Explicit paired gate; filename intentionally outside default service collection."""
 
 import asyncio
+import hashlib
 import json
 from uuid import uuid4
 
 import pytest
+from sqlalchemy import text
 
+from schemas.managed import EXECUTION_NAMESPACE
 from tests.managed_cross_service.conftest import unknown
 from tests.managed_cross_service.fake_http import call, completion, descriptor
 
@@ -24,6 +27,112 @@ async def assert_separated(cross, conversation_id, before):
     assert await cross.snapshot(conversation_id) == before
     assert before[2:4] == (0, 0)
     assert cross.observations().get("managed_forbidden_store", 0) == 0
+
+
+async def _create_website_turn(cross, *, pre_stream_profile=False):
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+    from models import (
+        AgentTurn,
+        Conversation,
+        Message,
+        TurnInputMessage,
+        WebsiteAdmission,
+        WebsiteImmediateTurn,
+    )
+    from schemas.managed import ManagedMessage, ManagedTurnRequest
+    from services.common import db_clock, fingerprint
+    from services.history_projection import freeze_website_projection
+
+    owner_id = cross.grants["a"]["owner_id"]
+    integration_id = cross.ids["integration_a"]
+    agent_id = cross.ids["agent_a"]
+    session_id, message_id = str(uuid4()), str(uuid4())
+    admission_response = await cross.request("POST", "/website/admissions", {
+        "owner_id": owner_id,
+        "integration_id": integration_id,
+        "agent_id": agent_id,
+        "session_id": session_id,
+        "message_id": message_id,
+        "text": "Historical Website input",
+        "desired_route": "MANAGED",
+    })
+    assert admission_response.status_code == 200
+    admission_id = admission_response.json()["admission_id"]
+    async_session = async_sessionmaker(
+        bind=cross.sql, class_=AsyncSession, expire_on_commit=False
+    )
+    async with async_session() as session, session.begin():
+        admission = await session.get(WebsiteAdmission, admission_id)
+        assert admission is not None and admission.route == "MANAGED"
+        conversation = await session.get(Conversation, admission.conversation_id)
+        message = await session.get(Message, admission.canonical_message_id)
+        assert conversation is not None and message is not None
+        clock = await db_clock(session)
+        fields = {
+            "contract_version": 1,
+            "conversation_id": str(conversation.id),
+            "selection_key": str(message.id),
+            "input_first_sequence": message.sequence,
+            "input_last_sequence": message.sequence,
+            "context_last_sequence": message.sequence,
+            "expected_input_revision": conversation.input_revision,
+            "expected_authority_revision": conversation.authority_revision,
+        }
+        turn = AgentTurn(
+            id=uuid4(), conversation_id=conversation.id, selection_key=message.id,
+            creation_fingerprint=fingerprint(fields),
+            input_first_sequence=message.sequence, input_last_sequence=message.sequence,
+            context_last_sequence=message.sequence, input_revision=conversation.input_revision,
+            authority_revision=conversation.authority_revision,
+            settling_revision=conversation.settling_revision, settling_burst_id=None,
+            status="PENDING", claim_epoch=0, operation_refs=[], created_at=clock,
+        )
+        await freeze_website_projection(session, conversation, turn, admission.agent_id)
+        historical_digest = None
+        if pre_stream_profile:
+            legacy_request = ManagedTurnRequest(
+                contract_version=turn.managed_contract_version,
+                conversation_id=conversation.id,
+                turn_id=turn.id,
+                owner_id=conversation.owner_id,
+                integration_id=conversation.integration_id,
+                agent_id=admission.agent_id,
+                channel=conversation.channel,
+                input_revision=turn.input_revision,
+                authority_revision=turn.authority_revision,
+                input_first_sequence=turn.input_first_sequence,
+                input_last_sequence=turn.input_last_sequence,
+                context_last_sequence=turn.context_last_sequence,
+                messages=(ManagedMessage.model_validate(message),),
+                selected_input_message_ids=(message.id,),
+                stream_partials=False,
+                max_partial_chars=2000,
+            )
+            fields = legacy_request.model_dump(mode="json")
+            fields.pop("stream_partials")
+            fields.pop("max_partial_chars")
+            identity = json.dumps(
+                {"execution_namespace": EXECUTION_NAMESPACE, "request": fields},
+                sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False,
+            ).encode("utf-8")
+            historical_digest = hashlib.sha256(identity).hexdigest()
+            # Seed the old immutable hash before the insert; no trigger or
+            # persisted snapshot is changed after creation.
+            turn.managed_projection_fingerprint = historical_digest
+        session.add(turn)
+        await session.flush()
+        session.add(WebsiteImmediateTurn(
+            message_id=message.id, conversation_id=conversation.id, turn_id=turn.id,
+        ))
+        session.add(TurnInputMessage(
+            message_id=message.id, conversation_id=conversation.id, turn_id=turn.id,
+            sequence=message.sequence, ordinal=0,
+        ))
+        turn_id = str(turn.id)
+    read_response = await cross.request("GET", f"/turns/{turn_id}")
+    assert read_response.status_code == 200
+    return read_response.json(), historical_digest
 
 
 async def test_A_simple_same_turn_draft_and_terminal_replay(cross):
@@ -47,7 +156,12 @@ async def test_A_simple_same_turn_draft_and_terminal_replay(cross):
     assert turn["draft_text"] == "Готово" and turn["operation_refs"] == []
     assert turn["managed_agent_id"] == cross.ids["agent_a"]
     assert turn["managed_dispatch_epoch"] == 1
-    projection = cross.observations()["managed_projections"][0]
+    observations = cross.observations()
+    projection = observations["managed_projections"][0]
+    projection_fields = observations["managed_projection_fields_set"][0]
+    assert "stream_partials" in projection_fields and "max_partial_chars" in projection_fields
+    assert projection["stream_partials"] is False
+    assert projection["max_partial_chars"] == 2000
     for key in [
         "conversation_id",
         "input_revision",
@@ -71,6 +185,78 @@ async def test_A_simple_same_turn_draft_and_terminal_replay(cross):
     assert cross.observations()["guard_denials"] == 2
     assert cross.read("cs-guard.json")["denials"] == 2
     cross.safe_logs(SENTINEL)
+
+
+async def test_current_website_v2_profile_crosses_real_cs_ai_http_and_replays(cross):
+    from schemas.managed import ManagedTurnRequest, prepare_request
+
+    cross.model.queue(completion("Current Website profile draft"))
+    turn, historical_digest = await _create_website_turn(cross)
+    assert historical_digest is None
+    claim = await cross.claim(turn)
+
+    response = await cross.execute(claim)
+    result = draft(response, "Current Website profile draft")
+    observations = cross.observations()
+    assert observations["managed_http_requests"] == 1
+    assert len(observations["managed_projections"]) == 1
+
+    projection = observations["managed_projections"][0]
+    assert projection["channel"] == "WEBSITE_WIDGET"
+    assert projection["contract_version"] == 2
+    assert projection["stream_partials"] is False
+    assert projection["max_partial_chars"] == 2000
+    assert {"stream_partials", "max_partial_chars"} <= set(
+        observations["managed_projection_fields_set"][0]
+    )
+
+    prepared = prepare_request(ManagedTurnRequest.model_validate(projection))
+    expected_body_hash = hashlib.sha256(prepared.body).hexdigest()
+    async with cross.sql.connect() as connection:
+        retained_hash = await connection.scalar(text(
+            "SELECT managed_projection_fingerprint FROM agent_turns WHERE id=:id"
+        ), {"id": claim["turn"]["id"]})
+        contract_version = await connection.scalar(text(
+            "SELECT managed_contract_version FROM agent_turns WHERE id=:id"
+        ), {"id": claim["turn"]["id"]})
+    assert contract_version == 2
+    assert retained_hash == prepared.fingerprint
+    assert retained_hash == result["managed_request_fingerprint"]
+    assert observations["managed_request_body_sha256"] == [expected_body_hash]
+    assert observations["managed_request_canonical_sha256"] == [expected_body_hash]
+    assert observations["managed_request_body_sizes"] == [{
+        "raw": len(prepared.body), "canonical": len(prepared.body),
+    }]
+    assert cross.model.calls[0].get("stream", False) is False
+
+    replay = await cross.execute(claim)
+    assert replay.json() == {"turn": result, "replayed": True}
+    assert cross.observations()["managed_http_requests"] == 1
+    assert len(cross.model.calls) == 1
+
+
+async def test_historical_pre_stream_projection_crosses_real_cs_ai_http_after_restart(cross):
+    cross.model.queue(completion("Legacy-profile draft"))
+    turn, legacy_fingerprint = await _create_website_turn(cross, pre_stream_profile=True)
+    claim = await cross.claim(turn)
+
+    # A fresh Conversation worker restores the persisted profile. It must send
+    # the exact pre-stream JSON body and the real AI process must parse both
+    # extension keys as omitted before executing the request.
+    await cross.restart_cs()
+    response = await cross.execute(claim)
+    result = draft(response, "Legacy-profile draft")
+    assert result["managed_request_fingerprint"] == legacy_fingerprint
+    observations = cross.observations()
+    assert observations["managed_http_requests"] == 1
+    field_sets = observations["managed_projection_fields_set"]
+    assert len(field_sets) == 1
+    assert "stream_partials" not in field_sets[0]
+    assert "max_partial_chars" not in field_sets[0]
+
+    replay = await cross.execute(claim)
+    assert replay.json() == {"turn": result, "replayed": True}
+    assert cross.observations()["managed_http_requests"] == 1
 
 
 @pytest.mark.parametrize("selection", [(3, 3), (1, 1), (1, 2)])
@@ -501,7 +687,6 @@ async def test_G_abrupt_conversation_process_restart_recovers_retained_marker(cr
 
 
 async def test_G_R1_application_error_result_lost_at_real_pg_commit_wait(cross):
-    from sqlalchemy import text
 
     from tests.conftest import observed_waiters
 
