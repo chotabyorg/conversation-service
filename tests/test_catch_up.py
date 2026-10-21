@@ -233,11 +233,13 @@ async def test_not_due_boundary_is_not_waited_out_or_absorbed(telegram_harness, 
     assert latest.status_code == 200 and latest.json()["send"] is True
 
 
-def test_catch_up_cohort_requires_managed_settling_text_binding():
+def test_catch_up_cohort_requires_managed_settling_text_binding(telegram_harness):
     assert Settings.model_fields["catch_up_bindings"].default == ()
+    values = telegram_harness["settings"].model_dump()
+    values["catch_up_bindings"] = [dict(owner_id="x", integration_id=uuid4(),
+                                       agent_id=uuid4(), channel="TELEGRAM")]
     with pytest.raises(ValueError, match="invalid catch-up configuration"):
-        Settings(catch_up_bindings=[dict(owner_id="x", integration_id=uuid4(),
-                 agent_id=uuid4(), channel="TELEGRAM")], _env_file=None)
+        Settings(**values, _env_file=None)
     with pytest.raises(ValueError):
         CatchUpBinding(owner_id="x", integration_id=uuid4(), agent_id=uuid4(), channel="VOICE")
 
