@@ -132,7 +132,7 @@ async def admit(client: httpx.AsyncClient, headers: dict[str, str], **changes: A
 @pytest.mark.asyncio
 @pytest.mark.parametrize("lifecycle_source", ["CONTROL_PLANE_BINDING", "AI_AGENT"])
 async def test_revocation_keeps_acquired_v1_completion_and_no_send_recovery(
-    telegram_harness, lifecycle_source,
+    telegram_harness, sql, lifecycle_source,
 ):
     from models import InboxGrantScope, TelegramResponseAttempt
     from schemas.handoff import AiGrantRevoke, CpGrantRevoke, InboxGrantProvision
@@ -159,6 +159,12 @@ async def test_revocation_keeps_acquired_v1_completion_and_no_send_recovery(
                              source_agent_lifecycle_generation=1,
                              target_agent_lifecycle_generation=2))
     await inbox_lifecycle.revoke_grant(h["database"], settings, request)
+    work = await h["client"].post("/internal/v1/telegram/delivery-work",
+        json={"owner_id": OWNER, "integration_id": str(INTEGRATION),
+              "agent_id": str(AGENT), "bot_id": 999}, headers=h["gateway_headers"])
+    assert work.status_code == 200
+    assert len(work.json()["items"]) == 1
+    assert work.json()["items"][0]["work_kind"] == "RECOVER_ONLY"
     recovery = await h["client"].post("/internal/v1/telegram/responses/begin",
                                        json=body, headers=h["gateway_headers"])
     assert recovery.status_code == 200
