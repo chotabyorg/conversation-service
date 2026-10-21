@@ -9,7 +9,13 @@ from sqlalchemy.exc import IntegrityError
 
 from core.config import CatchUpBinding, Settings
 from core.errors import DomainError
-from models import AgentTurn, CatchUpMember, CatchUpSelection, Conversation, TelegramAdmission
+from models import (
+    AgentTurn,
+    CatchUpMember,
+    CatchUpSelection,
+    Conversation,
+    TelegramAdmission,
+)
 from schemas.contracts import ControlTransition, DeliveryCreate
 from schemas.effects import ExternalEffectPermitRequest
 from services import authority, catch_up, delivery, effects
@@ -165,6 +171,15 @@ async def test_committed_send_recovers_original_evidence_after_identity_drift(
     assert begun.status_code == 200 and begun.json()["send"] is True
     async with sql.begin() as connection:
         await connection.execute(update(TelegramAdmission).values(update_id=9999))
+    binding = settings.managed_ai_bindings[0]
+    work = await h["client"].post("/internal/v1/telegram/responses/work", json={
+        "owner_id": binding.owner_id, "integration_id": str(binding.integration_id),
+        "agent_id": str(binding.agent_id), "bot_id": 999,
+    }, headers=h["gateway_headers"])
+    assert work.status_code == 200, work.text
+    assert len(work.json()["items"]) == 1
+    assert work.json()["items"][0]["work_kind"] == "RECOVER_ONLY"
+    assert work.json()["items"][0]["response_attempt_id"] == body["response_attempt_id"]
     recovered, _ = await begin(h)
     assert recovered.status_code == 200
     assert recovered.json()["send"] is False

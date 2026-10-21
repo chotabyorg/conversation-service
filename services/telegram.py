@@ -395,8 +395,11 @@ async def _validated_turn_admissions(
     conversation: Conversation,
     turn: AgentTurn,
     agent_id: UUID,
+    *,
+    require_catch_up_proof: bool = True,
 ) -> list[TelegramAdmissionRow]:
-    if turn.catch_up_version and not await catch_up.validate(session, conversation, turn, agent_id):
+    if (require_catch_up_proof and turn.catch_up_version
+            and not await catch_up.validate(session, conversation, turn, agent_id)):
         raise DomainError(ErrorCode.VALIDATION_ERROR)
     mapped = (await session.execute(select(TurnInputMessage, Message).join(
         Message, and_(Message.id == TurnInputMessage.message_id,
@@ -757,7 +760,8 @@ async def delivery_work(database: Database, principal: Principal,
                             or turn.draft_text is None):
                         continue
                     members = await _validated_turn_admissions(
-                        session, conversation, turn, request.agent_id
+                        session, conversation, turn, request.agent_id,
+                        require_catch_up_proof=False,
                     )
                     representative = members[0]
                     if (representative.owner_id != request.owner_id
@@ -809,6 +813,10 @@ async def delivery_work(database: Database, principal: Principal,
                         item_admission = recovery[1]
                         work_kind: Literal["SEND_CANDIDATE", "RECOVER_ONLY"] = "RECOVER_ONLY"
                     else:
+                        if turn.catch_up_version and not await catch_up.validate(
+                            session, conversation, turn, request.agent_id,
+                        ):
+                            raise DomainError(ErrorCode.VALIDATION_ERROR)
                         if (account is None or account.state != "BOUND"
                                 or account.bot_id != str(request.bot_id)
                                 or conversation.control_mode != "AGENT"
