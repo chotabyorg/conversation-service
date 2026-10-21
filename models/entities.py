@@ -6,6 +6,7 @@ from uuid import UUID, uuid4
 from sqlalchemy import (
     CHAR,
     BigInteger,
+    Boolean,
     CheckConstraint,
     DateTime,
     ForeignKeyConstraint,
@@ -48,10 +49,18 @@ MANAGED_MARKER = """
 MANAGED_PROJECTION = """
  (managed_contract_version = 1 AND managed_context_first_sequence = 1
   AND managed_projection_agent_id IS NULL AND managed_projection_fingerprint IS NULL)
- OR (managed_contract_version = 2 AND managed_context_first_sequence >= 1
+ OR (managed_contract_version IN (2, 3) AND managed_context_first_sequence >= 1
   AND managed_context_first_sequence <= input_first_sequence
   AND managed_projection_agent_id IS NOT NULL AND managed_projection_fingerprint IS NOT NULL
   AND managed_projection_fingerprint ~ '^[0-9a-f]{64}$')
+"""
+MANAGED_V3_SNAPSHOT = """
+ (managed_v3_snapshot IS NULL AND managed_v3_request_fingerprint IS NULL
+  AND managed_v3_dispatch_id IS NULL)
+ OR (managed_v3_snapshot IS NOT NULL AND managed_v3_request_fingerprint IS NOT NULL
+  AND managed_v3_dispatch_id IS NOT NULL
+  AND managed_v3_request_fingerprint ~ '^[0-9a-f]{64}$'
+  AND managed_contract_version = 3)
 """
 TURN_LIFECYCLE = """
  (status = 'PENDING' AND claim_epoch = 0 AND claim_token_digest IS NULL
@@ -119,6 +128,7 @@ class Conversation(Base):
     authority_input_floor_sequence: Mapped[int] = mapped_column(
         BigInteger, default=0, server_default=sql_text("0")
     )
+    handoff_resume_floor_sequence: Mapped[int | None] = mapped_column(BigInteger)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=sql_text("clock_timestamp()")
     )
@@ -154,6 +164,9 @@ class Conversation(Base):
                 "input_revision <= last_message_sequence AND authority_revision >= 0 AND "
                 "authority_input_floor_sequence >= 0 AND "
                 "authority_input_floor_sequence <= last_message_sequence"
+                " AND (handoff_resume_floor_sequence IS NULL OR "
+                "(handoff_resume_floor_sequence >= 0 AND "
+                "handoff_resume_floor_sequence <= last_message_sequence))"
             ),
             name="ck_conversation_counters",
         ),
@@ -244,8 +257,7 @@ class Message(Base):
         UniqueConstraint("source_inbound_event_id", name="uq_message_source_event"),
         UniqueConstraint("source_agent_turn_id", name="uq_message_source_agent_turn"),
         UniqueConstraint("id", "conversation_id", name="uq_message_id_conversation"),
-        UniqueConstraint("id", "conversation_id", "sequence",
-                         name="uq_message_identity_sequence"),
+        UniqueConstraint("id", "conversation_id", "sequence", name="uq_message_identity_sequence"),
         ForeignKeyConstraint(
             ["conversation_id"],
             ["conversations.id"],
@@ -288,7 +300,8 @@ class Message(Base):
         ForeignKeyConstraint(
             ["source_agent_turn_id", "conversation_id"],
             ["agent_turns.id", "agent_turns.conversation_id"],
-            name="fk_message_source_agent_turn_conversation", ondelete="RESTRICT",
+            name="fk_message_source_agent_turn_conversation",
+            ondelete="RESTRICT",
             use_alter=True,
         ),
         CheckConstraint(
@@ -325,8 +338,12 @@ class SettlingBurst(Base):
     closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     __table_args__ = (
         UniqueConstraint("id", "conversation_id", name="uq_settling_burst_id_conversation"),
-        ForeignKeyConstraint(["conversation_id"], ["conversations.id"],
-                             name="fk_settling_burst_conversation", ondelete="RESTRICT"),
+        ForeignKeyConstraint(
+            ["conversation_id"],
+            ["conversations.id"],
+            name="fk_settling_burst_conversation",
+            ondelete="RESTRICT",
+        ),
         CheckConstraint(
             "policy_version ~ '^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$' "
             "AND quiet_window_ms >= 1 AND max_wait_ms >= quiet_window_ms "
@@ -336,11 +353,16 @@ class SettlingBurst(Base):
             "AND (closed_at IS NULL OR closed_at = ready_at)",
             name="ck_settling_burst_shape",
         ),
-        Index("uq_settling_burst_open", "conversation_id", unique=True,
-              postgresql_where=sql_text("closed_at IS NULL")),
+        Index(
+            "uq_settling_burst_open",
+            "conversation_id",
+            unique=True,
+            postgresql_where=sql_text("closed_at IS NULL"),
+        ),
         Index("ix_settling_burst_due", "ready_at", "conversation_id"),
-        Index("ix_settling_burst_conversation_tail", "conversation_id",
-              sql_text("tail_sequence DESC")),
+        Index(
+            "ix_settling_burst_conversation_tail", "conversation_id", sql_text("tail_sequence DESC")
+        ),
     )
 
 
@@ -374,6 +396,7 @@ class AgentTurn(Base):
     )
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    retired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     outcome: Mapped[str | None] = mapped_column(String(16))
     draft_text: Mapped[str | None] = mapped_column(Text)
     partial_draft_text: Mapped[str | None] = mapped_column(Text)
@@ -394,6 +417,9 @@ class AgentTurn(Base):
     )
     managed_projection_agent_id: Mapped[UUID | None] = mapped_column()
     managed_projection_fingerprint: Mapped[str | None] = mapped_column(CHAR(64))
+    managed_v3_snapshot: Mapped[dict[str, object] | None] = mapped_column(JSONB(none_as_null=True))
+    managed_v3_request_fingerprint: Mapped[str | None] = mapped_column(CHAR(64))
+    managed_v3_dispatch_id: Mapped[UUID | None] = mapped_column()
     __table_args__ = (
         UniqueConstraint("conversation_id", "selection_key", name="uq_turn_selection"),
         UniqueConstraint("id", "conversation_id", name="uq_turn_id_conversation"),
@@ -440,9 +466,11 @@ class AgentTurn(Base):
             "status IN ('PENDING','CLAIMED','COMPLETED','FAILED')", name="ck_turn_status"
         ),
         CheckConstraint("settling_revision >= 0", name="ck_turn_settling_revision"),
-        CheckConstraint("catch_up_version IN (0,1) AND (catch_up_version=0 OR "
-                        "(settling_burst_id IS NOT NULL AND managed_contract_version=2))",
-                        name="ck_turn_catch_up_version"),
+        CheckConstraint(
+            "catch_up_version IN (0,1) AND (catch_up_version=0 OR "
+            "(settling_burst_id IS NOT NULL AND managed_contract_version IN (2,3)))",
+            name="ck_turn_catch_up_version",
+        ),
         CheckConstraint("claim_epoch >= 0", name="ck_turn_epoch"),
         CheckConstraint(digest_check("creation_fingerprint"), name="ck_turn_creation_fingerprint"),
         CheckConstraint(digest_check("claim_token_digest"), name="ck_turn_claim_digest"),
@@ -459,11 +487,12 @@ class AgentTurn(Base):
         CheckConstraint(TURN_LIFECYCLE, name="ck_turn_lifecycle"),
         CheckConstraint(MANAGED_MARKER, name="ck_turn_managed_marker"),
         CheckConstraint(MANAGED_PROJECTION, name="ck_turn_managed_projection"),
+        CheckConstraint(MANAGED_V3_SNAPSHOT, name="ck_turn_managed_v3_snapshot"),
         Index(
             "uq_turn_one_active",
             "conversation_id",
             unique=True,
-            postgresql_where=sql_text("status IN ('PENDING','CLAIMED')"),
+            postgresql_where=sql_text("status IN ('PENDING','CLAIMED') AND retired_at IS NULL"),
         ),
         Index("ix_turn_conversation_settling_burst", "conversation_id", "settling_burst_id"),
     )
@@ -516,25 +545,40 @@ class ExternalEffectPermit(Base):
     issued_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     __table_args__ = (
         UniqueConstraint("id", "conversation_id", name="uq_effect_permit_id_conversation"),
-        UniqueConstraint("operation_namespace", "operation_id",
-                         name="uq_effect_permit_operation"),
-        ForeignKeyConstraint(["conversation_id"], ["conversations.id"],
-                             name="fk_effect_permit_conversation", ondelete="RESTRICT"),
-        ForeignKeyConstraint(["turn_id", "conversation_id"],
-                             ["agent_turns.id", "agent_turns.conversation_id"],
-                             name="fk_effect_permit_turn", ondelete="RESTRICT"),
-        ForeignKeyConstraint(["origin_turn_id", "conversation_id"],
-                             ["agent_turns.id", "agent_turns.conversation_id"],
-                             name="fk_effect_permit_origin_turn", ondelete="RESTRICT"),
-        CheckConstraint("operation_namespace = 'main-chota.ai-business.v1'",
-                        name="ck_effect_permit_namespace"),
-        CheckConstraint("operation_fingerprint ~ '^[0-9a-f]{64}$'",
-                        name="ck_effect_permit_operation_fingerprint"),
-        CheckConstraint("request_fingerprint ~ '^[0-9a-f]{64}$'",
-                        name="ck_effect_permit_request_fingerprint"),
-        CheckConstraint("authority_revision >= 0 AND authority_input_floor_sequence >= 0 "
-                        "AND split_input_floor_sequence >= 0",
-                        name="ck_effect_permit_floors"),
+        UniqueConstraint("operation_namespace", "operation_id", name="uq_effect_permit_operation"),
+        ForeignKeyConstraint(
+            ["conversation_id"],
+            ["conversations.id"],
+            name="fk_effect_permit_conversation",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["turn_id", "conversation_id"],
+            ["agent_turns.id", "agent_turns.conversation_id"],
+            name="fk_effect_permit_turn",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["origin_turn_id", "conversation_id"],
+            ["agent_turns.id", "agent_turns.conversation_id"],
+            name="fk_effect_permit_origin_turn",
+            ondelete="RESTRICT",
+        ),
+        CheckConstraint(
+            "operation_namespace = 'main-chota.ai-business.v1'", name="ck_effect_permit_namespace"
+        ),
+        CheckConstraint(
+            "operation_fingerprint ~ '^[0-9a-f]{64}$'",
+            name="ck_effect_permit_operation_fingerprint",
+        ),
+        CheckConstraint(
+            "request_fingerprint ~ '^[0-9a-f]{64}$'", name="ck_effect_permit_request_fingerprint"
+        ),
+        CheckConstraint(
+            "authority_revision >= 0 AND authority_input_floor_sequence >= 0 "
+            "AND split_input_floor_sequence >= 0",
+            name="ck_effect_permit_floors",
+        ),
         Index("ix_effect_permit_turn", "conversation_id", "turn_id", "issued_at"),
     )
 
@@ -544,8 +588,22 @@ class DeliveryAttempt(Base):
     id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
     conversation_id: Mapped[UUID] = mapped_column(nullable=False)
     delivery_key: Mapped[UUID] = mapped_column(nullable=False)
-    source_turn_id: Mapped[UUID] = mapped_column(nullable=False)
-    # Per-source-ordinal Speech leases share one turn; other channels stay at 0.
+    source_turn_id: Mapped[UUID | None] = mapped_column()
+    source_message_id: Mapped[UUID | None] = mapped_column()
+    # Legacy Website/Telegram attempts retain their original API and may have no
+    # Handoff ordering ordinal. Enrolled Handoff writers always set one.
+    outbound_ordinal: Mapped[int | None] = mapped_column(BigInteger)
+    case_id: Mapped[UUID | None] = mapped_column()
+    case_revision: Mapped[int | None] = mapped_column(BigInteger)
+    assignment_revision: Mapped[int | None] = mapped_column(BigInteger)
+    grant_generation: Mapped[int | None] = mapped_column(BigInteger)
+    writer_state: Mapped[str] = mapped_column(
+        String(16), default="NONE", server_default=sql_text("'NONE'")
+    )
+    writer_supplier_instance_id: Mapped[UUID | None] = mapped_column()
+    writer_process_incarnation_id: Mapped[UUID | None] = mapped_column()
+    writer_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    writer_ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     ordinal: Mapped[int] = mapped_column(BigInteger, default=0, server_default=sql_text("0"))
     creation_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
     authority_revision: Mapped[int] = mapped_column(BigInteger, nullable=False)
@@ -571,6 +629,10 @@ class DeliveryAttempt(Base):
     __table_args__ = (
         UniqueConstraint("conversation_id", "delivery_key", name="uq_delivery_key"),
         UniqueConstraint("source_turn_id", "ordinal", name="uq_delivery_source_turn"),
+        UniqueConstraint("source_message_id", name="uq_delivery_source_message"),
+        UniqueConstraint(
+            "conversation_id", "outbound_ordinal", name="uq_delivery_outbound_ordinal"
+        ),
         UniqueConstraint("id", "conversation_id", name="uq_delivery_id_conversation"),
         CheckConstraint("ordinal >= 0", name="ck_delivery_ordinal"),
         ForeignKeyConstraint(
@@ -585,7 +647,43 @@ class DeliveryAttempt(Base):
             name="fk_delivery_source_turn_conversation",
             ondelete="RESTRICT",
         ),
+        ForeignKeyConstraint(
+            ["source_message_id", "conversation_id"],
+            ["messages.id", "messages.conversation_id"],
+            name="fk_delivery_source_message_conversation",
+            ondelete="RESTRICT",
+        ),
         CheckConstraint(f"status IN ({DELIVERY_STATES})", name="ck_delivery_status"),
+        CheckConstraint(
+            "((source_turn_id IS NOT NULL)::int + (source_message_id IS NOT NULL)::int) = 1",
+            name="ck_delivery_exact_source",
+        ),
+        CheckConstraint(
+            "outbound_ordinal IS NULL OR outbound_ordinal >= 1", name="ck_delivery_outbound_ordinal"
+        ),
+        CheckConstraint(
+            "writer_state IN ('NONE','LIVE','ENDED','RETIRED') AND "
+            "((writer_state='NONE' AND writer_supplier_instance_id IS NULL "
+            "AND writer_process_incarnation_id IS NULL AND writer_started_at IS NULL "
+            "AND writer_ended_at IS NULL) OR (writer_state='LIVE' "
+            "AND writer_supplier_instance_id IS NOT NULL "
+            "AND writer_process_incarnation_id IS NOT NULL "
+            "AND writer_started_at IS NOT NULL AND writer_ended_at IS NULL) OR "
+            "(writer_state IN ('ENDED','RETIRED') AND writer_supplier_instance_id IS NOT NULL "
+            "AND writer_process_incarnation_id IS NOT NULL AND writer_started_at IS NOT NULL "
+            "AND writer_ended_at IS NOT NULL))",
+            name="ck_delivery_writer_state",
+        ),
+        CheckConstraint(
+            "(case_id IS NULL AND case_revision IS NULL AND assignment_revision IS NULL "
+            "AND ((source_turn_id IS NOT NULL AND "
+            "(grant_generation IS NULL OR grant_generation >= 1)) OR "
+            "(source_message_id IS NOT NULL AND grant_generation IS NULL))) OR "
+            "(case_id IS NOT NULL AND case_revision >= 1 "
+            "AND assignment_revision >= 0 AND grant_generation >= 1 "
+            "AND source_message_id IS NOT NULL)",
+            name="ck_delivery_human_binding",
+        ),
         CheckConstraint("revision >= 0 AND authority_revision >= 0", name="ck_delivery_revisions"),
         CheckConstraint(
             "(expected_settling_revision IS NULL AND fenced_settling_revision IS NULL) OR "
@@ -606,6 +704,253 @@ class DeliveryAttempt(Base):
         ),
         CheckConstraint(f"error_code IN ({ERROR_CODES})", name="ck_delivery_error_code"),
         CheckConstraint(DELIVERY_EVIDENCE, name="ck_delivery_evidence"),
+    )
+
+
+class InboxGrantScope(Base):
+    """Durable grant and independent CP/AI revocation floors, even pre-conversation."""
+
+    __tablename__ = "inbox_grant_scopes"
+    owner_id: Mapped[str] = mapped_column(String(255, collation="C"), primary_key=True)
+    integration_id: Mapped[UUID] = mapped_column(primary_key=True)
+    channel: Mapped[str] = mapped_column(String(32, collation="C"), primary_key=True)
+    agent_id: Mapped[UUID] = mapped_column(primary_key=True)
+    account_id: Mapped[UUID | None] = mapped_column()
+    agent_owner_id: Mapped[UUID | None] = mapped_column()
+    cp_binding_generation: Mapped[int | None] = mapped_column(BigInteger)
+    agent_lifecycle_generation: Mapped[int | None] = mapped_column(BigInteger)
+    cp_binding_high_water: Mapped[int | None] = mapped_column(BigInteger)
+    agent_lifecycle_high_water: Mapped[int | None] = mapped_column(BigInteger)
+    grant_generation: Mapped[int] = mapped_column(
+        BigInteger, default=0, server_default=sql_text("0")
+    )
+    active: Mapped[bool] = mapped_column(Boolean, default=False, server_default=sql_text("false"))
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=sql_text("clock_timestamp()")
+    )
+    __table_args__ = (
+        CheckConstraint(OWNER_BOUNDS, name="ck_inbox_grant_owner_bounds"),
+        CheckConstraint("channel = 'TELEGRAM'", name="ck_inbox_grant_channel"),
+        CheckConstraint(
+            "(cp_binding_high_water IS NULL OR cp_binding_high_water >= 0) AND "
+            "(agent_lifecycle_high_water IS NULL OR agent_lifecycle_high_water >= 0) "
+            "AND grant_generation >= 0",
+            name="ck_inbox_grant_generations",
+        ),
+        CheckConstraint(
+            "(active = false) OR (account_id IS NOT NULL AND agent_owner_id IS NOT NULL "
+            "AND cp_binding_generation IS NOT NULL AND agent_lifecycle_generation IS NOT NULL "
+            "AND (cp_binding_high_water IS NULL OR "
+            "cp_binding_generation > cp_binding_high_water) "
+            "AND (agent_lifecycle_high_water IS NULL OR "
+            "agent_lifecycle_generation > agent_lifecycle_high_water) "
+            "AND grant_generation >= 1)",
+            name="ck_inbox_grant_active_shape",
+        ),
+    )
+
+
+class InboxGrantLifecycleReceipt(Base):
+    """Exact durable replay receipts for grant provisioning and revocation."""
+
+    __tablename__ = "inbox_grant_lifecycle_receipts"
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    owner_id: Mapped[str] = mapped_column(String(255, collation="C"), nullable=False)
+    integration_id: Mapped[UUID] = mapped_column(nullable=False)
+    channel: Mapped[str] = mapped_column(String(32, collation="C"), nullable=False)
+    agent_id: Mapped[UUID] = mapped_column(nullable=False)
+    command_id: Mapped[UUID] = mapped_column(nullable=False)
+    kind: Mapped[str] = mapped_column(String(24), nullable=False)
+    request_fingerprint: Mapped[str] = mapped_column(CHAR(64), nullable=False)
+    acknowledgement: Mapped[dict[str, object]] = mapped_column(JSONB, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=sql_text("clock_timestamp()")
+    )
+    __table_args__ = (
+        UniqueConstraint(
+            "owner_id",
+            "integration_id",
+            "channel",
+            "agent_id",
+            "command_id",
+            name="uq_inbox_grant_lifecycle_command",
+        ),
+        CheckConstraint(OWNER_BOUNDS, name="ck_inbox_grant_lifecycle_owner_bounds"),
+        CheckConstraint("channel = 'TELEGRAM'", name="ck_inbox_grant_lifecycle_channel"),
+        CheckConstraint(
+            "kind IN ('PROVISION','REVOKE_CONTROL_PLANE','REVOKE_AI_AGENT')",
+            name="ck_inbox_grant_lifecycle_kind",
+        ),
+        CheckConstraint(
+            digest_check("request_fingerprint"), name="ck_inbox_grant_lifecycle_fingerprint"
+        ),
+        Index(
+            "ix_inbox_grant_lifecycle_scope",
+            "owner_id",
+            "integration_id",
+            "channel",
+            "agent_id",
+            "created_at",
+        ),
+    )
+
+
+class HandoffCase(Base):
+    __tablename__ = "handoff_cases"
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    conversation_id: Mapped[UUID] = mapped_column(nullable=False)
+    owner_id: Mapped[str] = mapped_column(String(255, collation="C"), nullable=False)
+    integration_id: Mapped[UUID] = mapped_column(nullable=False)
+    channel: Mapped[str] = mapped_column(String(32, collation="C"), nullable=False)
+    agent_id: Mapped[UUID] = mapped_column(nullable=False)
+    control_request_id: Mapped[UUID] = mapped_column(nullable=False)
+    control_request_fingerprint: Mapped[str] = mapped_column(CHAR(64), nullable=False)
+    source_turn_id: Mapped[UUID] = mapped_column(nullable=False)
+    reason: Mapped[str] = mapped_column(String(32), nullable=False)
+    note: Mapped[str | None] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    case_revision: Mapped[int] = mapped_column(BigInteger, default=1, server_default=sql_text("1"))
+    authority_revision: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    opened_authority_revision: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    assignment_revision: Mapped[int] = mapped_column(
+        BigInteger, default=0, server_default=sql_text("0")
+    )
+    assigned_account_id: Mapped[UUID | None] = mapped_column()
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=sql_text("clock_timestamp()")
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=sql_text("clock_timestamp()")
+    )
+    __table_args__ = (
+        UniqueConstraint("id", "conversation_id", name="uq_handoff_case_id_conversation"),
+        UniqueConstraint(
+            "owner_id",
+            "integration_id",
+            "channel",
+            "conversation_id",
+            "control_request_id",
+            name="uq_handoff_control_request",
+        ),
+        ForeignKeyConstraint(
+            ["conversation_id", "owner_id", "integration_id", "channel"],
+            [
+                "conversations.id",
+                "conversations.owner_id",
+                "conversations.integration_id",
+                "conversations.channel",
+            ],
+            name="fk_handoff_case_conversation_scope",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["source_turn_id", "conversation_id"],
+            ["agent_turns.id", "agent_turns.conversation_id"],
+            name="fk_handoff_case_source_turn",
+            ondelete="RESTRICT",
+        ),
+        CheckConstraint("channel = 'TELEGRAM'", name="ck_handoff_case_channel"),
+        CheckConstraint(
+            "reason IN ('CUSTOMER_REQUEST','AGENT_LIMIT','BUSINESS_UNCERTAIN',"
+            "'POLICY_REQUIRES_HUMAN','OTHER')",
+            name="ck_handoff_case_reason",
+        ),
+        CheckConstraint("status IN ('OPEN','CLAIMED','RETURNED')", name="ck_handoff_case_status"),
+        CheckConstraint(
+            "case_revision >= 1 AND authority_revision >= 1 AND "
+            "opened_authority_revision >= 1 AND "
+            "opened_authority_revision <= authority_revision AND "
+            "assignment_revision >= 0",
+            name="ck_handoff_case_revisions",
+        ),
+        CheckConstraint(
+            digest_check("control_request_fingerprint"), name="ck_handoff_control_fingerprint"
+        ),
+        CheckConstraint(
+            "note IS NULL OR (char_length(note) BETWEEN 1 AND 1000 AND octet_length(note) <= 4000)",
+            name="ck_handoff_case_note",
+        ),
+        CheckConstraint(
+            "(status = 'CLAIMED' AND assigned_account_id IS NOT NULL) OR "
+            "(status <> 'CLAIMED' AND assigned_account_id IS NULL)",
+            name="ck_handoff_case_assignment",
+        ),
+        Index(
+            "uq_handoff_one_active_case",
+            "conversation_id",
+            unique=True,
+            postgresql_where=sql_text("status IN ('OPEN','CLAIMED')"),
+        ),
+        Index("ix_handoff_case_owner_status", "owner_id", "status", "updated_at"),
+    )
+
+
+class InboxCommandReceipt(Base):
+    __tablename__ = "inbox_command_receipts"
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    conversation_id: Mapped[UUID] = mapped_column(nullable=False)
+    case_id: Mapped[UUID] = mapped_column(nullable=False)
+    owner_id: Mapped[str] = mapped_column(String(255, collation="C"), nullable=False)
+    integration_id: Mapped[UUID] = mapped_column(nullable=False)
+    channel: Mapped[str] = mapped_column(String(32, collation="C"), nullable=False)
+    actor_account_id: Mapped[UUID] = mapped_column(nullable=False)
+    command_id: Mapped[UUID] = mapped_column(nullable=False)
+    kind: Mapped[str] = mapped_column(String(24), nullable=False)
+    request_fingerprint: Mapped[str] = mapped_column(CHAR(64), nullable=False)
+    applied_case_revision: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    applied_authority_revision: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    applied_assignment_revision: Mapped[int | None] = mapped_column(BigInteger)
+    message_id: Mapped[UUID | None] = mapped_column()
+    outbound_intent_id: Mapped[UUID | None] = mapped_column()
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=sql_text("clock_timestamp()")
+    )
+    __table_args__ = (
+        UniqueConstraint(
+            "owner_id",
+            "integration_id",
+            "channel",
+            "conversation_id",
+            "actor_account_id",
+            "command_id",
+            name="uq_inbox_command_scope",
+        ),
+        ForeignKeyConstraint(
+            ["case_id", "conversation_id"],
+            ["handoff_cases.id", "handoff_cases.conversation_id"],
+            name="fk_inbox_command_case",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["message_id", "conversation_id"],
+            ["messages.id", "messages.conversation_id"],
+            name="fk_inbox_command_message",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["outbound_intent_id", "conversation_id"],
+            ["delivery_attempts.id", "delivery_attempts.conversation_id"],
+            name="fk_inbox_command_delivery",
+            ondelete="RESTRICT",
+        ),
+        CheckConstraint("channel = 'TELEGRAM'", name="ck_inbox_command_channel"),
+        CheckConstraint(
+            "kind IN ('CLAIM','SEND_HUMAN','RETURN_TO_AGENT')", name="ck_inbox_command_kind"
+        ),
+        CheckConstraint(digest_check("request_fingerprint"), name="ck_inbox_command_fingerprint"),
+        CheckConstraint(
+            "applied_case_revision >= 1 AND applied_authority_revision >= 0 AND "
+            "(applied_assignment_revision IS NULL OR applied_assignment_revision >= 0)",
+            name="ck_inbox_command_revisions",
+        ),
+        CheckConstraint(
+            "(kind = 'SEND_HUMAN' AND message_id IS NOT NULL "
+            "AND outbound_intent_id IS NOT NULL AND applied_assignment_revision IS NOT NULL) "
+            "OR (kind <> 'SEND_HUMAN' AND message_id IS NULL "
+            "AND outbound_intent_id IS NULL)",
+            name="ck_inbox_command_message_shape",
+        ),
+        Index("ix_inbox_command_case", "case_id", "created_at"),
     )
 
 
@@ -686,6 +1031,7 @@ class DeliveryReconciliation(Base):
 
 class WebsiteAdmission(Base):
     """Frozen arbitration, including legacy reservations without canonical content."""
+
     __tablename__ = "website_admissions"
     id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
     owner_id: Mapped[str] = mapped_column(String(255, collation="C"), nullable=False)
@@ -703,25 +1049,43 @@ class WebsiteAdmission(Base):
         DateTime(timezone=True), server_default=sql_text("clock_timestamp()")
     )
     __table_args__ = (
-        UniqueConstraint("owner_id", "integration_id", "channel", "provider_namespace",
-                         "message_id", name="uq_website_admission_identity"),
+        UniqueConstraint(
+            "owner_id",
+            "integration_id",
+            "channel",
+            "provider_namespace",
+            "message_id",
+            name="uq_website_admission_identity",
+        ),
         UniqueConstraint("canonical_message_id", name="uq_website_admission_message"),
         UniqueConstraint("id", "conversation_id", name="uq_website_admission_parent"),
-        ForeignKeyConstraint(["conversation_id", "owner_id", "integration_id", "channel"],
-                             ["conversations.id", "conversations.owner_id",
-                              "conversations.integration_id", "conversations.channel"],
-                             ondelete="RESTRICT"),
-        ForeignKeyConstraint(["canonical_message_id", "conversation_id"],
-                             ["messages.id", "messages.conversation_id"], ondelete="RESTRICT"),
+        ForeignKeyConstraint(
+            ["conversation_id", "owner_id", "integration_id", "channel"],
+            [
+                "conversations.id",
+                "conversations.owner_id",
+                "conversations.integration_id",
+                "conversations.channel",
+            ],
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["canonical_message_id", "conversation_id"],
+            ["messages.id", "messages.conversation_id"],
+            ondelete="RESTRICT",
+        ),
         CheckConstraint(OWNER_BOUNDS, name="ck_website_admission_owner"),
-        CheckConstraint("channel='WEBSITE_WIDGET' AND "
-                        "provider_namespace='main-chota.website-widget.v1'",
-                        name="ck_website_admission_namespace"),
+        CheckConstraint(
+            "channel='WEBSITE_WIDGET' AND provider_namespace='main-chota.website-widget.v1'",
+            name="ck_website_admission_namespace",
+        ),
         CheckConstraint(digest_check("fingerprint"), name="ck_website_admission_fingerprint"),
-        CheckConstraint("(route='LEGACY' AND conversation_id IS NULL "
-                        "AND canonical_message_id IS NULL) OR (route='MANAGED' "
-                        "AND conversation_id IS NOT NULL AND canonical_message_id IS NOT NULL)",
-                        name="ck_website_admission_route"),
+        CheckConstraint(
+            "(route='LEGACY' AND conversation_id IS NULL "
+            "AND canonical_message_id IS NULL) OR (route='MANAGED' "
+            "AND conversation_id IS NOT NULL AND canonical_message_id IS NOT NULL)",
+            name="ck_website_admission_route",
+        ),
         Index("ix_website_admission_processing", "conversation_id"),
     )
 
@@ -732,18 +1096,25 @@ class WebsiteImmediateTurn(Base):
     conversation_id: Mapped[UUID] = mapped_column(nullable=False)
     turn_id: Mapped[UUID] = mapped_column(nullable=False)
     __table_args__ = (
-        ForeignKeyConstraint(["message_id"], ["website_admissions.canonical_message_id"],
-                             ondelete="RESTRICT"),
-        ForeignKeyConstraint(["message_id", "conversation_id"],
-                             ["messages.id", "messages.conversation_id"], ondelete="RESTRICT"),
-        ForeignKeyConstraint(["turn_id", "conversation_id"],
-                             ["agent_turns.id", "agent_turns.conversation_id"],
-                             ondelete="RESTRICT"),
+        ForeignKeyConstraint(
+            ["message_id"], ["website_admissions.canonical_message_id"], ondelete="RESTRICT"
+        ),
+        ForeignKeyConstraint(
+            ["message_id", "conversation_id"],
+            ["messages.id", "messages.conversation_id"],
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["turn_id", "conversation_id"],
+            ["agent_turns.id", "agent_turns.conversation_id"],
+            ondelete="RESTRICT",
+        ),
     )
 
 
 class WebsiteResponseAttempt(Base):
     """Local HTTP write fact; never an application acknowledgement."""
+
     __tablename__ = "website_response_attempts"
     id: Mapped[UUID] = mapped_column(primary_key=True)
     admission_id: Mapped[UUID] = mapped_column(nullable=False)
@@ -758,20 +1129,28 @@ class WebsiteResponseAttempt(Base):
     )
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     __table_args__ = (
-        ForeignKeyConstraint(["admission_id", "conversation_id"],
-                             ["website_admissions.id", "website_admissions.conversation_id"],
-                             ondelete="RESTRICT"),
-        ForeignKeyConstraint(["delivery_id", "conversation_id"],
-                             ["delivery_attempts.id", "delivery_attempts.conversation_id"],
-                             ondelete="RESTRICT"),
-        CheckConstraint("(outcome IS NULL AND finished_at IS NULL) OR "
-                        "(outcome IN ('WRITE_COMPLETED','WRITE_FAILED','UNKNOWN') "
-                        "AND finished_at IS NOT NULL)", name="ck_website_response_outcome"),
+        ForeignKeyConstraint(
+            ["admission_id", "conversation_id"],
+            ["website_admissions.id", "website_admissions.conversation_id"],
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["delivery_id", "conversation_id"],
+            ["delivery_attempts.id", "delivery_attempts.conversation_id"],
+            ondelete="RESTRICT",
+        ),
+        CheckConstraint(
+            "(outcome IS NULL AND finished_at IS NULL) OR "
+            "(outcome IN ('WRITE_COMPLETED','WRITE_FAILED','UNKNOWN') "
+            "AND finished_at IS NOT NULL)",
+            name="ck_website_response_outcome",
+        ),
     )
 
 
 class TelegramAdmission(Base):
     """Sticky Telegram route and atomic link to accepted canonical input."""
+
     __tablename__ = "telegram_admissions"
     id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
     owner_id: Mapped[str] = mapped_column(String(255, collation="C"), nullable=False)
@@ -794,37 +1173,61 @@ class TelegramAdmission(Base):
         DateTime(timezone=True), server_default=sql_text("clock_timestamp()")
     )
     __table_args__ = (
-        UniqueConstraint("owner_id", "integration_id", "channel", "provider_namespace",
-                         "provider_event_id", name="uq_telegram_admission_identity"),
+        UniqueConstraint(
+            "owner_id",
+            "integration_id",
+            "channel",
+            "provider_namespace",
+            "provider_event_id",
+            name="uq_telegram_admission_identity",
+        ),
         UniqueConstraint("canonical_message_id", name="uq_telegram_admission_message"),
         UniqueConstraint("id", "conversation_id", name="uq_telegram_admission_parent"),
-        ForeignKeyConstraint(["conversation_id", "owner_id", "integration_id", "channel"],
-                             ["conversations.id", "conversations.owner_id",
-                              "conversations.integration_id", "conversations.channel"],
-                             ondelete="RESTRICT"),
-        ForeignKeyConstraint(["canonical_message_id", "conversation_id"],
-                             ["messages.id", "messages.conversation_id"], ondelete="RESTRICT"),
+        ForeignKeyConstraint(
+            ["conversation_id", "owner_id", "integration_id", "channel"],
+            [
+                "conversations.id",
+                "conversations.owner_id",
+                "conversations.integration_id",
+                "conversations.channel",
+            ],
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["canonical_message_id", "conversation_id"],
+            ["messages.id", "messages.conversation_id"],
+            ondelete="RESTRICT",
+        ),
         CheckConstraint(OWNER_BOUNDS, name="ck_telegram_admission_owner"),
-        CheckConstraint("channel='TELEGRAM' AND "
-                        "provider_namespace='main-chota.telegram.v1'",
-                        name="ck_telegram_admission_namespace"),
+        CheckConstraint(
+            "channel='TELEGRAM' AND provider_namespace='main-chota.telegram.v1'",
+            name="ck_telegram_admission_namespace",
+        ),
         CheckConstraint(digest_check("fingerprint"), name="ck_telegram_admission_fingerprint"),
-        CheckConstraint("char_length(provider_event_id) BETWEEN 1 AND 512 AND "
-                        "octet_length(provider_event_id) <= 512",
-                        name="ck_telegram_admission_event_bounds"),
-        CheckConstraint("char_length(provider_thread_id) BETWEEN 1 AND 512 AND "
-                        "octet_length(provider_thread_id) <= 512",
-                        name="ck_telegram_admission_thread_bounds"),
+        CheckConstraint(
+            "char_length(provider_event_id) BETWEEN 1 AND 512 AND "
+            "octet_length(provider_event_id) <= 512",
+            name="ck_telegram_admission_event_bounds",
+        ),
+        CheckConstraint(
+            "char_length(provider_thread_id) BETWEEN 1 AND 512 AND "
+            "octet_length(provider_thread_id) <= 512",
+            name="ck_telegram_admission_thread_bounds",
+        ),
         CheckConstraint("update_id >= 0", name="ck_telegram_admission_update_id"),
-        CheckConstraint("chat_id ~ '^[1-9][0-9]{0,18}$' AND "
-                        "message_id ~ '^[1-9][0-9]{0,18}$' AND "
-                        "sender_id ~ '^[1-9][0-9]{0,18}$' AND "
-                        "bot_id ~ '^[1-9][0-9]{0,18}$'",
-                        name="ck_telegram_admission_provider_ids"),
-        CheckConstraint("(route='LEGACY' AND conversation_id IS NULL "
-                        "AND canonical_message_id IS NULL) OR (route='MANAGED' "
-                        "AND conversation_id IS NOT NULL AND canonical_message_id IS NOT NULL)",
-                        name="ck_telegram_admission_route"),
+        CheckConstraint(
+            "chat_id ~ '^[1-9][0-9]{0,18}$' AND "
+            "message_id ~ '^[1-9][0-9]{0,18}$' AND "
+            "sender_id ~ '^[1-9][0-9]{0,18}$' AND "
+            "bot_id ~ '^[1-9][0-9]{0,18}$'",
+            name="ck_telegram_admission_provider_ids",
+        ),
+        CheckConstraint(
+            "(route='LEGACY' AND conversation_id IS NULL "
+            "AND canonical_message_id IS NULL) OR (route='MANAGED' "
+            "AND conversation_id IS NOT NULL AND canonical_message_id IS NOT NULL)",
+            name="ck_telegram_admission_route",
+        ),
         Index("ix_telegram_admission_processing", "conversation_id"),
     )
 
@@ -853,18 +1256,25 @@ class TelegramImmediateTurn(Base):
     conversation_id: Mapped[UUID] = mapped_column(nullable=False)
     turn_id: Mapped[UUID] = mapped_column(nullable=False)
     __table_args__ = (
-        ForeignKeyConstraint(["message_id"], ["telegram_admissions.canonical_message_id"],
-                             ondelete="RESTRICT"),
-        ForeignKeyConstraint(["message_id", "conversation_id"],
-                             ["messages.id", "messages.conversation_id"], ondelete="RESTRICT"),
-        ForeignKeyConstraint(["turn_id", "conversation_id"],
-                             ["agent_turns.id", "agent_turns.conversation_id"],
-                             ondelete="RESTRICT"),
+        ForeignKeyConstraint(
+            ["message_id"], ["telegram_admissions.canonical_message_id"], ondelete="RESTRICT"
+        ),
+        ForeignKeyConstraint(
+            ["message_id", "conversation_id"],
+            ["messages.id", "messages.conversation_id"],
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["turn_id", "conversation_id"],
+            ["agent_turns.id", "agent_turns.conversation_id"],
+            ondelete="RESTRICT",
+        ),
     )
 
 
 class TelegramResponseAttempt(Base):
     """At most one Telegram provider write per logical managed draft."""
+
     __tablename__ = "telegram_response_attempts"
     id: Mapped[UUID] = mapped_column(primary_key=True)
     admission_id: Mapped[UUID] = mapped_column(nullable=False)
@@ -879,13 +1289,20 @@ class TelegramResponseAttempt(Base):
     )
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     __table_args__ = (
-        ForeignKeyConstraint(["admission_id", "conversation_id"],
-                             ["telegram_admissions.id", "telegram_admissions.conversation_id"],
-                             ondelete="RESTRICT"),
-        ForeignKeyConstraint(["delivery_id", "conversation_id"],
-                             ["delivery_attempts.id", "delivery_attempts.conversation_id"],
-                             ondelete="RESTRICT"),
-        CheckConstraint("(outcome IS NULL AND finished_at IS NULL) OR "
-                        "(outcome IN ('PROVIDER_ACCEPTED','FAILED','UNKNOWN') "
-                        "AND finished_at IS NOT NULL)", name="ck_telegram_response_outcome"),
+        ForeignKeyConstraint(
+            ["admission_id", "conversation_id"],
+            ["telegram_admissions.id", "telegram_admissions.conversation_id"],
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["delivery_id", "conversation_id"],
+            ["delivery_attempts.id", "delivery_attempts.conversation_id"],
+            ondelete="RESTRICT",
+        ),
+        CheckConstraint(
+            "(outcome IS NULL AND finished_at IS NULL) OR "
+            "(outcome IN ('PROVIDER_ACCEPTED','FAILED','UNKNOWN') "
+            "AND finished_at IS NOT NULL)",
+            name="ck_telegram_response_outcome",
+        ),
     )

@@ -82,6 +82,13 @@ async def test_migrated_catalog_constraints_indexes_utc_and_exact_collation(h, s
         "uq_delivery_reconciliation_revision",
         "fk_reconciliation_delivery_conversation",
         "ck_delivery_evidence",
+        "ck_inbox_grant_channel",
+        "ck_inbox_grant_generations",
+        "ck_inbox_grant_active_shape",
+        "ck_handoff_case_status",
+        "ck_handoff_control_fingerprint",
+        "ck_inbox_command_fingerprint",
+        "ck_inbox_grant_lifecycle_fingerprint",
     }
     async with sql.connect() as connection:
         constraints = set(
@@ -115,7 +122,12 @@ async def test_migrated_catalog_constraints_indexes_utc_and_exact_collation(h, s
             and "PENDING" in active
             and "CLAIMED" in active
         )
-        assert "WHERE" in active and "COMPLETED" not in active and "FAILED" not in active
+        assert (
+            "WHERE" in active
+            and "COMPLETED" not in active
+            and "FAILED" not in active
+            and "retired_at IS NULL" in active
+        )
         tables = set(
             (
                 await connection.execute(
@@ -147,10 +159,14 @@ async def test_migrated_catalog_constraints_indexes_utc_and_exact_collation(h, s
             "external_effect_permits",
             "catch_up_selections",
             "catch_up_members",
+            "inbox_grant_scopes",
+            "inbox_grant_lifecycle_receipts",
+            "handoff_cases",
+            "inbox_command_receipts",
         }
         assert (
             await connection.scalar(text("SELECT version_num FROM alembic_version"))
-            == "0011_turn_catch_up"
+            == "0012_shared_handoff"
         )
         timestamps = (
             (
@@ -291,23 +307,33 @@ async def test_turn_input_message_foreign_key_binds_exact_id_and_sequence(h, sql
     third = await h.ingest()
     first_turn, _ = await h.select(third, input_first_sequence=1, input_last_sequence=1)
     claim = await h.claim(first_turn)
-    assert (await h.call(
-        "POST", f"/turns/{first_turn['id']}/complete",
-        dict(h.proof(claim), outcome="NO_RESPONSE"),
-    )).status_code == 200
+    assert (
+        await h.call(
+            "POST",
+            f"/turns/{first_turn['id']}/complete",
+            dict(h.proof(claim), outcome="NO_RESPONSE"),
+        )
+    ).status_code == 200
     second_turn, _ = await h.select(third, input_first_sequence=2, input_last_sequence=2)
     claim = await h.claim(second_turn)
-    assert (await h.call(
-        "POST", f"/turns/{second_turn['id']}/complete",
-        dict(h.proof(claim), outcome="NO_RESPONSE"),
-    )).status_code == 200
+    assert (
+        await h.call(
+            "POST",
+            f"/turns/{second_turn['id']}/complete",
+            dict(h.proof(claim), outcome="NO_RESPONSE"),
+        )
+    ).status_code == 200
     await violation(
         sql,
         "INSERT INTO turn_input_messages(message_id,conversation_id,turn_id,sequence,ordinal) "
         "VALUES(:message_id,:conversation_id,:turn_id,1,1)",
-        dict(message_id=third["message"]["id"],
-             conversation_id=first["conversation"]["id"], turn_id=second_turn["id"]),
-        "23503", "fk_turn_input_exact_message",
+        dict(
+            message_id=third["message"]["id"],
+            conversation_id=first["conversation"]["id"],
+            turn_id=second_turn["id"],
+        ),
+        "23503",
+        "fk_turn_input_exact_message",
     )
 
 
@@ -317,21 +343,30 @@ async def test_goal5_settling_checks_reject_malformed_raw_sql(h, sql):
     # inbound row and make malformed snapshots on INSERT to exercise the
     # named CHECKs themselves rather than the immutability trigger.
     async with sql.connect() as connection:
-        columns = list((await connection.execute(text(
-            "SELECT column_name FROM information_schema.columns "
-            "WHERE table_schema='public' AND table_name='messages' "
-            "ORDER BY ordinal_position"
-        ))).scalars())
+        columns = list(
+            (
+                await connection.execute(
+                    text(
+                        "SELECT column_name FROM information_schema.columns "
+                        "WHERE table_schema='public' AND table_name='messages' "
+                        "ORDER BY ordinal_position"
+                    )
+                )
+            ).scalars()
+        )
     burst_id = uuid4()
     async with sql.begin() as connection:
-        await connection.execute(text(
-            "INSERT INTO settling_bursts "
-            "(id,conversation_id,policy_version,quiet_window_ms,max_wait_ms,"
-            "opened_at,max_cutoff_at,last_input_at,tail_sequence,ready_at) "
-            "VALUES (:id,:conversation,'telegram-v1',100,1000,clock_timestamp(),"
-            "clock_timestamp()+interval '1 second',clock_timestamp(),1,"
-            "clock_timestamp()+interval '100 milliseconds')"
-        ), {"id": str(burst_id), "conversation": accepted["conversation"]["id"]})
+        await connection.execute(
+            text(
+                "INSERT INTO settling_bursts "
+                "(id,conversation_id,policy_version,quiet_window_ms,max_wait_ms,"
+                "opened_at,max_cutoff_at,last_input_at,tail_sequence,ready_at) "
+                "VALUES (:id,:conversation,'telegram-v1',100,1000,clock_timestamp(),"
+                "clock_timestamp()+interval '1 second',clock_timestamp(),1,"
+                "clock_timestamp()+interval '100 milliseconds')"
+            ),
+            {"id": str(burst_id), "conversation": accepted["conversation"]["id"]},
+        )
     overrides = {
         "id": ":new_id",
         "sequence": "sequence + 1000000",
@@ -344,11 +379,14 @@ async def test_goal5_settling_checks_reject_malformed_raw_sql(h, sql):
     expressions = [overrides.get(column, column) for column in columns]
     await violation(
         sql,
-        "INSERT INTO messages (" + ",".join(columns) + ") SELECT "
-        + ",".join(expressions) + " FROM messages WHERE id=:id",
-        {"id": accepted["message"]["id"], "new_id": str(uuid4()),
-         "burst_id": str(burst_id)},
-        "23514", "ck_message_settling_snapshot",
+        "INSERT INTO messages ("
+        + ",".join(columns)
+        + ") SELECT "
+        + ",".join(expressions)
+        + " FROM messages WHERE id=:id",
+        {"id": accepted["message"]["id"], "new_id": str(uuid4()), "burst_id": str(burst_id)},
+        "23514",
+        "ck_message_settling_snapshot",
     )
     null_expressions = [
         "NULL" if column == "settling_quiet_window_ms" else expression
@@ -356,25 +394,32 @@ async def test_goal5_settling_checks_reject_malformed_raw_sql(h, sql):
     ]
     await violation(
         sql,
-        "INSERT INTO messages (" + ",".join(columns) + ") SELECT "
-        + ",".join(null_expressions) + " FROM messages WHERE id=:id",
-        {"id": accepted["message"]["id"], "new_id": str(uuid4()),
-         "burst_id": str(burst_id)},
-        "23514", "ck_message_settling_burst_shape",
+        "INSERT INTO messages ("
+        + ",".join(columns)
+        + ") SELECT "
+        + ",".join(null_expressions)
+        + " FROM messages WHERE id=:id",
+        {"id": accepted["message"]["id"], "new_id": str(uuid4()), "burst_id": str(burst_id)},
+        "23514",
+        "ck_message_settling_burst_shape",
     )
     _, attempt, _ = await h.delivery()
     await violation(
         sql,
         "UPDATE delivery_attempts SET expected_settling_revision=NULL, "
         "fenced_settling_revision=0 WHERE id=:id",
-        {"id": attempt["id"]}, "23514", "ck_delivery_settling_fence",
+        {"id": attempt["id"]},
+        "23514",
+        "ck_delivery_settling_fence",
     )
     await h.reconcile(attempt, "DISPATCH_REQUESTED")
     await violation(
         sql,
         "UPDATE delivery_reconciliations SET expected_settling_revision=0, "
         "result_settling_revision=NULL WHERE delivery_attempt_id=:id",
-        {"id": attempt["id"]}, "23514", "ck_reconciliation_settling_fence",
+        {"id": attempt["id"]},
+        "23514",
+        "ck_reconciliation_settling_fence",
     )
 
 
@@ -391,7 +436,7 @@ async def test_missing_or_wrong_revision_and_missing_table_are_not_ready(h, sql)
     finally:
         async with sql.begin() as connection:
             await connection.execute(
-                text("UPDATE alembic_version SET version_num='0011_turn_catch_up'")
+                text("UPDATE alembic_version SET version_num='0012_shared_handoff'")
             )
     async with sql.begin() as connection:
         await connection.execute(
