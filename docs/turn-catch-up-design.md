@@ -186,6 +186,14 @@ refuse while non-representable evidence remains. Never delete evidence to force 
    of another Conversation; no broader quiet windows and no latency claims.
 7. Exercise send-versus-ingress/handoff ordering, retained delivery UNKNOWN, late
    evidence and superseded drafts without blind resend or loss of operation refs.
+   After a permit commits, change admission/identity evidence in an explicitly
+   corrupted fixture: the exact original permit replay retains precedence, while
+   fresh permits, a replacement request and new communication sends fail closed.
+   Separately hold an original provider writer after its single call has started,
+   change identity evidence, and complete/replay its original evidence. Only that
+   exact attempt may record completion; restart/recovery must make zero additional
+   provider calls. Preserve the separate committed-before-ingress first-dispatch
+   case from item 3; do not reinterpret a committed permit as replacement authority.
 8. Run the current Business bridge and supported Website/Telegram HTTP suites on
    exact paired revisions, then independent technical/business reviews of changes
    and evidence. Hosted channel acceptance remains a separate paid-QA gate.
