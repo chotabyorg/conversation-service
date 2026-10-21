@@ -96,7 +96,10 @@ async def test_native_partial_tls_release_precedes_result_or_original_cancel_and
         settings = settings.model_copy(update={
             "managed_ai_connect_seconds": .05 if mode == "connect_deadline" else 5,
         })
-        install_client(h, settings, origin, .1 if mode == "total_deadline" else 5)
+        # The total budget also covers real PostgreSQL preparation. Allow it
+        # to reach the native TLS stall on a loaded runner before expiring;
+        # the same socket-close, original-cancel and no-resend proofs follow.
+        install_client(h, settings, origin, 1 if mode == "total_deadline" else 5)
         before = set(asyncio.all_tasks())
         request = asyncio.create_task(execute(h, turn, claim))
         if mode == "caller_cancel":
