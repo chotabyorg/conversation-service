@@ -29,9 +29,15 @@ Proof = dict[str, Any]
 
 
 def enabled(settings: Settings, binding: ManagedBinding) -> bool:
+    return scope_enabled(settings, binding.owner_id, binding.integration_id,
+                         binding.channel, binding.agent_id)
+
+
+def scope_enabled(settings: Settings, owner_id: str, integration_id: UUID,
+                  channel: str, agent_id: UUID) -> bool:
     return any(
         (entry.owner_id, entry.integration_id, entry.channel, entry.agent_id)
-        == (binding.owner_id, binding.integration_id, binding.channel, binding.agent_id)
+        == (owner_id, integration_id, channel, agent_id)
         for entry in settings.catch_up_bindings
     )
 

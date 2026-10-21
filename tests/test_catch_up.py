@@ -10,9 +10,10 @@ from sqlalchemy.exc import IntegrityError
 from core.config import CatchUpBinding, Settings
 from core.errors import DomainError
 from models import AgentTurn, CatchUpMember, CatchUpSelection, Conversation, TelegramAdmission
-from schemas.contracts import DeliveryCreate
+from schemas.contracts import ControlTransition, DeliveryCreate
 from schemas.effects import ExternalEffectPermitRequest
-from services import catch_up, delivery, effects
+from services import authority, catch_up, delivery, effects
+from services.settling import select_settled_turn
 from services.telegram_worker import TelegramWorker
 from tests import test_website
 from tests.test_settling import (
@@ -321,3 +322,122 @@ async def test_website_coalesces_bursts_and_writes_once(wh, sql, test_database_c
     async with wh.database.session_factory() as session:
         header = await session.get(CatchUpSelection, request.turn_id)
         assert header.member_count == 3
+
+
+async def test_return_requires_fresh_input_and_separates_original_authority_burst(
+    telegram_harness, sql,
+):
+    h = telegram_harness
+    settings = enable(h)
+    await add(h, sql, 0, close=False)
+    async with h["database"].session_factory() as session:
+        conversation = await session.scalar(select(Conversation))
+    await authority.transition_control(h["database"], principal(h), conversation.id,
+        ControlTransition(control_mode="HUMAN", expected_authority_revision=0))
+    await add(h, sql, 1, close=False)
+    await authority.transition_control(h["database"], principal(h), conversation.id,
+        ControlTransition(control_mode="AGENT", expected_authority_revision=1))
+    worker = TelegramWorker(h["database"], settings, DeterministicManagedPort())
+    assert await worker.run_once() is False
+    await add(h, sql, 2)
+    assert await worker.run_once()
+    request = worker.port.prepared[0].request
+    assert (request.input_first_sequence, request.input_last_sequence) == (3, 3)
+    assert request.authority_revision == 2
+    turn, conversation = await turn_and_conversation(h, request.turn_id)
+    async with h["database"].session_factory() as session:
+        assert await catch_up.effect_complete(session, conversation, turn)
+        header = await session.get(CatchUpSelection, turn.id)
+        assert header.authority_input_floor_sequence == 2
+
+
+async def test_two_workers_cannot_select_or_dispatch_the_same_catch_up(telegram_harness, sql):
+    h = telegram_harness
+    settings = enable(h)
+    for n in range(3):
+        await add(h, sql, n)
+    port = PausingManagedPort()
+    first = asyncio.create_task(TelegramWorker(h["database"], settings, port).run_once())
+    try:
+        await asyncio.wait_for(port.started.wait(), 8)
+        assert await TelegramWorker(h["database"], settings, port).run_once() is False
+    finally:
+        port.release.set()
+    assert await first and port.calls == 1
+    async with sql.connect() as connection:
+        assert await connection.scalar(text("SELECT count(*) FROM catch_up_selections")) == 1
+        assert await connection.scalar(text("SELECT count(*) FROM turn_input_messages")) == 3
+
+
+async def test_malformed_oldest_candidate_does_not_block_another_conversation(
+    telegram_harness, sql,
+):
+    h = telegram_harness
+    settings = enable(h)
+    await add(h, sql, 0)
+    async with sql.begin() as connection:
+        await connection.execute(update(TelegramAdmission).values(route="LEGACY"))
+    other = await telegram_admit(h["client"], h["gateway_headers"],
+                                 message_id=8, update_id=56, chat_id=456)
+    assert other.status_code == 200
+    await _advance_to_due(sql)
+    port = DeterministicManagedPort()
+    assert await TelegramWorker(h["database"], settings, port).run_once()
+    assert port.calls == 1
+    _, conversation = await turn_and_conversation(h, port.prepared[0].request.turn_id)
+    assert conversation.provider_thread_id == "456"
+
+
+async def test_catch_up_evidence_blocks_downgrade_without_deleting_history(
+    telegram_harness, sql, database_url,
+):
+    from tests.test_managed_migration import migrate
+
+    h = telegram_harness
+    settings = enable(h)
+    await add(h, sql, 0)
+    port = DeterministicManagedPort()
+    assert await TelegramWorker(h["database"], settings, port).run_once()
+    await h["database"].dispose()
+    rejected = migrate(database_url, "downgrade", "0010_voice_caller_number", expected=1)
+    assert "Retained catch-up evidence prevents downgrade." in rejected.stderr
+    assert await h["database"].ready()
+    turn, conversation = await turn_and_conversation(h, port.prepared[0].request.turn_id)
+    async with h["database"].session_factory() as session:
+        assert await catch_up.validate(session, conversation, turn)
+
+
+async def test_catch_up_marker_cannot_commit_without_its_selection(telegram_harness, sql):
+    h = telegram_harness
+    settings = enable(h)
+    await add(h, sql, 0)
+    port = DeterministicManagedPort()
+    assert await TelegramWorker(h["database"], settings, port).run_once()
+    async with sql.connect() as connection:
+        columns = list((await connection.execute(text(
+            "SELECT column_name FROM information_schema.columns WHERE table_schema='public' "
+            "AND table_name='agent_turns' ORDER BY ordinal_position"))).scalars())
+    expressions = [":new_id" if name == "id" else ":new_key" if name == "selection_key"
+                   else name for name in columns]
+    with pytest.raises(IntegrityError, match="Incomplete catch-up selection"):
+        async with sql.begin() as connection:
+            await connection.execute(text(
+                "INSERT INTO agent_turns ("+",".join(columns)+") SELECT "
+                +",".join(expressions)+" FROM agent_turns WHERE id=:source"),
+                {"new_id": uuid4(), "new_key": uuid4(), "source": port.prepared[0].request.turn_id})
+
+
+async def test_fresh_dispatch_revalidates_frozen_identity_after_restart(telegram_harness, sql):
+    h = telegram_harness
+    settings = enable(h)
+    await add(h, sql, 0)
+    turn_id = await select_settled_turn(h["database"], principal(h), settings)
+    assert turn_id is not None
+    async with sql.begin() as connection:
+        await connection.execute(update(TelegramAdmission).values(update_id=9999))
+    port = DeterministicManagedPort()
+    # The restarted worker finds the retained pending Turn, but cannot dispatch it.
+    assert await TelegramWorker(h["database"], settings, port).run_once()
+    assert port.calls == 0
+    turn, _ = await turn_and_conversation(h, turn_id)
+    assert turn.status == "FAILED" and turn.managed_dispatch_epoch is None

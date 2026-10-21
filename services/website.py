@@ -133,7 +133,11 @@ async def admit(database: Database, principal: Principal, request: AdmissionRequ
                 )
                 clock, burst_id, policy_version, quiet_ms, max_ms = (
                     await freeze_admission_membership(
-                        session, conversation, policy, conversation.last_message_sequence
+                        session, conversation, policy, conversation.last_message_sequence,
+                        separate_authority_epoch=catch_up.scope_enabled(
+                            settings, request.owner_id, request.integration_id,
+                            "WEBSITE_WIDGET", request.agent_id,
+                        ),
                     )
                 )
                 conversation.updated_at = clock

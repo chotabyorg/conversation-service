@@ -40,6 +40,8 @@ async def freeze_admission_membership(
     conversation: Conversation,
     policy: SettlingPolicy | None,
     sequence: int,
+    *,
+    separate_authority_epoch: bool = False,
 ) -> tuple[datetime, UUID | None, str | None, int | None, int | None]:
     """Freeze one accepted input into the open burst or create a new burst."""
     burst = await session.scalar(select(SettlingBurst).where(
@@ -47,6 +49,13 @@ async def freeze_admission_membership(
         SettlingBurst.closed_at.is_(None),
     ).with_for_update())
     clock = await db_clock(session)
+    if (burst is not None and separate_authority_epoch
+            and burst.tail_sequence <= conversation.authority_input_floor_sequence):
+        # Seal the old deadline without moving it or admitting post-Return input
+        # to a burst from a previous authority epoch.
+        burst.closed_at = burst.ready_at
+        await session.flush()
+        burst = None
     if burst is not None and clock < burst.ready_at:
         if sequence <= burst.tail_sequence:
             raise RuntimeError("Settling burst tail is not monotonic")

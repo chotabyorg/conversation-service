@@ -127,6 +127,10 @@ CUSTOMER tail must not emit another delayed customer-facing answer. Retain its
 terminal draft/operation references and record a superseded communication decision.
 Do not fabricate an old settling revision to force that result. Check the explicit
 catch-up completeness/current-tail proof at the existing locked send boundary.
+For a burst larger than the count or byte bound, its final residual Turn may
+communicate once it owns the current latest tail and all selected inputs still
+match their frozen admission proof. It remains ineligible for fresh effects:
+another Turn owned part of its original burst. Earlier prefixes stay suppressed.
 
 Continuous arrivals must not starve execution: due work may run while stale/incomplete
 responses remain suppressed. The oldest-ready Conversation ordering is preserved.
@@ -157,6 +161,9 @@ selection, fresh permits and send decisions. Group membership cannot cross the
 authority input floor established by handoff/Return. Return to AI requires a fresh
 post-Return input; it must not schedule old queued inputs as new agent work.
 Earlier HUMAN conversation remains context, not fresh confirmation authority.
+The first opt-in admission after an authority floor seals any older open burst at
+its original ready deadline and starts a new burst. It never extends that old
+deadline or attaches new confirmation input to a pre-Return burst.
 The old Handoff source must be reconciled with these rules before enrollment.
 
 ## Migration and release
