@@ -209,14 +209,26 @@ async def case_detail(
         ).all()
         has_more = len(rows) > limit
         rows = list(rows[:limit])
+        attempts = {
+            attempt.source_message_id: attempt
+            for attempt in (
+                await session.scalars(
+                    select(DeliveryAttempt).where(
+                        DeliveryAttempt.source_message_id.in_([message.id for message in rows]),
+                        DeliveryAttempt.conversation_id == conversation.id,
+                    )
+                )
+            ).all()
+        }
+        first_live_ordinal = await session.scalar(
+            select(func.min(DeliveryAttempt.outbound_ordinal)).where(
+                DeliveryAttempt.conversation_id == conversation.id,
+                DeliveryAttempt.writer_state == "LIVE",
+            )
+        )
         views: list[MessageView] = []
         for message in rows:
-            attempt = await session.scalar(
-                select(DeliveryAttempt).where(
-                    DeliveryAttempt.source_message_id == message.id,
-                    DeliveryAttempt.conversation_id == conversation.id,
-                )
-            )
+            attempt = attempts.get(message.id)
             state: (
                 Literal["PENDING", "PROVIDER_ACCEPTED", "FAILED", "UNKNOWN", "SUPERSEDED"] | None
             ) = None
@@ -240,18 +252,11 @@ async def case_detail(
                     }.get(attempt.status),
                 )
                 provider_id = attempt.provider_message_id
-                if attempt.outbound_ordinal is not None:
-                    blocked = bool(
-                        await session.scalar(
-                            select(DeliveryAttempt.id)
-                            .where(
-                                DeliveryAttempt.conversation_id == conversation.id,
-                                DeliveryAttempt.outbound_ordinal < attempt.outbound_ordinal,
-                                DeliveryAttempt.writer_state == "LIVE",
-                            )
-                            .limit(1)
-                        )
-                    )
+                blocked = (
+                    first_live_ordinal is not None
+                    and attempt.outbound_ordinal is not None
+                    and first_live_ordinal < attempt.outbound_ordinal
+                )
             views.append(
                 MessageView(
                     message_id=message.id,

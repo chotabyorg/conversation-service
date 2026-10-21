@@ -15,7 +15,7 @@ import pytest
 import pytest_asyncio
 from asgi_lifespan import LifespanManager
 from pydantic import SecretStr
-from sqlalchemy import func, select, text
+from sqlalchemy import event, func, select, text
 
 import services.authority as authority
 import services.delivery as delivery
@@ -1565,6 +1565,37 @@ async def test_covered_cp_revoke_acknowledges_only_inactive_scope_without_refenc
         scope = await session.get(InboxGrantScope, scope_id)
         assert scope is not None and scope.active and scope.cp_binding_generation == 6
         assert scope.grant_generation == 3 and scope.cp_binding_high_water == 5
+
+
+@pytest.mark.asyncio
+async def test_full_inbox_page_uses_bounded_delivery_queries(inbox_harness, user_me_transport):
+    ids = await seed_case(inbox_harness.database)
+    async with inbox_harness.database.session_factory() as session, session.begin():
+        root = await session.get(Conversation, ids["conversation_id"])
+        assert root is not None
+        root.last_message_sequence = 101
+        for sequence in range(2, 102):
+            session.add(Message(id=uuid4(), conversation_id=root.id, sequence=sequence,
+                actor="CUSTOMER", direction="INBOUND", content_type="TEXT",
+                text="Synthetic retained history"))
+    counts = []
+
+    def count_queries(_conn, _cursor, statement, _params, _context, _many):
+        if statement.lstrip().upper().startswith("SELECT") and "delivery_attempts" in statement:
+            counts.append(1)
+
+    engine = inbox_harness.database.engine.sync_engine
+    event.listen(engine, "before_cursor_execute", count_queries)
+    try:
+        result = await inbox_harness.client.get(
+            f"/public/v1/inbox/cases/{ids['case_id']}?limit=100",
+            headers=browser_headers("session-a"))
+        assert result.status_code == 200
+        assert len(result.json()["messages"]) == 100
+        assert result.json()["next_after_sequence"] == 100
+        assert len(counts) == 2
+    finally:
+        event.remove(engine, "before_cursor_execute", count_queries)
 
 
 @pytest.mark.parametrize("managed_version", [1, 2])
