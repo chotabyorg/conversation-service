@@ -82,7 +82,10 @@ The new browser path polls independently of sending customer messages. Polling
 selects at most one bounded eligible intent for its authenticated session. The
 gateway acquires that exact intent in the common journal before a socket write,
 with stable source/intent/ordinal/attempt plus supplier/process incarnation.
-The frame carries stable message identity for browser deduplication. No new
+The frame carries a stable opaque public delivery ID for browser deduplication;
+canonical Conversation, Turn, intent, attempt and supplier/process IDs stay
+private. The ID is retained with the original frame, not regenerated on retry.
+No new
 Turn, CRM operation, proposal or permit is created to deliver a HUMAN reply.
 
 | Event | Retained meaning |
@@ -90,10 +93,19 @@ Turn, CRM operation, proposal or permit is created to deliver a HUMAN reply.
 | No eligible intent | Empty poll; no writer acquired |
 | Positive begin | One authorized write for that exact original attempt |
 | HTTP write completed | Transport acceptance only; not read or human delivery |
-| Failure/disconnect/uncertain completion | FAILED or UNKNOWN as supported by positive original evidence; never infer success |
+| Confirmed failure of the original attempt | FAILED only with positive failure evidence from that attempt; never infer success |
+| Disconnect or uncertain completion | UNKNOWN without positive original failure evidence; never infer failure or success |
 | Retried poll after an uncertain acquired write | Recovery metadata only; no blind second send |
 | Exact replay of an already completed public response | Same retained frame identity/content; browser deduplicates it |
 | Positive task join or trusted retirement proof | Ends only the original writer; does not change the provider outcome or resend |
+
+Define a closed idle-poll DTO before implementation. Keep PENDING, DRAFT_READY,
+NO_RESPONSE, FAILED and UNKNOWN distinct in the existing private result path;
+the new transport must not collapse them into failure or a resend instruction.
+Wrong/expired credentials, wrong scope and unknown retained identities preserve
+the existing indistinguishable 404 behavior. Public recovery responses expose
+only bounded delivery state and the opaque public delivery ID; no internal IDs,
+canonical pending text, credential digests or execution metadata.
 
 An authenticated history read must not become an alternative delivery path for
 unacquired or UNKNOWN outbound intents. Visitor-facing history includes its own
