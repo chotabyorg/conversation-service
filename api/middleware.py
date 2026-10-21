@@ -18,6 +18,7 @@ MAX_BODY_BYTES = 65536
 STRICT_JSON_PREFIXES = (
     "/public/v1/inbox/",
     "/internal/v1/inbox-grants/",
+    "/internal/v1/outbound-writers/",
     "/internal/v2/telegram/delivery/",
     "/internal/v3/managed-turns/",
 )
@@ -196,7 +197,15 @@ class BoundaryMiddleware:
                     "/internal/v1/inbox-grants/provision",
                     "/internal/v1/inbox-grants/revoke",
                 }
-                if principal.role == "INBOX_LIFECYCLE":
+                writer_retire_path = "/internal/v1/outbound-writers/retire"
+                if principal.principal_id == "delivery-writer-supervisor":
+                    if path != writer_retire_path or scope["method"] != "POST":
+                        await reject(ErrorCode.NOT_FOUND)
+                        return
+                elif path.startswith("/internal/v1/outbound-writers/"):
+                    await reject(ErrorCode.NOT_FOUND)
+                    return
+                elif principal.role == "INBOX_LIFECYCLE":
                     if path not in lifecycle_paths or scope["method"] != "POST":
                         await reject(ErrorCode.NOT_FOUND)
                         return

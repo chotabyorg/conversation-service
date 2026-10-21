@@ -693,7 +693,7 @@ async def complete(
         if (
             intent.writer_supplier_instance_id != request.supplier_instance_id
             or intent.writer_process_incarnation_id != request.process_incarnation_id
-            or intent.writer_state not in {"LIVE", "ENDED"}
+            or intent.writer_state not in {"LIVE", "ENDED", "RETIRED"}
         ):
             raise DomainError(ErrorCode.INVALID_DELIVERY_TRANSITION)
         if request.work_kind != "RECOVER_ONLY" and intent.writer_state == "LIVE":
@@ -753,7 +753,7 @@ async def complete(
                             created_at=clock,
                         )
                     )
-        ended = intent.writer_state == "ENDED"
+        ended = intent.writer_state in {"ENDED", "RETIRED"}
         if request.writer_end is not None:
             if (
                 intent.writer_state == "LIVE"
@@ -764,7 +764,7 @@ async def complete(
                 intent.writer_state = "ENDED"
                 intent.writer_ended_at = await db_clock(session)
                 ended = True
-            elif intent.writer_state != "ENDED":
+            elif intent.writer_state not in {"ENDED", "RETIRED"}:
                 raise DomainError(ErrorCode.INVALID_DELIVERY_TRANSITION)
         await session.flush()
         return TelegramCompleteResult(

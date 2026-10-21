@@ -133,6 +133,9 @@ PRE_GOAL5_COLUMNS["delivery_attempts"] |= {
     "writer_process_incarnation_id",
     "writer_started_at",
     "writer_ended_at",
+    "writer_retirement_command_id",
+    "writer_retirement_fingerprint",
+    "writer_retirement_receipt",
 }
 PRE_GOAL5_COLUMNS["delivery_reconciliations"] |= {
     "expected_settling_revision",
@@ -262,6 +265,9 @@ async def goal4b_rows(sql):
             "writer_process_incarnation_id",
             "writer_started_at",
             "writer_ended_at",
+            "writer_retirement_command_id",
+            "writer_retirement_fingerprint",
+            "writer_retirement_receipt",
         }
     )
     omitted["delivery_reconciliations"].update(

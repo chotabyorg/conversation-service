@@ -604,6 +604,9 @@ class DeliveryAttempt(Base):
     writer_process_incarnation_id: Mapped[UUID | None] = mapped_column()
     writer_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     writer_ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    writer_retirement_command_id: Mapped[UUID | None] = mapped_column()
+    writer_retirement_fingerprint: Mapped[str | None] = mapped_column(CHAR(64))
+    writer_retirement_receipt: Mapped[dict[str, object] | None] = mapped_column(JSONB)
     ordinal: Mapped[int] = mapped_column(BigInteger, default=0, server_default=sql_text("0"))
     creation_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
     authority_revision: Mapped[int] = mapped_column(BigInteger, nullable=False)
@@ -630,6 +633,18 @@ class DeliveryAttempt(Base):
         UniqueConstraint("conversation_id", "delivery_key", name="uq_delivery_key"),
         UniqueConstraint("source_turn_id", "ordinal", name="uq_delivery_source_turn"),
         UniqueConstraint("source_message_id", name="uq_delivery_source_message"),
+        UniqueConstraint("conversation_id", "writer_retirement_command_id",
+                         name="uq_delivery_writer_retirement_command"),
+        CheckConstraint(
+            "(writer_retirement_command_id IS NULL AND writer_retirement_fingerprint IS NULL "
+            "AND writer_retirement_receipt IS NULL) OR (writer_state='RETIRED' "
+            "AND writer_retirement_command_id IS NOT NULL "
+            "AND writer_retirement_fingerprint IS NOT NULL "
+            "AND writer_retirement_fingerprint ~ '^[0-9a-f]{64}$' "
+            "AND writer_retirement_receipt IS NOT NULL "
+            "AND jsonb_typeof(writer_retirement_receipt)='object')",
+            name="ck_delivery_writer_retirement_receipt",
+        ),
         UniqueConstraint(
             "conversation_id", "outbound_ordinal", name="uq_delivery_outbound_ordinal"
         ),

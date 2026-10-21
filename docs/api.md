@@ -34,7 +34,7 @@ canonical assistant history only under the [explicit write policy](history-proje
 
 `GET /health` returns `{status:"ok",service:"conversation-service"}`.
 `GET /ready` returns ready200 only when DB query, migration
-`0012_shared_handoff` and required Conversation, permit, Inbox, Website
+`0013_writer_retirement` and required Conversation, permit, Inbox, Website
 and Telegram journal queries succeed; otherwise not_ready503. These are the only
 unauthenticated routes. `GET /internal/openapi.json` requires the service header.
 Default `/docs`, `/redoc`, `/openapi.json` are disabled. The fetched schema provides
@@ -291,13 +291,46 @@ terminalizes as `INVALID_RESULT` before AI instead of dropping evidence.
 str(outbound_intent_id))`. The first `begin` binds supplier and process incarnation
 under the same scope/root/intent locks as Return and revocation. Timeout and
 transport uncertainty remain UNKNOWN and are never blindly resent. A LIVE writer
-remains a barrier regardless of elapsed time or another poller's recovery; only a
-matching positive `TASK_JOINED` report from its original supplier ends it. A later
+remains a barrier regardless of elapsed time or another poller's recovery. A
+matching positive `TASK_JOINED` report from its original supplier or the exact
+supervisor protocol below ends it. A later
 fresh AGENT response can then proceed without changing the old outcome. Inbound
 events retained during HUMAN control or at/below the Return floor complete
 immediately with `AUTHORITY_FENCED`; they do not block ordered Telegram ingress.
 
-Migration `0012_shared_handoff` is required for readiness. Downgrade is
+### Permanent writer loss
+
+`POST /internal/v1/outbound-writers/retire` accepts exactly one dedicated
+`X-Writer-Retirement-Token`. Other service/lifecycle tokens cannot use this port;
+this credential cannot provision grants, send messages, create permits or change
+authority. The request is the complete Telegram v2 begin identity with
+`work_kind:RECOVER_ONLY`, a UUID `command_id`, `expected_delivery_revision` and
+UUID `proof_ref` (no text). It never grants another send.
+
+After preflight it releases all DB checkouts/locks and reads
+`POST {WRITER_SUPERVISOR_BASE_URL}/internal/v1/writer-termination/proof` using the
+separate `X-Writer-Supervisor-Token`, with an eight-second total deadline and a
+16 KiB response cap. The strict JSON response must echo
+every request field and the canonical SHA256 `request_fingerprint`, with
+`proof_kind:PROCESS_TERMINATED|TASKS_FENCED_AND_JOINED`, strict booleans
+`fenced:true,tasks_ended:true`, and UTC `observed_at`. The supervisor must have
+positive evidence for this exact supplier/process incarnation. A timeout, lease,
+missing pod, replacement process or caller assertion is insufficient. No
+production proof provider is shipped here; its implementation and acceptance
+remain an enrollment gate.
+
+Under the original scope/root/intent locks, exact revision and LIVE identity are
+checked again. Only then the existing writer becomes RETIRED. An unfinished
+DISPATCH_REQUESTED outcome becomes UNKNOWN/TRANSPORT_ERROR through the existing
+reconciliation ledger; an already observed outcome is preserved. The immutable
+command, proof and receipt live on that same intent. A lost ACK replays the
+stored receipt before contacting the supervisor or checking the newer delivery
+revision; changing the retained command payload conflicts. A late provider
+receipt from the original writer can refine UNKNOWN without reopening the
+writer, replacing the retirement evidence or sending again. Return remains a
+separate, owner-authorized Conversation transition.
+
+Migration `0013_writer_retirement` is required for readiness. Downgrade is
 refused while Handoff cases, command/lifecycle receipts, grant generations,
 Return floors, managed-v3 snapshots, delivery intents or writer evidence would be
 lost. Disable the exact cohort and worker for rollback; keep migrations and sticky

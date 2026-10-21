@@ -50,7 +50,7 @@ class Database:
     async def dispose(self) -> None:
         await self.engine.dispose()
 
-    async def ready(self, expected_revision: str = "0012_shared_handoff") -> bool:
+    async def ready(self, expected_revision: str = "0013_writer_retirement") -> bool:
         try:
             async with self.engine.connect() as connection:
                 if await connection.scalar(text("SELECT 1")) != 1:
@@ -95,6 +95,12 @@ class Database:
                         "authority_revision,authority_input_floor_sequence,"
                         "split_input_floor_sequence "
                         "FROM external_effect_permits LIMIT 1"
+                    )
+                )
+                await connection.execute(
+                    text(
+                        "SELECT writer_retirement_command_id,writer_retirement_fingerprint,"
+                        "writer_retirement_receipt FROM delivery_attempts LIMIT 1"
                     )
                 )
                 await connection.execute(
