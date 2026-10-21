@@ -2154,23 +2154,30 @@ async def test_live_human_writer_blocks_fresh_agent_until_original_task_joined(
     assert begun.json()["writer_state"] == "LIVE"
 
     case = sent["case"]
+    return_command = {
+        "command_id": str(uuid4()),
+        "expected_authority_revision": case["authority_revision"],
+        "expected_case_revision": case["case_revision"],
+    }
     returned = await inbox_harness.client.post(
         f"/public/v1/inbox/cases/{ids['case_id']}/return-to-agent",
-        json={
-            "command_id": str(uuid4()),
-            "expected_authority_revision": case["authority_revision"],
-            "expected_case_revision": case["case_revision"],
-        },
+        json=return_command,
         headers=browser_headers("session-a", write=True),
     )
-    assert returned.status_code == 200, returned.text
+    assert returned.status_code == 409, returned.text
+    assert returned.json()["detail"]["code"] == "TELEGRAM_WRITER_LIVE"
     async with inbox_harness.database.session_factory() as session:
         intent = await session.get(DeliveryAttempt, UUID(human_item["outbound_intent_id"]))
         assert intent is not None
         assert intent.writer_state == "LIVE"
+        conversation = await session.get(Conversation, ids["conversation_id"])
+        assert conversation is not None
+        assert conversation.control_mode == "HUMAN"
+        assert conversation.authority_revision == case["authority_revision"]
 
-    await add_fresh_agent_turn(inbox_harness, ids["conversation_id"])
     blocked_items = await telegram_work(inbox_harness)
+    assert len(blocked_items) == 1
+    assert blocked_items[0]["work_kind"] == "RECOVER_ONLY"
     assert all(item["source_kind"] != "AGENT_TURN" for item in blocked_items)
 
     complete = dict(begin)
@@ -2188,6 +2195,13 @@ async def test_live_human_writer_blocks_fresh_agent_until_original_task_joined(
     assert ended.status_code == 200, ended.text
     assert ended.json()["outcome"] == "UNKNOWN"
     assert ended.json()["writer_state"] == "ENDED"
+    returned = await inbox_harness.client.post(
+        f"/public/v1/inbox/cases/{ids['case_id']}/return-to-agent",
+        json=return_command,
+        headers=browser_headers("session-a", write=True),
+    )
+    assert returned.status_code == 200, returned.text
+    await add_fresh_agent_turn(inbox_harness, ids["conversation_id"])
     agent_items = await telegram_work(inbox_harness)
     assert len(agent_items) == 1
     assert agent_items[0]["source_kind"] == "AGENT_TURN"
