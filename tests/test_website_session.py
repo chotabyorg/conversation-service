@@ -17,6 +17,7 @@ from schemas.contracts import ErrorCode
 from schemas.website_session import WebsiteSessionAccess
 from services import website_session
 from tests.conftest import Harness, app_client, error, observed_waiters
+from tests.test_managed_migration import migrate
 
 
 @pytest_asyncio.fixture
@@ -230,3 +231,12 @@ async def test_database_rejects_cross_root_binding_and_excess_retention(sh, sql)
             async with sql.begin() as conn:
                 await conn.execute(text("UPDATE website_session_capabilities SET " + mutation
                                         + " WHERE conversation_id=:root"), {"root": root.id})
+
+
+async def test_migration_refuses_to_discard_credential_evidence(sh, database_url):
+    created = await issued(sh)
+    await sh.database.dispose()
+    rejected = migrate(database_url, "downgrade", "0013_writer_retirement", expected=1)
+    assert "Retained Website session credentials prevent downgrade" in rejected.stderr
+    assert await sh.database.ready()
+    await authorized(sh, access(sh, created))
