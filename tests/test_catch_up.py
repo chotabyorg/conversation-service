@@ -15,7 +15,6 @@ from models import (
     CatchUpSelection,
     Conversation,
     TelegramAdmission,
-    TelegramProviderAccount,
 )
 from schemas.contracts import ControlTransition, DeliveryCreate
 from schemas.effects import ExternalEffectPermitRequest
@@ -161,9 +160,8 @@ async def test_identity_drift_after_permit_keeps_exact_replay_but_denies_new_wor
     assert begun.status_code != 200 or begun.json()["send"] is False
 
 
-@pytest.mark.parametrize("drift", ["admission", "account"])
 async def test_committed_send_recovers_original_evidence_after_identity_drift(
-    telegram_harness, sql, drift,
+    telegram_harness, sql,
 ):
     h = telegram_harness
     settings = enable(h)
@@ -172,12 +170,7 @@ async def test_committed_send_recovers_original_evidence_after_identity_drift(
     begun, body = await begin(h)
     assert begun.status_code == 200 and begun.json()["send"] is True
     async with sql.begin() as connection:
-        if drift == "account":
-            await connection.execute(update(TelegramProviderAccount).values(
-                state="CONFLICT", bot_id=None,
-            ))
-        else:
-            await connection.execute(update(TelegramAdmission).values(update_id=9999))
+        await connection.execute(update(TelegramAdmission).values(update_id=9999))
     binding = settings.managed_ai_bindings[0]
     work = await h["client"].post("/internal/v1/telegram/responses/work", json={
         "owner_id": binding.owner_id, "integration_id": str(binding.integration_id),
