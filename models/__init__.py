@@ -1,3 +1,4 @@
+from models.catch_up import CatchUpMember, CatchUpSelection
 from models.entities import (
     AgentTurn,
     Conversation,
@@ -19,6 +20,7 @@ from models.entities import (
 from models.voice import VoiceCall, VoiceInput, VoicePlaybackEvent, VoiceResponse
 
 __all__ = [
+    "CatchUpMember", "CatchUpSelection",
     "VoiceCall", "VoiceInput", "VoicePlaybackEvent", "VoiceResponse",
     "AgentTurn",
     "Conversation",

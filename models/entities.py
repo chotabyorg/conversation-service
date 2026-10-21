@@ -359,6 +359,9 @@ class AgentTurn(Base):
         BigInteger, default=0, server_default=sql_text("0")
     )
     settling_burst_id: Mapped[UUID | None] = mapped_column()
+    catch_up_version: Mapped[int] = mapped_column(
+        SmallInteger, default=0, server_default=sql_text("0")
+    )
     status: Mapped[str] = mapped_column(
         String(16), default="PENDING", server_default=sql_text("'PENDING'")
     )
@@ -437,6 +440,9 @@ class AgentTurn(Base):
             "status IN ('PENDING','CLAIMED','COMPLETED','FAILED')", name="ck_turn_status"
         ),
         CheckConstraint("settling_revision >= 0", name="ck_turn_settling_revision"),
+        CheckConstraint("catch_up_version IN (0,1) AND (catch_up_version=0 OR "
+                        "(settling_burst_id IS NOT NULL AND managed_contract_version=2))",
+                        name="ck_turn_catch_up_version"),
         CheckConstraint("claim_epoch >= 0", name="ck_turn_epoch"),
         CheckConstraint(digest_check("creation_fingerprint"), name="ck_turn_creation_fingerprint"),
         CheckConstraint(digest_check("claim_token_digest"), name="ck_turn_claim_digest"),

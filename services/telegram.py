@@ -47,6 +47,7 @@ from schemas.telegram import (
 from schemas.telegram import (
     TelegramAdmission as AdmissionRequest,
 )
+from services import catch_up
 from services.common import (
     authorized_conversation,
     db_clock,
@@ -391,6 +392,8 @@ async def _validated_turn_admissions(
     turn: AgentTurn,
     agent_id: UUID,
 ) -> list[TelegramAdmissionRow]:
+    if turn.catch_up_version and not await catch_up.validate(session, conversation, turn, agent_id):
+        raise DomainError(ErrorCode.VALIDATION_ERROR)
     mapped = (await session.execute(select(TurnInputMessage, Message).join(
         Message, and_(Message.id == TurnInputMessage.message_id,
                       Message.conversation_id == TurnInputMessage.conversation_id),
@@ -419,7 +422,8 @@ async def _validated_turn_admissions(
     admissions: list[TelegramAdmissionRow] = []
     for _, message in mapped:
         if (message.actor != "CUSTOMER" or message.direction != "INBOUND"
-                or message.settling_burst_id != turn.settling_burst_id):
+                or (not turn.catch_up_version
+                    and message.settling_burst_id != turn.settling_burst_id)):
             raise DomainError(ErrorCode.VALIDATION_ERROR)
         admission = await session.scalar(select(TelegramAdmissionRow).where(
             TelegramAdmissionRow.canonical_message_id == message.id,
@@ -561,6 +565,8 @@ async def begin_response(database: Database, principal: Principal,
 
         settling = turn.settling_burst_id is not None
         stale = settling and conversation.settling_revision > turn.settling_revision
+        if turn.catch_up_version:
+            stale = stale or not await catch_up.communication_current(session, conversation, turn)
         expected_settling = turn.settling_revision if settling else None
         fenced_settling = conversation.settling_revision if settling else None
         if stale:

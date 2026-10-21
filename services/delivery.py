@@ -108,6 +108,9 @@ async def create_delivery(
                 )
                 if source is None:
                     raise DomainError(ErrorCode.NOT_FOUND)
+                if source.catch_up_version:
+                    # Catch-up sends must pass the channel's exact admission proof.
+                    raise DomainError(ErrorCode.INVALID_DELIVERY_TRANSITION)
                 existing_intent = await session.scalar(
                     select(DeliveryAttempt.id).where(
                         DeliveryAttempt.source_turn_id == source.id,
@@ -203,6 +206,9 @@ async def reconcile_delivery(
             if status != attempt.status and status not in TRANSITIONS[attempt.status]:
                 raise DomainError(ErrorCode.INVALID_DELIVERY_TRANSITION)
             if status == "DISPATCH_REQUESTED":
+                source = await session.get(AgentTurn, attempt.source_turn_id)
+                if source is None or source.catch_up_version:
+                    raise DomainError(ErrorCode.INVALID_DELIVERY_TRANSITION)
                 if conversation.control_mode != "AGENT":
                     raise DomainError(ErrorCode.CONTROL_MODE_CONFLICT)
                 if not (

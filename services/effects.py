@@ -33,6 +33,7 @@ from schemas.effects import (
     ExternalEffectPermitResult,
     request_fingerprint,
 )
+from services import catch_up
 from services.common import authorized_conversation, db_clock, unique_violation
 
 
@@ -97,6 +98,9 @@ async def _input_complete(
     ))
     if not selected_count:
         return False
+
+    if turn.catch_up_version:
+        return await catch_up.effect_complete(session, conversation, turn)
 
     if turn.settling_burst_id is None:
         return not await _exists(session, select(1).select_from(TurnInputMessage).join(
@@ -164,7 +168,15 @@ async def _split_floor(
         "WHERE burst.conversation_id=:conversation_id "
         "AND burst.tail_sequence > :origin_tail "
         "AND burst.tail_sequence <= :current_tail "
-        "AND EXISTS ("
+        "AND (EXISTS ("
+        " SELECT 1 FROM catch_up_members AS member "
+        " JOIN agent_turns AS selected ON selected.id=member.turn_id "
+        " AND selected.conversation_id=member.conversation_id "
+        " WHERE member.conversation_id=burst.conversation_id AND member.burst_id=burst.id "
+        " AND selected.catch_up_version=1 "
+        " AND (member.first_sequence>member.burst_first_sequence "
+        " OR member.last_sequence<member.burst_tail_sequence)"
+        ") OR EXISTS ("
         "  SELECT 1 FROM agent_turns AS candidate "
         "  WHERE candidate.conversation_id=burst.conversation_id "
         "    AND candidate.settling_burst_id=burst.id "
@@ -194,7 +206,7 @@ async def _split_floor(
         "            AND assignment.sequence=missing_message.sequence"
         "        )"
         "    )"
-        ") "
+        ")) "
         "ORDER BY burst.tail_sequence DESC LIMIT 1"
     ), {
         "conversation_id": conversation_id,

@@ -88,6 +88,15 @@ class SettlingPolicy(BaseModel):
         return self
 
 
+class CatchUpBinding(BaseModel):
+    """Explicit owner/agent text cohort; no global enable switch or Voice default."""
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    owner_id: OwnerId
+    integration_id: UUID
+    agent_id: UUID
+    channel: Literal[Channel.TELEGRAM, Channel.WEBSITE_WIDGET]
+
+
 TimeoutSeconds = Annotated[float, Field(strict=True, gt=0, le=240, allow_inf_nan=False)]
 
 
@@ -166,6 +175,11 @@ class Settings(BaseSettings):
     turn_settling_policies: Annotated[tuple[SettlingPolicy, ...], NoDecode] = Field(
         default=(), alias="TURN_SETTLING_POLICIES",
         validation_alias=AliasChoices("TURN_SETTLING_POLICIES", "turn_settling_policies"),
+        max_length=64, repr=False,
+    )
+    catch_up_bindings: Annotated[tuple[CatchUpBinding, ...], NoDecode] = Field(
+        default=(), alias="TURN_CATCH_UP_BINDINGS",
+        validation_alias=AliasChoices("TURN_CATCH_UP_BINDINGS", "catch_up_bindings"),
         max_length=64, repr=False,
     )
 
@@ -287,7 +301,7 @@ class Settings(BaseSettings):
                 raise ValueError("invalid Telegram configuration") from None
         return value
 
-    @field_validator("turn_settling_policies", mode="before")
+    @field_validator("turn_settling_policies", "catch_up_bindings", mode="before")
     @classmethod
     def parse_settling_policies(cls, value: object) -> object:
         if isinstance(value, str):
@@ -349,6 +363,17 @@ class Settings(BaseSettings):
                            for g in principal.grants):
                     raise ValueError("invalid Voice worker configuration")
         scopes = [entry.scope() for entry in self.managed_ai_bindings]
+        catch_up_scopes = [(b.owner_id, b.integration_id, b.channel, b.agent_id)
+                           for b in self.catch_up_bindings]
+        if len(set(catch_up_scopes)) != len(catch_up_scopes) or any(
+            not any((b.owner_id, b.integration_id, b.channel, b.agent_id) == scope
+                    for b in self.managed_ai_bindings)
+            or not any(p.channel == scope[2] and
+                       (p.integration_id is None or p.integration_id == scope[1])
+                       for p in self.turn_settling_policies)
+            for scope in catch_up_scopes
+        ):
+            raise ValueError("invalid catch-up configuration")
         if len(set(scopes)) != len(scopes):
             raise ValueError("invalid managed AI configuration")
         if any(entry.service_token.get_secret_value() in tokens

@@ -43,6 +43,7 @@ from schemas.website import (
 from schemas.website import (
     WebsiteAdmission as AdmissionRequest,
 )
+from services import catch_up
 from services.common import authorized_conversation, db_clock, fingerprint
 from services.settling import freeze_admission_membership
 
@@ -272,10 +273,15 @@ async def begin_response(database: Database, principal: Principal, request: Webs
             turn.settling_burst_id is not None
             and conversation.settling_revision > turn.settling_revision
         )
+        if turn.catch_up_version:
+            settling_stale = settling_stale or not await catch_up.communication_current(
+                session, conversation, turn,
+            )
         permission_current = (
             conversation.control_mode == "AGENT"
             and conversation.authority_revision == turn.authority_revision
             and settling_revision_is_current()
+            and not settling_stale
         )
         if delivery is not None:
             source = await session.scalar(select(WebsiteResponseAttempt).where(
