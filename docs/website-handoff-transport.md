@@ -26,6 +26,20 @@ unchanged. They cannot be promoted to a private mailbox by knowing their UUID.
 1. A new public `POST /v1/sessions` accepts only the widget key, not a requested
    existing session ID. Gateway revalidates the integration with Control Plane
    and derives owner/integration/agent from that trusted response.
+   Before enrollment, Gateway must enforce creation admission: 5 requests/minute
+   per integration and trusted client IP (burst 2), 60/minute per integration
+   across clients (burst 10), and one in-flight create per browser tab. Only a
+   configured trusted ingress may supply the client IP; arbitrary forwarded
+   headers cannot choose a rate-limit key. Conversation owns the durable quota:
+   at most 1,000 unexpired credentials per integration, checked under an
+   integration-scoped lock before insertion. These initial server-controlled
+   limits must hold across workers and restart, not only in process memory.
+   Control Plane owns integration validity, not anonymous visitor throttling.
+   Denial returns 429 with a bounded Retry-After and performs no root/credential
+   insert or AI admission. Polling is at most one in-flight request per session,
+   30/minute (burst 2). Acceptance must cover cross-worker concurrency, restart,
+   spoofed forwarding headers, aggregate quota and repeated lost-create replies.
+   Expiry frees quota but does not delete retained revocation/delivery evidence.
 2. Gateway requests a fresh session from a dedicated private Conversation port.
    Conversation generates the cryptographic UUID and 256-bit random bearer
    capability and atomically reserves that new canonical root and credential.
