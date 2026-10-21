@@ -723,10 +723,7 @@ async def begin_response(
         if request.response_attempt_id != expected_response_attempt_id(admission.id):
             raise DomainError(ErrorCode.DELIVERY_IDENTITY_CONFLICT)
         lifecycle_scope = await _locked_handoff_scope(session, admission)
-        if _ever_enrolled(lifecycle_scope):
-            # The scope lock is shared with provision/revoke. This closes the
-            # old-v1 writer versus Handoff enrollment TOCTOU.
-            raise DomainError(ErrorCode.NOT_FOUND)
+        historical_only = _ever_enrolled(lifecycle_scope)
         conversation = await authorized_conversation(
             session, principal, admission.conversation_id, lock=True
         )
@@ -791,6 +788,8 @@ async def begin_response(
                 or delivery.source_turn_id != turn.id
             ):
                 raise DomainError(ErrorCode.DELIVERY_IDENTITY_CONFLICT)
+            if historical_only and not attempt.send_authorized:
+                raise DomainError(ErrorCode.NOT_FOUND)
             if attempt.send_authorized:
                 if delivery.status == "DISPATCH_REQUESTED" and attempt.outcome is None:
                     clock = await db_clock(session)
@@ -826,6 +825,10 @@ async def begin_response(
                 replayed=True,
             )
 
+        if historical_only:
+            # Provision/revoke fences new v1 acquisitions, while the original
+            # acquired attempt above retains its no-send recovery identity.
+            raise DomainError(ErrorCode.NOT_FOUND)
         account = await _telegram_account(session, admission.owner_id, admission.integration_id)
         if account is None or account.state != "BOUND" or account.bot_id != admission.bot_id:
             raise DomainError(ErrorCode.NOT_FOUND)
@@ -942,9 +945,9 @@ async def complete_response(
             raise DomainError(ErrorCode.NOT_FOUND)
         if request.response_attempt_id != expected_response_attempt_id(admission.id):
             raise DomainError(ErrorCode.DELIVERY_IDENTITY_CONFLICT)
-        lifecycle_scope = await _locked_handoff_scope(session, admission)
-        if _ever_enrolled(lifecycle_scope):
-            raise DomainError(ErrorCode.NOT_FOUND)
+        # Exact retained v1 writer outcomes remain recordable after revocation.
+        # This path can neither acquire a writer nor authorize a provider send.
+        await _locked_handoff_scope(session, admission)
         conversation = await authorized_conversation(
             session, principal, admission.conversation_id, lock=True
         )

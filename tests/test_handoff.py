@@ -331,6 +331,47 @@ def browser_headers(token: str, *, write: bool = False) -> dict[str, str]:
     return headers
 
 
+@pytest.mark.asyncio
+async def test_empty_grant_principal_matches_no_conversations(inbox_harness):
+    from services.common import scope_filter
+    ids = await seed_case(inbox_harness.database)
+    principal = Principal(principal_id="empty-grant-reader", role="INBOX_LIFECYCLE", grants=())
+    async with inbox_harness.database.session_factory() as session:
+        assert await session.get(Conversation, ids["conversation_id"]) is not None
+        rows = list(await session.scalars(select(Conversation.id).where(scope_filter(principal))))
+    assert rows == []
+
+
+@pytest.mark.asyncio
+async def test_prior_operation_ref_bound_keeps_recent_turn_before_uuid_sort(inbox_harness):
+    from services.managed_execution_v3 import _prior_operation_refs
+    ids = await seed_case(inbox_harness.database)
+    recent_id = UUID(int=(1 << 128) - 1)
+    async with inbox_harness.database.session_factory() as session, session.begin():
+        current = await session.get(AgentTurn, ids["turn_id"])
+        assert current is not None
+        for turn_id, age, count in ((UUID(int=1), 2, 1), (recent_id, 1, 32)):
+            when = current.created_at - timedelta(seconds=age)
+            session.add(AgentTurn(
+                id=turn_id, conversation_id=current.conversation_id, selection_key=uuid4(),
+                creation_fingerprint="5" * 64, input_first_sequence=1, input_last_sequence=1,
+                context_last_sequence=1, input_revision=1, authority_revision=0,
+                status="COMPLETED", claim_epoch=1, claim_token_digest="6" * 64,
+                worker_ref="prior-reference-fixture", lease_expires_at=when + timedelta(minutes=1),
+                started_at=when, completed_at=when, created_at=when,
+                outcome="DRAFT_READY", draft_text="retained prior result",
+                terminal_fingerprint="7" * 64,
+                operation_refs=[dict(origin="AI_AGENT_SERVICE", operation_id=f"op-{index:02}",
+                                     outcome="UNKNOWN") for index in range(count)]))
+        await session.flush()
+        refs = await _prior_operation_refs(session, current.conversation_id, current)
+    assert len(refs) == 32
+    assert {ref.origin_turn_id for ref in refs} == {recent_id}
+    assert [ref.operation_ref.operation_id for ref in refs] == [
+        f"op-{index:02}" for index in range(32)
+    ]
+
+
 def lifecycle_proofs(
     request: InboxGrantProvision, *, binding_generation: int = 1, agent_generation: int = 1
 ):

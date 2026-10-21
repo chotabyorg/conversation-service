@@ -227,6 +227,7 @@ async def _prior_operation_refs(
                 )
             except (KeyError, TypeError, ValueError):
                 raise DomainError(ErrorCode.VALIDATION_ERROR) from None
+    values = values[:32]
     values.sort(
         key=lambda item: (
             str(item.origin_turn_id),
@@ -234,7 +235,7 @@ async def _prior_operation_refs(
             item.operation_ref.operation_id,
         )
     )
-    return values[:32]
+    return values
 
 
 async def _build_request(

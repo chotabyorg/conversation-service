@@ -324,7 +324,7 @@ blocking ordered update ingestion.
 
 Migration `0012_shared_handoff` adds the case, command receipt, grant
 generation, retained v3 snapshot, delivery ordering, writer lifecycle, and Return
-floor state. Readiness requires migration 0009. Downgrade is refused while any
+floor state. Readiness requires migration `0012_shared_handoff`. Downgrade is refused while any
 case, lifecycle/command receipt, active or historical grant generation, retained
 Return floor, v3 Turn snapshot/dispatch identity, or HUMAN delivery intent/evidence
 would be lost. Rollback therefore disables the exact cohort and worker while

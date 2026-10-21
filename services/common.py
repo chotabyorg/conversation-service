@@ -7,7 +7,7 @@ from datetime import datetime
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import and_, exists, func, or_, select
+from sqlalchemy import and_, exists, false, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
@@ -50,6 +50,7 @@ def current_test_database_clock() -> datetime | None:
 def scope_filter(principal: Principal) -> ColumnElement[bool]:
     # Each OR arm is an actual complete grant triple, never scalar allowlists.
     return or_(
+        false(),
         *(
             and_(
                 Conversation.owner_id == grant.owner_id,

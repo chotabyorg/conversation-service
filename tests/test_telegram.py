@@ -129,6 +129,58 @@ async def admit(client: httpx.AsyncClient, headers: dict[str, str], **changes: A
     return response
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lifecycle_source", ["CONTROL_PLANE_BINDING", "AI_AGENT"])
+async def test_revocation_keeps_acquired_v1_completion_and_no_send_recovery(
+    telegram_harness, lifecycle_source,
+):
+    from models import InboxGrantScope, TelegramResponseAttempt
+    from schemas.handoff import AiGrantRevoke, CpGrantRevoke, InboxGrantProvision
+    from services import inbox_lifecycle
+    from services.telegram_worker import TelegramWorker
+    h = telegram_harness
+    first = await admit(h["client"], h["gateway_headers"])
+    assert first.status_code == 200
+    worker = TelegramWorker(h["database"], h["settings"], DeterministicManagedPort())
+    assert await worker.run_once()
+    identity = {key: inbound()[key] for key in (
+        "owner_id", "integration_id", "agent_id", "provider_thread_id", "provider_event_id")}
+    attempt_id = expected_response_attempt_id(UUID(first.json()["admission_id"]))
+    body = {**identity, "response_attempt_id": str(attempt_id)}
+    begun = await h["client"].post("/internal/v1/telegram/responses/begin",
+                                    json=body, headers=h["gateway_headers"])
+    assert begun.status_code == 200 and begun.json()["send"]
+    settings = h["settings"].model_copy(update={"handoff_cohort_integration_ids": (INTEGRATION,)})
+    common = dict(contract_version=1, lifecycle_source=lifecycle_source, command_id=uuid4(),
+                  owner_id=OWNER, integration_id=INTEGRATION, channel="TELEGRAM", agent_id=AGENT)
+    request = (CpGrantRevoke(**common, source_binding_generation=1, target_binding_generation=2)
+               if lifecycle_source == "CONTROL_PLANE_BINDING" else
+               AiGrantRevoke(**common, agent_owner_id=uuid4(),
+                             source_agent_lifecycle_generation=1,
+                             target_agent_lifecycle_generation=2))
+    await inbox_lifecycle.revoke_grant(h["database"], settings, request)
+    recovery = await h["client"].post("/internal/v1/telegram/responses/begin",
+                                       json=body, headers=h["gateway_headers"])
+    assert recovery.status_code == 200
+    assert not recovery.json()["send"] and recovery.json()["work_kind"] == "RECOVER_ONLY"
+    completion = {**body, "outcome": "PROVIDER_ACCEPTED", "provider_message_id": "late-v1-501"}
+    completed = await h["client"].post("/internal/v1/telegram/responses/complete",
+                                        json=completion, headers=h["gateway_headers"])
+    assert completed.status_code == 200 and not completed.json()["replayed"]
+    replay = await h["client"].post("/internal/v1/telegram/responses/complete",
+                                     json=completion, headers=h["gateway_headers"])
+    assert replay.status_code == 200 and replay.json()["replayed"]
+    async with h["database"].session_factory() as session:
+        attempt = await session.get(TelegramResponseAttempt, attempt_id)
+        assert attempt.finished_at is not None and attempt.outcome == "PROVIDER_ACCEPTED"
+        scope = await session.get(InboxGrantScope, (OWNER, INTEGRATION, "TELEGRAM", AGENT))
+        assert scope is not None and not scope.active
+        assert not await inbox_lifecycle._has_unjoined_v1_writer(session, InboxGrantProvision(
+            contract_version=1, command_id=uuid4(), owner_id=OWNER,
+            integration_id=INTEGRATION, channel="TELEGRAM", agent_id=AGENT,
+            expected_binding_generation=2))
+
+
 async def _admit_distinct_private_chats(h: dict[str, Any], count: int, *, base: int):
     admission_ids = []
     for index in range(count):

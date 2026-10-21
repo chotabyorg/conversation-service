@@ -238,7 +238,7 @@ stale revisions or changed assignment return 409. No team/RBAC or foreign-accoun
 access is implied by the concurrent same-owner command behavior.
 
 Provisioning and lifecycle proofs use a private CP-only role named
-`control-plane-inbox-lifecycle` with `X-Service-Token`; revoke also accepts the
+`control-plane-inbox-lifecycle` with `X-Inbox-Lifecycle-Token`; revoke also accepts the
 AI-owned `ai-handoff-lifecycle` principal under the distinct lifecycle token.
 Conversation `POST /internal/v1/inbox-grants/provision` calls CP
 `POST /internal/v1/handoff/integration-proof` using `X-Inbox-Lifecycle-Token`
@@ -278,7 +278,7 @@ terminalizes as `INVALID_RESULT` before AI instead of dropping evidence.
 | --- | --- | --- |
 | POST `/internal/v2/telegram/delivery/work` | `{contract_version:2,owner_id,integration_id,agent_id,bot_id}` | up to100 ordered immutable items; AGENT turns and canonical HUMAN messages share one Conversation ordinal stream |
 | POST `/internal/v2/telegram/delivery/begin` | complete work identity including source, ordinal, attempt UUID, text plus `supplier_instance_id` and `process_incarnation_id` | exact retained text and identity plus `{send,writer_state,replayed}`; only first acquisition of `SEND_CANDIDATE` returns `send:true`; recovery and replays return false |
-| POST `/internal/v2/telegram/delivery/complete` | begin identity plus `PROVIDER_ACCEPTED` with provider ID, `FAILED` with `PROVIDER_REJECTED`, or `UNKNOWN` with `TIMEOUT|TRANSPORT_ERROR`; optional exact `TASK_JOINED` writer end | `{outbound_intent_id,response_attempt_id,outcome,writer_state,replayed}`; records positive provider evidence and/or original-task join; never claims read/delivery beyond Telegram send response |
+| POST `/internal/v2/telegram/delivery/complete` | begin identity plus `PROVIDER_ACCEPTED` with provider ID, `FAILED` with `PROVIDER_REJECTED`, or `UNKNOWN` with `TIMEOUT\|TRANSPORT_ERROR`; optional exact `TASK_JOINED` writer end | `{outbound_intent_id,response_attempt_id,outcome,writer_state,replayed}`; records positive provider evidence and/or original-task join; never claims read/delivery beyond Telegram send response |
 
 `response_attempt_id` is `uuid5(UUID("ec0df7d3-b0f4-4c6a-b16d-a02f80ebcde3"),
 str(outbound_intent_id))`. The first `begin` binds supplier and process incarnation
