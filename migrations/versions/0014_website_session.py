@@ -41,7 +41,12 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    if op.get_bind().execute(sa.text(
+    bind = op.get_bind()
+    # Issuance inserts the canonical parent before its credential. Preserve that
+    # lock order and stop concurrent root creation before checking emptiness.
+    bind.execute(sa.text("LOCK TABLE conversations IN SHARE ROW EXCLUSIVE MODE"))
+    bind.execute(sa.text("LOCK TABLE website_session_capabilities IN ACCESS EXCLUSIVE MODE"))
+    if bind.execute(sa.text(
         "SELECT EXISTS (SELECT 1 FROM website_session_capabilities)"
     )).scalar():
         raise RuntimeError("Retained Website session credentials prevent downgrade")

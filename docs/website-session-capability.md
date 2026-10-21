@@ -23,9 +23,9 @@ or disabling the port also denies access. The gateway's dynamic CP validation is
 still required in the transport implementation; this source slice is not proof
 of live CP freshness.
 
-`WEBSITE_SESSION_TTL_SECONDS` is server controlled, 60вЂ“86400 seconds (default 24h).
+`WEBSITE_SESSION_TTL_SECONDS` is server controlled, 60-86400 seconds (default 24h).
 The DB clock sets issue/expiry and is checked after the canonical root lock.
-`locked_access` checks the full grant, current server generation, agent, session,
+`locked_credential` checks the credential, current server generation, agent, session,
 digest, revocation and expiry inside the caller's transaction. All credential
 revocation writers must acquire this same root lock. Future Handoff paths acquire
 the common Inbox grant scope first, then this root, and keep the transaction

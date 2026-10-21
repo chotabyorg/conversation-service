@@ -240,3 +240,34 @@ async def test_migration_refuses_to_discard_credential_evidence(sh, database_url
     assert "Retained Website session credentials prevent downgrade" in rejected.stderr
     assert await sh.database.ready()
     await authorized(sh, access(sh, created))
+
+
+async def test_downgrade_waits_for_issuance_and_keeps_its_committed_credential(
+    sh, sql, database_url, monkeypatch,
+):
+    inserted, release = asyncio.Event(), asyncio.Event()
+    original_clock = website_session.db_clock
+    pids = []
+
+    async def paused_clock(session):
+        pids.append(await session.scalar(text("SELECT pg_backend_pid()")))
+        inserted.set()
+        await release.wait()
+        return await original_clock(session)
+
+    monkeypatch.setattr(website_session, "db_clock", paused_clock)
+    creating = asyncio.create_task(issued(sh))
+    migration = None
+    try:
+        await asyncio.wait_for(inserted.wait(), timeout=3)
+        migration = asyncio.create_task(asyncio.to_thread(
+            migrate, database_url, "downgrade", "0013_writer_retirement", expected=1))
+        await observed_waiters(sql, pids[0], 1, "website_session_downgrade_waits_for_issuer")
+    finally:
+        release.set()
+    created = await creating
+    assert migration is not None
+    rejected = await asyncio.wait_for(migration, timeout=30)
+    assert "Retained Website session credentials prevent downgrade" in rejected.stderr
+    assert await sh.database.ready()
+    await authorized(sh, access(sh, created))
