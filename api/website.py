@@ -1,7 +1,7 @@
 """Narrow trusted Website routes, isolated from foundation execution authority."""
 from uuid import UUID
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Response
 
 from api.dependencies import AppDatabase, AppManagedPort, AppSettings, TrustedPrincipal
 from schemas.website import (
@@ -15,10 +15,21 @@ from schemas.website import (
     WebsiteResponseCompleted,
     WebsiteResult,
 )
+from schemas.website_session import WebsiteSessionCreated, WebsiteSessionScope
 from services import website
 from services.website_evidence import operational_evidence
+from services.website_session import create as create_session
 
 router = APIRouter(prefix="/internal/v1/website")
+
+
+@router.post("/sessions", response_model=WebsiteSessionCreated, status_code=201)
+async def session_create(
+    request: WebsiteSessionScope, response: Response, database: AppDatabase,
+    principal: TrustedPrincipal, settings: AppSettings,
+) -> WebsiteSessionCreated:
+    response.headers["Cache-Control"] = "no-store"
+    return await create_session(database, principal, request, settings)
 
 
 @router.post("/admissions", response_model=WebsiteAdmissionResult)

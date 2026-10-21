@@ -64,6 +64,7 @@ class WebsiteBinding(BaseModel):
     owner_id: OwnerId
     integration_id: UUID
     agent_id: UUID
+    capability_generation: int | None = Field(default=None, ge=1, le=9223372036854775807)
 
 
 class ManagedBinding(BaseModel):
@@ -219,6 +220,16 @@ class Settings(BaseSettings):
         default=False,
         alias="WEBSITE_WORKER_ENABLED",
         validation_alias=AliasChoices("WEBSITE_WORKER_ENABLED", "website_worker_enabled"),
+    )
+    website_session_capabilities_enabled: bool = Field(
+        default=False, alias="WEBSITE_SESSION_CAPABILITIES_ENABLED",
+        validation_alias=AliasChoices(
+            "WEBSITE_SESSION_CAPABILITIES_ENABLED", "website_session_capabilities_enabled"
+        ),
+    )
+    website_session_ttl_seconds: int = Field(
+        default=86400, ge=60, le=86400, alias="WEBSITE_SESSION_TTL_SECONDS",
+        validation_alias=AliasChoices("WEBSITE_SESSION_TTL_SECONDS", "website_session_ttl_seconds"),
     )
     website_worker_principal_id: WorkerRef | None = Field(
         default=None,
@@ -635,6 +646,11 @@ class Settings(BaseSettings):
         identities = [(entry.owner_id, entry.integration_id) for entry in self.website_bindings]
         if len(set(identities)) != len(identities):
             raise ValueError("invalid website configuration")
+        if self.website_session_capabilities_enabled and (
+            not self.website_bindings
+            or any(entry.capability_generation is None for entry in self.website_bindings)
+        ):
+            raise ValueError("Website session capabilities require pinned binding generations")
         if self.website_worker_enabled:
             principal = next(
                 (

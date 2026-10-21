@@ -50,7 +50,7 @@ class Database:
     async def dispose(self) -> None:
         await self.engine.dispose()
 
-    async def ready(self, expected_revision: str = "0013_writer_retirement") -> bool:
+    async def ready(self, expected_revision: str = "0014_website_session") -> bool:
         try:
             async with self.engine.connect() as connection:
                 if await connection.scalar(text("SELECT 1")) != 1:
@@ -62,6 +62,10 @@ class Database:
                 )
                 if versions != [expected_revision]:
                     return False
+                await connection.execute(text(
+                    "SELECT conversation_id,token_digest,binding_generation,expires_at "
+                    "FROM website_session_capabilities LIMIT 1"
+                ))
                 await connection.execute(
                     text(
                         "SELECT t.catch_up_version,s.membership_fingerprint,m.ordinal "

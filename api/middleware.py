@@ -163,6 +163,7 @@ class BoundaryMiddleware:
                     await reject(ErrorCode.NOT_FOUND)
                     return
                 website_paths = {
+                    "/internal/v1/website/sessions",
                     "/internal/v1/website/admissions",
                     "/internal/v1/website/results",
                                  "/internal/v1/website/responses/begin",
