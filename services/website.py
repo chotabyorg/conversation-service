@@ -273,19 +273,9 @@ async def begin_response(database: Database, principal: Principal, request: Webs
                     and delivery.expected_settling_revision == turn.settling_revision
                     and delivery.fenced_settling_revision == turn.settling_revision)
 
-        settling_stale = (
-            turn.settling_burst_id is not None
-            and conversation.settling_revision > turn.settling_revision
-        )
-        if turn.catch_up_version:
-            settling_stale = settling_stale or not await catch_up.communication_current(
-                session, conversation, turn,
-            )
-        permission_current = (
+        authority_current = (
             conversation.control_mode == "AGENT"
             and conversation.authority_revision == turn.authority_revision
-            and settling_revision_is_current()
-            and not settling_stale
         )
         if delivery is not None:
             source = await session.scalar(select(WebsiteResponseAttempt).where(
@@ -295,8 +285,12 @@ async def begin_response(database: Database, principal: Principal, request: Webs
                 WebsiteResponseAttempt.send_authorized.is_(True),
                 WebsiteResponseAttempt.outcome == "WRITE_COMPLETED",
             ).order_by(WebsiteResponseAttempt.created_at, WebsiteResponseAttempt.id).limit(1))
-            if (source is not None and permission_current
-                    and persisted_settling_fence_is_current()):
+            # This returns the exact committed result without another write.
+            # Later input cannot revoke that result, but authority, the frozen
+            # admission proof and the original persisted fence still apply.
+            if (source is not None and authority_current
+                    and persisted_settling_fence_is_current()
+                    and await catch_up.validate(session, conversation, turn)):
                 return WebsiteResponseBegun(
                     action="REPLAY_COMPLETED",
                     response_attempt_id=request.response_attempt_id,
@@ -306,6 +300,18 @@ async def begin_response(database: Database, principal: Principal, request: Webs
                     replayed=True,
                     denial_reason=None,
                 )
+
+        settling_stale = (
+            turn.settling_burst_id is not None
+            and conversation.settling_revision > turn.settling_revision
+        )
+        if turn.catch_up_version:
+            settling_stale = settling_stale or not await catch_up.communication_current(
+                session, conversation, turn,
+            )
+        permission_current = (
+            authority_current and settling_revision_is_current() and not settling_stale
+        )
 
         if (attempt is not None and attempt.send_authorized
                 and attempt.outcome is None and delivery is not None
