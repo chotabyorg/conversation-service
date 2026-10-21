@@ -306,7 +306,8 @@ the legacy coordinator has resolved it. Generic
 `/delivery-attempts/{id}/reconcile` also rejects Telegram v2-tagged intents;
 legacy attempts retain their reconciliation path and do not acquire v2 FIFO
 ordinals during migration. Provider results and writer retirement for v2 intents
-must come from the original supplier's v2 completion identity.
+must come from the original supplier's v2 completion identity or the dedicated
+positive supervisor retirement protocol described in [the API](docs/api.md).
 
 Managed Handoff turns use strict v3 request/result contracts while existing
 v1/v2 paths stay intact. The v3 request keeps the frozen canonical message
@@ -317,15 +318,26 @@ UUIDs are stable UUIDv5 values derived from
 the immutable intent ID. A provider call happens only after the first `begin`
 returns `send=true`; replay/recovery never authorizes a second send. `UNKNOWN`
 is retained without blind retry. A LIVE writer is never released by elapsed time
-or another poller; only the original supplier's positive task-joined lifecycle
-receipt ends it. New inbound customer messages received during HUMAN mode or at
+or another poller. The original supplier's positive task-joined receipt or an
+independently verified supervisor termination proof ends it. New inbound customer messages received during HUMAN mode or at
 or below the Return floor are retained and reported `AUTHORITY_FENCED`, not left
 blocking ordered update ingestion.
 
 Migration `0012_shared_handoff` adds the case, command receipt, grant
 generation, retained v3 snapshot, delivery ordering, writer lifecycle, and Return
-floor state. Readiness requires migration `0012_shared_handoff`. Downgrade is refused while any
+floor state. Migration `0013_writer_retirement` adds immutable supervisor evidence
+on the original intent. Readiness requires `0013_writer_retirement`. Downgrade is refused while any
 case, lifecycle/command receipt, active or historical grant generation, retained
 Return floor, v3 Turn snapshot/dispatch identity, or HUMAN delivery intent/evidence
 would be lost. Rollback therefore disables the exact cohort and worker while
 keeping migration history and sticky bindings available for safe evidence replay.
+
+The retirement port is disabled unless all three private settings
+`WRITER_RETIREMENT_TOKEN`, `WRITER_SUPERVISOR_TOKEN` and
+`WRITER_SUPERVISOR_BASE_URL` are configured. Credentials must be distinct from
+each other and existing service, AI and lifecycle credentials. This repository
+defines and verifies the proof contract; it does not yet ship a production
+supervisor proof provider. Keep the production Handoff cohort empty until a
+provider can prove termination/fencing of the exact acquired supplier/process
+incarnation. Heartbeat expiry, a missing pod, a new poller or an owner click are
+not positive evidence. Lost legacy identities without such proof stay blocked.

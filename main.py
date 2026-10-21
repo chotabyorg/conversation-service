@@ -17,6 +17,7 @@ from api.telegram_v2 import router as telegram_v2_router
 from api.voice import router as voice_router
 from api.website import operations as processing_router
 from api.website import router as website_router
+from api.writer_retirement import router as writer_retirement_router
 from core.config import Settings, load_settings
 from core.logging import configure_logging, logger
 from db.database import Database
@@ -66,6 +67,7 @@ def create_app(
     application.include_router(health_router)
     application.include_router(internal_router)
     application.include_router(handoff_router)
+    application.include_router(writer_retirement_router)
     application.include_router(inbox_router)
     application.include_router(effects_router)
     application.include_router(telegram_router)

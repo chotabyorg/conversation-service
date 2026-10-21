@@ -335,6 +335,18 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("HANDOFF_LIFECYCLE_TOKEN", "handoff_ai_lifecycle_token"),
         repr=False,
     )
+    writer_retirement_token: ServiceToken | None = Field(
+        default=None, repr=False,
+        validation_alias=AliasChoices("WRITER_RETIREMENT_TOKEN", "writer_retirement_token"),
+    )
+    writer_supervisor_token: ServiceToken | None = Field(
+        default=None, repr=False,
+        validation_alias=AliasChoices("WRITER_SUPERVISOR_TOKEN", "writer_supervisor_token"),
+    )
+    writer_supervisor_base_url: str | None = Field(
+        default=None, repr=False,
+        validation_alias=AliasChoices("WRITER_SUPERVISOR_BASE_URL", "writer_supervisor_base_url"),
+    )
     inbox_require_verified_email: bool = Field(
         default=True,
         alias="INBOX_REQUIRE_VERIFIED_EMAIL",
@@ -387,7 +399,8 @@ class Settings(BaseSettings):
             raise ValueError("invalid managed AI configuration") from None
         return value.rstrip("/")
 
-    @field_validator("user_service_base_url", "cp_handoff_base_url", "ai_handoff_base_url")
+    @field_validator("user_service_base_url", "cp_handoff_base_url", "ai_handoff_base_url",
+                     "writer_supervisor_base_url")
     @classmethod
     def service_origin(cls, value: str | None) -> str | None:
         if value is None:
@@ -570,14 +583,16 @@ class Settings(BaseSettings):
             raise ValueError("incomplete Telegram handoff configuration")
         lifecycle_tokens = {
             token.get_secret_value()
-            for token in (self.inbox_lifecycle_token, self.handoff_ai_lifecycle_token)
+            for token in (self.inbox_lifecycle_token, self.handoff_ai_lifecycle_token,
+                          self.writer_retirement_token, self.writer_supervisor_token)
             if token is not None
         }
         if (
             len(lifecycle_tokens)
             != sum(
                 token is not None
-                for token in (self.inbox_lifecycle_token, self.handoff_ai_lifecycle_token)
+                for token in (self.inbox_lifecycle_token, self.handoff_ai_lifecycle_token,
+                              self.writer_retirement_token, self.writer_supervisor_token)
             )
             or lifecycle_tokens.intersection(tokens)
             or any(
@@ -586,6 +601,12 @@ class Settings(BaseSettings):
             )
         ):
             raise ValueError("invalid Telegram handoff credentials")
+        writer_ports = (self.writer_retirement_token, self.writer_supervisor_token,
+                        self.writer_supervisor_base_url)
+        if any(value is not None for value in writer_ports) and not all(
+            value is not None for value in writer_ports
+        ):
+            raise ValueError("incomplete writer supervisor configuration")
         if self.telegram_worker_enabled:
             principal = next(
                 (
