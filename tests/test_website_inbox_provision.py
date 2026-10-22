@@ -168,13 +168,24 @@ async def test_retained_website_scope_can_be_revoked_after_cohort_config_rollbac
     assert caught.value.code == ErrorCode.NOT_FOUND
 
 
-async def test_provisioned_visitor_handoff_claim_reply_join_return_and_new_ai_input(wh, suppliers):
+async def test_provisioned_visitor_handoff_claim_reply_join_return_and_new_ai_input(
+    wh, suppliers, monkeypatch,
+):
     await append(wh, "Нужен оператор")
     await due(wh)
     worker = WebsiteWorker(wh.database, wh.settings, WebsiteV3Port("HANDOFF"))
     assert await worker.run_once()
     human = HumanPrincipal(account_id=suppliers.account, email_verified=True,
                            consent_required=False)
+    from api import middleware
+
+    async def authenticated_owner(*_):
+        return human
+
+    monkeypatch.setattr(middleware, "authenticate_browser", authenticated_owner)
+    assert wh.settings.handoff_cohort_integration_ids == ()
+    public = await wh.client.get("/public/v1/inbox/cases")
+    assert public.status_code == 200 and len(public.json()["items"]) == 1
     page = await inbox.list_cases(wh.database, human, 20, None)
     assert len(page.items) == 1
     foreign = human.model_copy(update={"account_id": uuid4()})
