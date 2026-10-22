@@ -20,6 +20,8 @@ Revision = Annotated[StrictInt, Field(ge=0, le=9_223_372_036_854_775_807)]
 PositiveRevision = Annotated[StrictInt, Field(ge=1, le=9_223_372_036_854_775_807)]
 Generation = Annotated[StrictInt, Field(ge=0, le=9_223_372_036_854_775_807)]
 PositiveGeneration = Annotated[StrictInt, Field(ge=1, le=9_223_372_036_854_775_807)]
+HandoffChannel = Literal["TELEGRAM", "WEBSITE_WIDGET"]
+
 ContractVersion1 = Annotated[StrictInt, Field(ge=1, le=1)]
 ContractVersion2 = Annotated[StrictInt, Field(ge=2, le=2)]
 
@@ -35,7 +37,7 @@ class CaseSummary(Contract):
     conversation_id: UUID
     owner_id: OwnerId
     integration_id: UUID
-    channel: Literal["TELEGRAM"]
+    channel: HandoffChannel
     provider_thread_id: ExternalId
     status: Literal["OPEN", "CLAIMED", "RETURNED"]
     case_revision: PositiveRevision
@@ -127,7 +129,7 @@ class CpBindingProofRequest(Contract):
     command_id: UUID
     owner_id: OwnerId
     integration_id: UUID
-    channel: Literal["TELEGRAM"]
+    channel: HandoffChannel
     agent_id: UUID
     expected_binding_generation: Generation
 
@@ -137,7 +139,7 @@ class CpBindingProof(Contract):
     account_id: UUID
     owner_id: OwnerId
     integration_id: UUID
-    channel: Literal["TELEGRAM"]
+    channel: HandoffChannel
     agent_id: UUID
     binding_generation: Generation
 
@@ -146,7 +148,7 @@ class AiAgentProofRequest(Contract):
     contract_version: ContractVersion1
     owner_id: OwnerId
     integration_id: UUID
-    channel: Literal["TELEGRAM"]
+    channel: HandoffChannel
     agent_id: UUID
 
 
@@ -154,7 +156,7 @@ class AiAgentProof(Contract):
     contract_version: ContractVersion1
     owner_id: OwnerId
     integration_id: UUID
-    channel: Literal["TELEGRAM"]
+    channel: HandoffChannel
     agent_id: UUID
     agent_owner_id: UUID
     agent_lifecycle_generation: Generation
@@ -165,7 +167,7 @@ class InboxGrantProvision(Contract):
     command_id: UUID
     owner_id: OwnerId
     integration_id: UUID
-    channel: Literal["TELEGRAM"]
+    channel: HandoffChannel
     agent_id: UUID
     expected_binding_generation: Generation
 
@@ -176,7 +178,7 @@ class InboxGrantProvisioned(Contract):
     account_id: UUID
     owner_id: OwnerId
     integration_id: UUID
-    channel: Literal["TELEGRAM"]
+    channel: HandoffChannel
     agent_id: UUID
     binding_generation: Generation
     agent_owner_id: UUID
@@ -192,7 +194,7 @@ class InboxGrantRevokeBase(Contract):
     command_id: UUID
     owner_id: OwnerId
     integration_id: UUID
-    channel: Literal["TELEGRAM"]
+    channel: HandoffChannel
     agent_id: UUID
 
 
@@ -229,7 +231,7 @@ class InboxGrantRevokedBase(Contract):
     command_id: UUID
     owner_id: OwnerId
     integration_id: UUID
-    channel: Literal["TELEGRAM"]
+    channel: HandoffChannel
     agent_id: UUID
     grant_generation: Generation
     active: Literal[False]

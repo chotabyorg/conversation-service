@@ -60,8 +60,9 @@ def _wire_fingerprint(request: BaseModel) -> str:
     return fingerprint(request.model_dump(mode="json"))
 
 
-def _cohort(settings: Settings, integration_id: UUID) -> None:
-    if integration_id not in settings.handoff_cohort_integration_ids:
+def _cohort(settings: Settings, integration_id: UUID, channel: str) -> None:
+    # Reader support does not enroll Website before its full transport ships.
+    if channel != "TELEGRAM" or integration_id not in settings.handoff_cohort_integration_ids:
         raise DomainError(ErrorCode.NOT_FOUND)
 
 
@@ -363,7 +364,7 @@ async def provision_grant(
     settings: Settings,
     request: InboxGrantProvision,
 ) -> InboxGrantProvisioned:
-    _cohort(settings, request.integration_id)
+    _cohort(settings, request.integration_id, request.channel)
     kind = "PROVISION"
     digest = _wire_fingerprint(request)
     replay = await _preflight(database, request, kind, InboxGrantProvisioned)
@@ -560,7 +561,7 @@ async def revoke_grant(
     settings: Settings,
     request: CpGrantRevoke | AiGrantRevoke,
 ) -> CpGrantRevoked | AiGrantRevoked:
-    _cohort(settings, request.integration_id)
+    _cohort(settings, request.integration_id, request.channel)
     kind = _revoke_kind(request)
     digest = _wire_fingerprint(request)
     ack_model: type[CpGrantRevoked] | type[AiGrantRevoked]
@@ -629,7 +630,7 @@ async def revoke_grant(
                     command_id=request.command_id,
                     owner_id=request.owner_id,
                     integration_id=request.integration_id,
-                    channel="TELEGRAM",
+                    channel=request.channel,
                     agent_id=request.agent_id,
                     grant_generation=scope.grant_generation,
                     active=False,
@@ -646,7 +647,7 @@ async def revoke_grant(
                     command_id=request.command_id,
                     owner_id=request.owner_id,
                     integration_id=request.integration_id,
-                    channel="TELEGRAM",
+                    channel=request.channel,
                     agent_id=request.agent_id,
                     grant_generation=scope.grant_generation,
                     active=False,

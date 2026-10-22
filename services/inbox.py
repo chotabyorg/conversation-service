@@ -63,7 +63,7 @@ def _summary(case: HandoffCase, conversation: Conversation) -> CaseSummary:
         conversation_id=conversation.id,
         owner_id=case.owner_id,
         integration_id=case.integration_id,
-        channel=cast(Literal["TELEGRAM"], case.channel),
+        channel=cast(Literal["TELEGRAM", "WEBSITE_WIDGET"], case.channel),
         provider_thread_id=conversation.provider_thread_id,
         status=cast(Literal["OPEN", "CLAIMED", "RETURNED"], case.status),
         case_revision=case.case_revision,

@@ -237,12 +237,12 @@ async def test_migration_refuses_to_discard_credential_evidence(sh, database_url
     created = await issued(sh)
     await sh.database.dispose()
     rejected = migrate(database_url, "downgrade", "0013_writer_retirement", expected=1)
-    assert "Retained Website session credentials prevent downgrade" in rejected.stderr
+    assert "Retained Website session credentials and common grant epochs prevent downgrade" in rejected.stderr
     assert await sh.database.ready()
     await authorized(sh, access(sh, created))
 
 
-async def test_downgrade_waits_for_issuance_and_keeps_its_committed_credential(
+async def test_downgrade_refuses_during_issuance_and_keeps_its_committed_credential(
     sh, sql, database_url, monkeypatch,
 ):
     inserted, release = asyncio.Event(), asyncio.Event()
@@ -262,12 +262,13 @@ async def test_downgrade_waits_for_issuance_and_keeps_its_committed_credential(
         await asyncio.wait_for(inserted.wait(), timeout=3)
         migration = asyncio.create_task(asyncio.to_thread(
             migrate, database_url, "downgrade", "0013_writer_retirement", expected=1))
-        await observed_waiters(sql, pids[0], 1, "website_session_downgrade_waits_for_issuer")
+        rejected = await asyncio.wait_for(migration, timeout=30)
+        assert "common grant epochs prevent downgrade" in rejected.stderr
     finally:
         release.set()
     created = await creating
     assert migration is not None
     rejected = await asyncio.wait_for(migration, timeout=30)
-    assert "Retained Website session credentials prevent downgrade" in rejected.stderr
+    assert "Retained Website session credentials and common grant epochs prevent downgrade" in rejected.stderr
     assert await sh.database.ready()
     await authorized(sh, access(sh, created))

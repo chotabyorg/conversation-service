@@ -45,3 +45,28 @@ Handoff merely because this issuance port exists.
 Credential validation alone grants no content access. The transport must also check
 the shared active grant epoch, both supplier proofs and their durable revocation
 floors before any content read/admit/send; this helper is not that combined gate.
+
+## Common grant credential gate
+
+`locked_access` composes visitor authentication with the existing `InboxGrantScope`,
+shared provision receipt and current CP/AI proofs. It requires a caller-owned
+transaction and retains the common scope lock before the canonical root lock
+through protected use. It does not expose a public content or delivery endpoint.
+Issuance under an active common grant records its grant generation, AI lifecycle
+generation and original provision command UUID; the existing binding generation
+records CP's generation. CP proof reuses that retained command identity.
+
+Wrong visitors are rejected before supplier I/O. A valid visitor still needs both
+fresh proofs, matching account/agent identity, the exact retained provision receipt,
+and generations strictly above both shared revocation floors. Supplier outage
+fails closed. Revoke and reenrollment cannot promote an old credential into a new
+epoch, including after restart or stale configuration rollback. Foundation
+credentials issued without a grant retain null epoch fields and cannot use this
+content gate after later enrollment. The migration does not backfill authority.
+
+The schema can read Website cases and lifecycle receipts, but fresh Website common
+provision/revoke remains rejected before supplier calls. Enabling it requires the
+remaining legacy Website fencing, common managed v3 execution, idle delivery and
+writer retirement work. No new lifecycle store or delivery mechanism is introduced.
+Migration 0015 refuses downgrade unconditionally to preserve retained epochs;
+before enabling issuance, prepare a compatible rollback reader or forward fix.
