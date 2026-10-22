@@ -188,7 +188,16 @@ async def begin(database: Database, principal: Principal, request: WebsiteDelive
                     send=False, replayed=False, recovery=_recovery(intent))
             current = (_valid_authority(intent, source, root, grant)
                 and await _current_catch_up_source(session, source, root))
+        from schemas.writer_retirement import WebsiteWriterIdentity
+
+        registered_descriptor = WebsiteWriterIdentity.model_validate({
+            **{key: value for key, value in request.model_dump(mode="json").items()
+               if key in WebsiteWriterIdentity.model_fields},
+            "conversation_id": str(root.id), "channel": "WEBSITE_WIDGET", "contract_version": 1,
+        })
         decision = await begin_writer(session, intent, root, source,
+            attestation_required=settings.writer_attestation_required,
+            registration_descriptor=registered_descriptor.model_dump(mode="json"),
             recover_only=request.recover_only, current=current,
             supplier_instance_id=request.supplier_instance_id,
             process_incarnation_id=request.process_incarnation_id,

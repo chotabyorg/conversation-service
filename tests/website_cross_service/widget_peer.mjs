@@ -60,7 +60,13 @@ try {
   await page.getByRole('button', { name: 'Открыть чат', exact: true }).click();
   async function send(text) {
     await page.locator('.chw-input').fill(text);
+    const admitted = page.waitForResponse(response =>
+      new URL(response.url()).pathname === '/v1/sessions/messages' &&
+      response.request().method() === 'POST');
     await page.getByRole('button', { name: 'Отправить', exact: true }).click();
+    const response = await admitted;
+    assert.equal(response.status(), 202);
+    assert.equal((await response.json()).status, 'ACCEPTED');
     await page.waitForFunction(() => !document.querySelector('.chw-input').disabled);
     assert.equal(await page.locator('.chw-retry').count(), 0);
   }

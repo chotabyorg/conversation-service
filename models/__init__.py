@@ -26,8 +26,10 @@ from models.website_admission_limit import WebsiteCreationBucket
 from models.website_history import WebsiteVisibleMessage
 from models.website_poll import WebsitePollState
 from models.website_session import WebsiteSessionCapability
+from models.writer_attestation import WriterRecoveryCommand, WriterRegistration, WriterWitness
 
 __all__ = [
+    "WriterRecoveryCommand", "WriterRegistration", "WriterWitness",
     "WebsitePollState",
     "WebsiteCreationBucket",
     "WebsiteVisibleMessage",

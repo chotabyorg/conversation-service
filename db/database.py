@@ -50,7 +50,7 @@ class Database:
     async def dispose(self) -> None:
         await self.engine.dispose()
 
-    async def ready(self, expected_revision: str = "0018_website_poll_admission") -> bool:
+    async def ready(self, expected_revision: str = "0019_writer_attestation") -> bool:
         try:
             async with self.engine.connect() as connection:
                 if await connection.scalar(text("SELECT 1")) != 1:
@@ -62,6 +62,10 @@ class Database:
                 )
                 if versions != [expected_revision]:
                     return False
+                await connection.execute(text(
+                    "SELECT r.id,w.proof_ref,c.command FROM writer_registrations r "
+                    "LEFT JOIN writer_witnesses w ON w.registration_id=r.id "
+                    "LEFT JOIN writer_recovery_commands c ON c.registration_id=r.id LIMIT 1"))
                 await connection.execute(text(
                     "SELECT conversation_id,token_digest,binding_generation,expires_at,"
                     "grant_generation,agent_lifecycle_generation,provision_command_id "

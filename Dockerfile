@@ -9,7 +9,7 @@ ENV PATH="/opt/venv/bin:$PATH" PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 RUN groupadd --gid 10001 conversation && useradd --uid 10001 --gid conversation --no-create-home conversation
 WORKDIR /app
 COPY --from=dependencies /opt/venv /opt/venv
-COPY main.py worker.py telegram_worker.py voice_worker.py alembic.ini ./
+COPY main.py worker.py telegram_worker.py voice_worker.py retirement_worker.py alembic.ini ./
 COPY core/ ./core/
 COPY db/ ./db/
 COPY models/ ./models/

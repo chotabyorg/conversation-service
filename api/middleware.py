@@ -19,6 +19,8 @@ STRICT_JSON_PREFIXES = (
     "/public/v1/inbox/",
     "/internal/v1/inbox-grants/",
     "/internal/v1/outbound-writers/",
+    "/internal/v1/writer-attestations/",
+    "/internal/v1/writer-termination/",
     "/internal/v2/telegram/delivery/",
     "/internal/v3/managed-turns/",
 )
@@ -209,8 +211,29 @@ class BoundaryMiddleware:
                     "/internal/v1/inbox-grants/revoke",
                 }
                 writer_retire_path = "/internal/v1/outbound-writers/retire"
-                if principal.principal_id == "delivery-writer-supervisor":
-                    if path != writer_retire_path or scope["method"] != "POST":
+                attestation_paths = {
+                    "/internal/v1/writer-attestations/register",
+                    "/internal/v1/writer-attestations/witness",
+                }
+                recovery_path = "/internal/v1/outbound-writers/recovery"
+                proof_path = "/internal/v1/writer-termination/proof"
+                if principal.principal_id.startswith("writer-producer:"):
+                    if (principal.role != "INBOX_LIFECYCLE"
+                        or path not in attestation_paths or scope["method"] != "POST"):
+                        await reject(ErrorCode.NOT_FOUND)
+                        return
+                elif principal.principal_id == "writer-proof-reader":
+                    if (principal.role != "INBOX_LIFECYCLE"
+                        or path != proof_path or scope["method"] != "POST"):
+                        await reject(ErrorCode.NOT_FOUND)
+                        return
+                elif path in attestation_paths or path == proof_path:
+                    await reject(ErrorCode.NOT_FOUND)
+                    return
+                elif principal.principal_id == "delivery-writer-supervisor":
+                    if (principal.role != "INBOX_LIFECYCLE"
+                        or path not in {writer_retire_path, recovery_path}
+                        or scope["method"] != "POST"):
                         await reject(ErrorCode.NOT_FOUND)
                         return
                 elif path.startswith("/internal/v1/outbound-writers/"):

@@ -422,6 +422,8 @@ async def begin(
                 intent, source, conversation, scope, account, int(request.bot_id)
             ) and await _current_catch_up_source(session, source, conversation)
         decision = await begin_writer(session, intent, conversation, source,
+            attestation_required=settings.writer_attestation_required,
+            registration_descriptor=request.model_dump(mode="json"),
             recover_only=request.work_kind == "RECOVER_ONLY", current=current,
             supplier_instance_id=request.supplier_instance_id,
             process_incarnation_id=request.process_incarnation_id,

@@ -136,6 +136,7 @@ class WebsiteHarness:
                         "CONVERSATION_S2S_TOKEN": self.tokens["website"],
                         "CONVERSATION_RESULT_WAIT_SECONDS": "4",
                         "CONVERSATION_RESULT_POLL_SECONDS": "0.05",
+                        "CONVERSATION_RESULT_POLL_INITIAL_SECONDS": "0.05",
                         "CONVERSATION_REQUEST_TIMEOUT_SECONDS":
                             "10" if self.settling_enabled else "1",
                         "MANAGED_WEBSITE_GUARDED_INTEGRATIONS": json.dumps(guard_values),
