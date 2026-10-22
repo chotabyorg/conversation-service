@@ -31,13 +31,28 @@ async def enrolled(wh, *, retained="generation"):
             row.grant_generation = 2
         elif retained == "cp_floor":
             row.cp_binding_high_water = 8
-        else:
+        elif retained == "ai_floor":
             row.agent_lifecycle_high_water = 12
 
 
 async def root(wh):
     async with wh.database.session_factory() as session:
         return await session.scalar(select(Conversation))
+
+
+async def test_unenrolled_legacy_website_does_not_create_common_lifecycle_rows(wh, sql):
+    await admit(wh, payload(wh))
+    assert await wh.worker.run_once()
+    conversation = await root(wh)
+    turn_id = wh.ai.calls[0].request.turn_id
+    await delivery.create_delivery(wh.database, wh.principal, conversation.id,
+        DeliveryCreate(delivery_key=uuid4(), source_turn_id=turn_id,
+                       expected_authority_revision=conversation.authority_revision),
+        settings=wh.settings)
+    await authority.transition_control(wh.database, wh.principal, conversation.id,
+        ControlTransition(control_mode="HUMAN", expected_authority_revision=0), wh.settings)
+    async with sql.connect() as conn:
+        assert await conn.scalar(text("SELECT count(*) FROM inbox_grant_scopes")) == 0
 
 
 @pytest.mark.parametrize("retained", ["generation", "cp_floor", "ai_floor"])
@@ -177,6 +192,7 @@ async def test_uuid_only_admission_cannot_attach_to_credentialed_root(wh, route,
 
 
 async def test_website_admission_waiter_observes_scope_enrollment(wh, sql):
+    await enrolled(wh, retained="empty")
     value = payload(wh)
     await admit(wh, value)
     async with wh.database.session_factory() as blocker, blocker.begin():
