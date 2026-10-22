@@ -69,7 +69,7 @@ async def lock_legacy_scopes(
             # recheck orders a concurrent first enrollment when no row exists.
             row = await session.scalar(select(InboxGrantScope).filter_by(owner_id=owner_id,
                 integration_id=integration_id, channel=channel, agent_id=agent_id)
-                .with_for_update().execution_options(populate_existing=True))
+                .with_for_update(read=True).execution_options(populate_existing=True))
         if row is not None:
             scopes.append(row)
     return any(telegram._ever_enrolled(row) for row in scopes)
