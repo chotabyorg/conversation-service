@@ -8,9 +8,9 @@ has no production consumers or enrollment yet.
 
 Conversation serializes creation by integration after the common grant scope lock.
 Within that transaction it checks the database clock, reserves GCRA admission and
-inserts the fresh root and capability. Limits are5/minute per integration+IP with
-burst2,60/minute per integration with burst10, and1000 unexpired credentials per
-integration. Quota includes revoked credentials until expiry. Denial returns429
+inserts the fresh root and capability. Limits are 5/minute per integration+IP with
+burst 2, 60/minute per integration with burst 10, and 1,000 unexpired credentials per
+integration. Quota includes revoked credentials until expiry. Denial returns 429
 with bounded Retry-After and creates no root, capability or new client bucket.
 
 PostgreSQL stores only scoped bucket digests and theoretical arrival timestamps.
