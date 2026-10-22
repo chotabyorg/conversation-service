@@ -5,8 +5,8 @@ import pytest
 from sqlalchemy import func, select
 
 from core.errors import DomainError
-from models import AgentTurn, Conversation, HandoffCase, InboxGrantScope
-from schemas.contracts import ErrorCode, TurnClaim, TurnExecute
+from models import AgentTurn, Conversation, HandoffCase, InboxGrantScope, Message
+from schemas.contracts import Channel, ErrorCode, TurnClaim, TurnExecute
 from schemas.managed_v3 import (
     ControlEvidenceResult,
     HandoffControlRequest,
@@ -14,9 +14,10 @@ from schemas.managed_v3 import (
     ManagedTurnV3Result,
 )
 from services import turns
+from services.common import db_clock
 from services.managed_client import handoff_request_id, prepare_v3_request
 from services.managed_execution_v3 import execute_claimed_turn_v3
-from services.website_worker import select_immediate
+from services.settling import _create_turn
 from tests.test_handoff import SealedUnknownPort
 from tests.test_website import admit, payload
 from tests.test_website import wh as website_fixture
@@ -55,16 +56,16 @@ class WebsiteV3Port(SealedUnknownPort):
 
 async def selected(wh):
     await admit(wh, payload(wh))
-    turn_id = await select_immediate(wh.database, wh.principal, wh.settings)
-    assert turn_id is not None
     async with wh.database.session_factory() as session, session.begin():
-        turn = await session.get(AgentTurn, turn_id)
-        turn.managed_contract_version = 3
         scope = await session.scalar(select(InboxGrantScope).where(
             InboxGrantScope.agent_id == UUID(wh.agent_id)).with_for_update())
         scope.active, scope.grant_generation = True, 1
         scope.cp_binding_generation = scope.agent_lifecycle_generation = 1
         scope.account_id = scope.agent_owner_id = uuid4()
+        root = await session.scalar(select(Conversation).with_for_update())
+        message = await session.scalar(select(Message))
+        turn_id = await _create_turn(session, root, [message], wh.settings.managed_ai_bindings[0],
+            Channel.WEBSITE_WIDGET, await db_clock(session), handoff_enrolled=True)
     claim = await turns.claim_turn(wh.database, wh.principal, turn_id,
                                   TurnClaim(worker_ref="website-v3-test", lease_seconds=30))
     proof = TurnExecute(claim_epoch=claim.turn.claim_epoch, claim_token=claim.claim_token)
