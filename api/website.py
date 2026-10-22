@@ -15,12 +15,20 @@ from schemas.website import (
     WebsiteResponseCompleted,
     WebsiteResult,
 )
+from schemas.website_delivery import (
+    WebsiteDeliveryBegin,
+    WebsiteDeliveryBegun,
+    WebsiteDeliveryComplete,
+    WebsiteDeliveryCompleted,
+    WebsiteDeliveryWorkResult,
+)
 from schemas.website_session import (
+    WebsiteSessionAccess,
     WebsiteSessionAdmission,
     WebsiteSessionCreated,
     WebsiteSessionScope,
 )
-from services import website, website_ingress
+from services import website, website_delivery, website_ingress
 from services.website_evidence import operational_evidence
 from services.website_session import create as create_session
 
@@ -47,6 +55,29 @@ async def session_admit(
     principal: TrustedPrincipal, settings: AppSettings,
 ) -> WebsiteAdmissionResult:
     return await website_ingress.admit(database, principal, request, settings)
+
+
+@router.post("/sessions/delivery/work", response_model=WebsiteDeliveryWorkResult)
+async def session_delivery_work(
+    request: WebsiteSessionAccess, database: AppDatabase,
+    principal: TrustedPrincipal, settings: AppSettings,
+) -> WebsiteDeliveryWorkResult:
+    return await website_delivery.work(database, principal, request, settings)
+
+
+@router.post("/sessions/delivery/begin", response_model=WebsiteDeliveryBegun)
+async def session_delivery_begin(
+    request: WebsiteDeliveryBegin, database: AppDatabase,
+    principal: TrustedPrincipal, settings: AppSettings,
+) -> WebsiteDeliveryBegun:
+    return await website_delivery.begin(database, principal, request, settings)
+
+
+@router.post("/sessions/delivery/complete", response_model=WebsiteDeliveryCompleted)
+async def session_delivery_complete(
+    request: WebsiteDeliveryComplete, database: AppDatabase, principal: TrustedPrincipal,
+) -> WebsiteDeliveryCompleted:
+    return await website_delivery.complete(database, principal, request)
 
 
 @router.post("/results", response_model=WebsiteResult)

@@ -27,9 +27,9 @@ async def lower_pending(session: AsyncSession, intent: DeliveryAttempt) -> bool:
         raise DomainError(ErrorCode.DELIVERY_IDENTITY_CONFLICT)
     return await session.scalar(select(DeliveryAttempt.id).where(
         DeliveryAttempt.conversation_id == intent.conversation_id,
-        DeliveryAttempt.outbound_ordinal < intent.outbound_ordinal,
-        DeliveryAttempt.outbound_ordinal.is_not(None),
         or_(DeliveryAttempt.writer_state == "LIVE", and_(
+            DeliveryAttempt.outbound_ordinal < intent.outbound_ordinal,
+            DeliveryAttempt.outbound_ordinal.is_not(None),
             DeliveryAttempt.writer_state == "NONE", DeliveryAttempt.status == "GENERATED")),
     ).limit(1)) is not None
 
