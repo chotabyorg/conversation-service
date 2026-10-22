@@ -7,14 +7,21 @@ import pytest
 from sqlalchemy import func, select
 
 from core.errors import DomainError
-from models import Conversation, DeliveryAttempt, InboxGrantScope, Message, WebsiteSessionCapability
+from models import (
+    Conversation,
+    DeliveryAttempt,
+    DeliveryReconciliation,
+    InboxGrantScope,
+    Message,
+    WebsiteSessionCapability,
+)
 from schemas.contracts import ErrorCode
 from schemas.handoff import ReturnToAgentCommand
-from services import inbox
+from services import inbox, website_delivery
 from services.common import db_clock
 from services.website_worker import WebsiteWorker
 from tests.conftest import error
-from tests.test_common_text_delivery import human_intents
+from tests.test_common_text_delivery import human_intents, load
 from tests.test_website_grant import suppliers as supplier_fixture
 from tests.test_website_session import scope
 from tests.test_website_session import sh as session_fixture
@@ -148,10 +155,44 @@ async def test_escaped_oversized_frame_never_acquires_writer_or_truncates(wh):
     assert value["state"] == "FRAME_TOO_LARGE" and value["frame"] is None
     begun = await call(wh, "begin", identity(wh, value))
     assert begun.status_code == 200 and len(begun.content) <= 4096
-    assert begun.json()["state"] == "FRAME_TOO_LARGE" and not begun.json()["send"]
+    assert begun.json()["state"] == "RECOVER_ONLY" and not begun.json()["send"]
+    assert value["recovery"]["status"] == begun.json()["recovery"]["status"] == "SUPERSEDED"
     async with wh.database.session_factory() as session:
         intent = await session.scalar(select(DeliveryAttempt))
-        assert intent.writer_state == "NONE" and intent.status == "GENERATED"
+        assert intent.writer_state == "NONE" and intent.status == "SUPERSEDED"
+        assert intent.error_code is None
+
+
+@pytest.mark.parametrize("path", ["work", "begin"])
+async def test_oversized_first_human_intent_is_terminal_and_next_fifo_can_proceed(
+    wh, suppliers, path,
+):
+    text = "\x01" * 12000
+    _principal, _case, ids = await human_intents(wh, suppliers, (text, "short owner reply"))
+    async with wh.database.session_factory() as session, session.begin():
+        _grant, _root, first, source = await load(session, ids[0])
+        descriptor = website_delivery._descriptor(first, source).model_dump(mode="json")
+        assert source[2] == text
+    request = identity(wh, {"item": descriptor})
+    result = await call(wh, "work", visitor(wh)) if path == "work" else await call(
+        wh, "begin", request)
+    assert result.status_code == 200 and len(result.content) <= 4096
+    assert result.json()["state"] == "FRAME_TOO_LARGE"
+    assert result.json()["frame"] is None and result.json()["recovery"]["status"] == "SUPERSEDED"
+    repeated = await call(wh, "begin", request)
+    assert repeated.status_code == 200 and not repeated.json()["send"]
+    next_value = await work(wh)
+    assert next_value["item"]["outbound_intent_id"] == str(ids[1])
+    assert next_value["frame"]["text"] == "short owner reply"
+    assert (await call(wh, "begin", identity(wh, next_value))).json()["send"]
+    async with wh.database.session_factory() as session:
+        first = await session.get(DeliveryAttempt, ids[0])
+        assert first.status == "SUPERSEDED" and first.writer_state == "NONE"
+        assert first.error_code is None
+        assert first.writer_started_at is first.writer_supplier_instance_id is None
+        assert await session.scalar(select(func.count()).select_from(DeliveryReconciliation).where(
+            DeliveryReconciliation.delivery_attempt_id == ids[0],
+            DeliveryReconciliation.status == "SUPERSEDED")) == 1
 
 
 @pytest.mark.parametrize("field", ["session_id", "session_token", "owner_id", "agent_id",

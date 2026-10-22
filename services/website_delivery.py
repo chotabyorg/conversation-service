@@ -141,6 +141,7 @@ async def work(database: Database, principal: Principal, request: WebsitePollAcc
             result = WebsiteDeliveryWorkResult(state="SEND_CANDIDATE", item=descriptor,
                                                 frame=_frame(intent, source))
             if not _fits(result):
+                await _supersede(session, intent, root, source)
                 return WebsiteDeliveryWorkResult(state="FRAME_TOO_LARGE", item=descriptor,
                     recovery=_recovery(intent))
             return result
@@ -183,6 +184,7 @@ async def begin(database: Database, principal: Principal, request: WebsiteDelive
                     "status": "WRITE_IN_PROGRESS", "writer_state": "LIVE"}),
                 frame=_frame(intent, source))
             if not _fits(candidate):
+                await _supersede(session, intent, root, source)
                 return WebsiteDeliveryBegun(state="FRAME_TOO_LARGE", item=descriptor,
                     send=False, replayed=False, recovery=_recovery(intent))
             current = (_valid_authority(intent, source, root, grant)
