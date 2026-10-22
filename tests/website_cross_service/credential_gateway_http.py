@@ -8,6 +8,7 @@ import socket
 import ssl
 import subprocess
 from contextlib import asynccontextmanager
+from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
@@ -19,7 +20,7 @@ import uvicorn
 from sqlalchemy import select
 
 from core.config import Settings
-from models import DeliveryAttempt
+from models import AgentTurn, Conversation, DeliveryAttempt, Message, WebsitePollState
 from schemas.handoff import HumanPrincipal
 from services.common import reset_test_database_clock, set_test_database_clock
 from services.human_auth import INBOX_ORIGIN
@@ -129,17 +130,6 @@ async def composed(wh, suppliers, monkeypatch, tmp_path, network_allowlist):
     tls = ssl.create_default_context(cafile=fixture["ca_file"])
     try:
         with (tmp_path / "private-gateway.log").open("xb") as log:
-            process = subprocess.Popen(
-                [
-                    fixture["gateway_python"],
-                    str(Path(__file__).with_name("gateway_peer.py")),
-                    str(input_file),
-                ],
-                cwd=gateway,
-                env=env,
-                stdout=log,
-                stderr=subprocess.STDOUT,
-            )
             async with (
                 httpx.AsyncClient(
                     base_url=f"http://127.0.0.1:{gateway_port}", trust_env=False, timeout=5
@@ -149,26 +139,50 @@ async def composed(wh, suppliers, monkeypatch, tmp_path, network_allowlist):
                     headers={"Origin": INBOX_ORIGIN},
                 ) as owner_api,
             ):
-                for _ in range(100):
-                    if process.poll() is not None:
-                        log.flush()
-                        text = (tmp_path / "private-gateway.log").read_text(
-                            encoding="utf-8", errors="replace"
-                        )
-                        pytest.fail(str(dict(peer_exit=process.returncode, error_classes=sorted(
-                            set(re.findall(r"\b[A-Za-z_]+(?:Error|Exception)\b", text))),
-                            missing_modules=re.findall(
-                                r"ModuleNotFoundError: No module named '([A-Za-z_][A-Za-z0-9_.]*)'",
-                                text))))
-                    try:
-                        if server.started and (await public.get("/health")).status_code == 200:
-                            break
-                    except httpx.HTTPError:
-                        pass
-                    await asyncio.sleep(0.05)
-                else:
-                    pytest.fail("Composed peers did not start")
-                yield SimpleNamespace(public=public, owner=owner_api, headers=headers, wh=wh)
+                async def restart(selected_sessions):
+                    nonlocal process
+                    if process is not None:
+                        process.terminate()
+                        await asyncio.to_thread(process.wait, timeout=5)
+                    env["COMMON_WEBSITE_MESSAGE_SESSION_ALLOWLIST"] = json.dumps(
+                        {config["integration_id"]: selected_sessions} if selected_sessions else {}
+                    )
+                    process = subprocess.Popen(
+                        [
+                            fixture["gateway_python"],
+                            str(Path(__file__).with_name("gateway_peer.py")),
+                            str(input_file),
+                        ],
+                        cwd=gateway,
+                        env=env,
+                        stdout=log,
+                        stderr=subprocess.STDOUT,
+                    )
+                    for _ in range(100):
+                        if process.poll() is not None:
+                            log.flush()
+                            text = (tmp_path / "private-gateway.log").read_text(
+                                encoding="utf-8", errors="replace"
+                            )
+                            pytest.fail(str(dict(peer_exit=process.returncode, error_classes=sorted(
+                                set(re.findall(r"\b[A-Za-z_]+(?:Error|Exception)\b", text))),
+                                missing_modules=re.findall(
+                                    r"ModuleNotFoundError: No module named "
+                                    r"'([A-Za-z_][A-Za-z0-9_.]*)'",
+                                    text))))
+                        try:
+                            if server.started and (await public.get("/health")).status_code == 200:
+                                break
+                        except httpx.HTTPError:
+                            pass
+                        await asyncio.sleep(0.05)
+                    else:
+                        pytest.fail("Composed peers did not start")
+
+                await restart([])
+                yield SimpleNamespace(
+                    public=public, owner=owner_api, headers=headers, wh=wh, restart=restart
+                )
     finally:
         if process is not None:
             process.terminate()
@@ -189,6 +203,63 @@ async def create_session(peer):
     peer.wh.created = response.json()
     peer.headers["X-Widget-Session-Token"] = peer.wh.created["session_token"]
     return peer.wh.created["session_id"]
+
+
+async def assert_no_session_work(peer, session):
+    async with peer.wh.database.session_factory() as db:
+        root = await db.scalar(
+            select(Conversation).where(Conversation.provider_thread_id == session)
+        )
+        assert root is not None  # The capability belongs to a genuine server-created root.
+        for model in (Message, AgentTurn, DeliveryAttempt):
+            assert not list(await db.scalars(select(model).where(model.conversation_id == root.id)))
+
+
+async def denied_message(peer, session, headers=None):
+    response = await peer.public.post(
+        "/v1/sessions/messages",
+        json=dict(session_id=session, message_id=str(uuid4()), message="Not admitted"),
+        headers=peer.headers if headers is None else headers,
+    )
+    assert response.status_code == 404 and response.json() == {"error": "Session unavailable"}
+    assert response.headers["Cache-Control"] == "no-store"
+
+
+async def wait_poll_ended(peer, session):
+    # Public response bytes precede private cleanup; restart only after the
+    # original process has positively ended its idle reservation.
+    for _ in range(100):
+        async with peer.wh.database.session_factory() as db:
+            row = await db.scalar(select(WebsitePollState).join(
+                Conversation, WebsitePollState.conversation_id == Conversation.id
+            ).where(Conversation.provider_thread_id == session))
+            if row is not None and row.ended_at is not None:
+                return
+        await asyncio.sleep(0.02)
+    pytest.fail("Original Gateway idle poll did not commit cleanup")
+
+
+async def select_created_session(peer, session):
+    # Start empty: a valid issued capability must not admit CUSTOMER work.
+    await denied_message(peer, session)
+    await assert_no_session_work(peer, session)
+    for path in ("history", "poll"):
+        response = await peer.public.post(
+            "/v1/sessions/" + path, json=dict(session_id=session), headers=peer.headers
+        )
+        assert response.status_code == 200
+        assert response.headers["Cache-Control"] == "no-store"
+        if path == "history":
+            assert response.json()["items"] == []
+        else:
+            assert response.json()["state"] == "EMPTY"
+    await wait_poll_ended(peer, session)
+    # The extra idle poll consumed a durable rate token; let its 2s interval pass.
+    peer.wh.clock.advance_to(peer.wh.clock.current + timedelta(seconds=2))
+    await peer.restart([session])
+    # Selection never replaces credential authentication.
+    await denied_message(peer, session, dict(peer.headers, **{"X-Widget-Session-Token": "A" * 43}))
+    await assert_no_session_work(peer, session)
 
 
 async def message(peer, session, text, message_id=None):
@@ -228,6 +299,7 @@ async def accepted_poll(peer, session):
 async def test_composed_handoff_owner_reply_return_and_fresh_ai_input(composed):
     peer = composed
     session = await create_session(peer)
+    await select_created_session(peer, session)
     first = await message(peer, session, "Нужен оператор")
     await due(peer.wh)
     assert await WebsiteWorker(
@@ -285,10 +357,23 @@ async def test_composed_handoff_owner_reply_return_and_fresh_ai_input(composed):
 async def test_composed_creation_quota_and_visitor_isolation(composed):
     peer = composed
     first = await create_session(peer)
+    await select_created_session(peer, first)
+    first_headers = dict(peer.headers)
     envelope = await message(peer, first, "Первый посетитель")
     await message(peer, first, envelope["message"], envelope["message_id"])
     second = await create_session(peer)
     assert second != first
+    await denied_message(peer, second)
+    await assert_no_session_work(peer, second)
+    port = WebsiteV3Port("DRAFT")
+    worker = WebsiteWorker(peer.wh.database, peer.wh.settings, port)
+    await due(peer.wh)
+    assert await worker.run_once() and len(port.requests) == 1
+    assert not await worker.run_once()
+    await assert_no_session_work(peer, second)
+    await peer.restart([])
+    await denied_message(peer, first, first_headers)
+    assert not await worker.run_once() and len(port.requests) == 1
     wrong = await peer.public.post(
         "/v1/sessions/history", json=dict(session_id=first), headers=peer.headers
     )
@@ -325,6 +410,7 @@ async def test_composed_busy_agent_has_one_bounded_catch_up_reply(composed):
             return await super().execute_v3(prepared, binding, request_id)
 
     session = await create_session(peer)
+    await select_created_session(peer, session)
     await message(peer, session, "Первый вопрос")
     await due(peer.wh)
     paused = PausedPort()

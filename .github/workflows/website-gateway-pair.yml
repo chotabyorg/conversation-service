@@ -34,7 +34,7 @@ jobs:
           --health-cmd "pg_isready -U website_pair -d website_pair_test"
           --health-interval 2s --health-timeout 2s --health-retries 20
     env:
-      GATEWAY_REVISION: ef38586ccffb093772f24849282ea40cfa7ef490
+      GATEWAY_REVISION: 6f4db23bfbca840e6178eb7bc46e82e91e0d1dc6
       AI_GUARD_REVISION: 058df0b5ad508e3ec3a551c0f58a9f0d715ebf3e
       CONVERSATION_REVISION: ${{ github.event.pull_request.head.sha }}
       DATABASE_URL: postgresql+asyncpg://website_pair:isolated_website_pair_fixture@127.0.0.1:5432/website_pair_test
