@@ -22,6 +22,7 @@ from core.config import Settings, load_settings
 from core.logging import configure_logging, logger
 from db.database import Database
 from services.managed_client import ManagedAIClient, ManagedAIPort
+from services.voice_warmup import VoiceWarmups, WarmupClient
 
 
 def create_app(
@@ -47,10 +48,13 @@ def create_app(
         application.state.managed_port = (
             managed_port if managed_port is not None else ManagedAIClient(active_settings)
         )
+        application.state.voice_warmups = VoiceWarmups(
+            active_database, active_settings, WarmupClient(active_settings))
         logger.info("", extra={"stage": "startup", "code": "STARTED"})
         try:
             yield
         finally:
+            await application.state.voice_warmups.close()
             await active_database.dispose()
             logger.info("", extra={"stage": "shutdown", "code": "STOPPED"})
 

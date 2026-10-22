@@ -140,6 +140,7 @@ class Settings(BaseSettings):
     voice_worker_concurrency: int = Field(default=1, ge=1, le=64)
     voice_worker_health_port: int = Field(default=8003, ge=1, le=65535)
     voice_call_lease_seconds: int = Field(default=15, ge=5, le=60)
+    voice_prompt_warmup_enabled: bool = False
     # Both constructor spellings use one source key, so explicit values outrank env/dotenv.
     # If both are supplied, the uppercase alias wins deterministically.
     database_url: SecretStr = Field(
