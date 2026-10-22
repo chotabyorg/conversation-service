@@ -165,6 +165,9 @@ class BoundaryMiddleware:
                 website_paths = {
                     "/internal/v1/website/sessions",
                     "/internal/v1/website/sessions/admissions",
+                    "/internal/v1/website/sessions/delivery/work",
+                    "/internal/v1/website/sessions/delivery/begin",
+                    "/internal/v1/website/sessions/delivery/complete",
                     "/internal/v1/website/admissions",
                     "/internal/v1/website/results",
                                  "/internal/v1/website/responses/begin",

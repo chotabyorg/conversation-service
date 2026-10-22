@@ -230,3 +230,43 @@ async def locked_access(
     ):
         raise DomainError(ErrorCode.NOT_FOUND)
     return root
+
+
+async def locked_original_writer(
+    session: AsyncSession, principal: Principal, request: WebsiteSessionAccess,
+) -> Conversation:
+    """Bind late original-writer evidence only; never authorizes text or sending.
+
+    Expiry, revocation and configuration removal must not erase an acquired
+    writer's evidence. The caller must additionally match that retained writer's
+    private supplier/process and attempt identity, and return metadata only.
+    """
+    if not session.in_transaction():
+        raise RuntimeError("Original Website writer evidence requires the caller transaction")
+    if principal.role not in {"WEBSITE", "FULL"} or not any(
+        grant.owner_id == request.owner_id and grant.integration_id == request.integration_id
+        and grant.channel.value == "WEBSITE_WIDGET"
+        and grant.provider_namespace == WEBSITE_NAMESPACE for grant in principal.grants
+    ):
+        raise DomainError(ErrorCode.NOT_FOUND)
+    raw = request.session_token.get_secret_value()
+    if re.fullmatch(r"[A-Za-z0-9_-]{43}", raw) is None:
+        raise DomainError(ErrorCode.NOT_FOUND)
+    digest = hashlib.sha256(raw.encode("ascii")).hexdigest()
+    values = dict(owner_id=request.owner_id, integration_id=request.integration_id,
+        channel="WEBSITE_WIDGET", provider_thread_id=str(request.session_id),
+        agent_id=request.agent_id, binding_generation=request.binding_generation)
+    probe = await session.scalar(select(WebsiteSessionCapability).filter_by(**values))
+    if (probe is None or not hmac.compare_digest(probe.token_digest, digest)
+            or probe.grant_generation is None or probe.agent_lifecycle_generation is None
+            or probe.provision_command_id is None):
+        raise DomainError(ErrorCode.NOT_FOUND)
+    await website_grant.lock_scope(session, request, shared=True)
+    root = await session.scalar(select(Conversation).where(Conversation.id == probe.conversation_id)
+        .with_for_update().execution_options(populate_existing=True))
+    retained = await session.scalar(select(WebsiteSessionCapability).filter_by(**values)
+        .execution_options(populate_existing=True))
+    if (root is None or retained is None or retained.conversation_id != root.id
+            or not hmac.compare_digest(retained.token_digest, digest)):
+        raise DomainError(ErrorCode.NOT_FOUND)
+    return root
