@@ -5,6 +5,7 @@ from uuid import UUID
 from pydantic import StrictBool, model_validator
 
 from schemas.contracts import Contract, PositiveCounter, TextContent
+from schemas.website_poll import WebsitePollAccess
 from schemas.website_session import WebsiteSessionAccess
 
 
@@ -49,10 +50,14 @@ class WebsiteDeliveryWorkResult(Contract):
         return self
 
 
-class WebsiteDeliveryBegin(WebsiteSessionAccess, WebsiteDeliveryDescriptor):
+class WebsiteDeliveryIdentity(WebsiteSessionAccess, WebsiteDeliveryDescriptor):
     supplier_instance_id: UUID
     process_incarnation_id: UUID
     recover_only: StrictBool
+
+
+class WebsiteDeliveryBegin(WebsiteDeliveryIdentity, WebsitePollAccess):
+    pass
 
 
 class WebsiteDeliveryBegun(Contract):
@@ -76,7 +81,7 @@ class WebsiteWriterEnd(Contract):
     process_incarnation_id: UUID
 
 
-class WebsiteDeliveryComplete(WebsiteDeliveryBegin):
+class WebsiteDeliveryComplete(WebsiteDeliveryIdentity):
     outcome: Literal["WRITE_COMPLETED", "WRITE_FAILED", "UNKNOWN"]
     error_code: Literal["ORIGINAL_WRITE_REJECTED", "TRANSPORT_ERROR", "TIMEOUT"] | None = None
     writer_end: WebsiteWriterEnd | None = None

@@ -1,6 +1,6 @@
 """Private HTTP credential adapter: one frame, exact writer, bounded honest evidence."""
 import asyncio
-from datetime import timedelta
+from datetime import datetime, timedelta
 from uuid import uuid4
 
 import pytest
@@ -42,20 +42,36 @@ async def call(wh, action, value):
 
 
 async def work(wh):
-    response = await call(wh, "work", visitor(wh))
+    await poll(wh)
+    response = await call(wh, "work", dict(visitor(wh), **wh.poll_access))
     assert response.status_code == 200
     assert len(response.content) <= 65536
     assert wh.created["session_token"] not in response.text
     return response.json()
 
 
+async def poll(wh):
+    if hasattr(wh, "poll_access") and wh.clock.current < wh.poll_deadline:
+        return wh.poll_access
+    request = dict(visitor(wh), request_id=str(uuid4()), supplier_instance_id=str(uuid4()),
+                   process_incarnation_id=str(uuid4()))
+    response = await wh.call("POST", "/website/sessions/polls/begin", request)
+    assert response.status_code == 200
+    value = response.json()
+    assert value["state"] == "ACQUIRED"
+    wh.poll_access = dict(poll_id=value["poll_id"],
+        supplier_instance_id=request["supplier_instance_id"],
+        process_incarnation_id=request["process_incarnation_id"])
+    wh.poll_deadline = datetime.fromisoformat(value["deadline_at"].replace("Z", "+00:00"))
+    return wh.poll_access
+
+
 def identity(wh, value):
-    return dict(visitor(wh), **value["item"], supplier_instance_id=str(uuid4()),
-        process_incarnation_id=str(uuid4()), recover_only=False)
+    return dict(visitor(wh), **value["item"], **wh.poll_access, recover_only=False)
 
 
 def completion(value, outcome="WRITE_COMPLETED", *, joined=True):
-    return dict(value, outcome=outcome,
+    return dict({key: item for key, item in value.items() if key != "poll_id"}, outcome=outcome,
         error_code="TIMEOUT" if outcome == "UNKNOWN" else None,
         writer_end=dict(kind="TASK_JOINED", supplier_instance_id=value["supplier_instance_id"],
             process_incarnation_id=value["process_incarnation_id"]) if joined else None)
@@ -157,9 +173,10 @@ async def test_oversized_first_human_intent_is_terminal_and_next_fifo_can_procee
         _grant, _root, first, source = await load(session, ids[0])
         descriptor = website_delivery._descriptor(first, source).model_dump(mode="json")
         assert source[2] == text
+    await poll(wh)
     request = identity(wh, {"item": descriptor})
-    result = await call(wh, "work", visitor(wh)) if path == "work" else await call(
-        wh, "begin", request)
+    result = await call(wh, "work", dict(visitor(wh), **wh.poll_access)) if path == "work" else (
+        await call(wh, "begin", request))
     assert result.status_code == 200 and len(result.content) <= 4096
     assert result.json()["state"] == "FRAME_TOO_LARGE"
     assert result.json()["frame"] is None and result.json()["recovery"]["status"] == "SUPERSEDED"
@@ -182,7 +199,7 @@ async def test_oversized_first_human_intent_is_terminal_and_next_fifo_can_procee
 @pytest.mark.parametrize("field", ["session_id", "session_token", "owner_id", "agent_id",
                                    "binding_generation", "integration_id"])
 async def test_wrong_visitor_work_has_no_supplier_io_or_content(wh, suppliers, field):
-    value = visitor(wh)
+    value = dict(visitor(wh), **await poll(wh))
     value[field] = ("x" * 43 if field == "session_token" else "foreign-owner"
         if field == "owner_id" else 8 if field == "binding_generation" else str(uuid4()))
     suppliers.calls.clear()
@@ -225,7 +242,7 @@ async def test_original_completion_after_expiry_revoke_and_config_removal_is_met
     assert result.status_code == 200 and len(result.content) <= 4096
     assert set(result.json()) == {"recovery", "replayed"}
     assert result.json()["recovery"]["writer_state"] == "ENDED" and suppliers.calls == []
-    error(await call(wh, "work", visitor(wh)), "NOT_FOUND", 404)
+    error(await call(wh, "work", dict(visitor(wh), **wh.poll_access)), "NOT_FOUND", 404)
     error(await call(wh, "begin", request), "NOT_FOUND", 404)
 
 

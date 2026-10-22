@@ -16,12 +16,13 @@ from schemas.website_delivery import (
     WebsiteDeliveryComplete,
     WebsiteDeliveryCompleted,
     WebsiteDeliveryDescriptor,
+    WebsiteDeliveryIdentity,
     WebsiteDeliveryRecovery,
     WebsiteDeliveryWorkResult,
     WebsitePublicFrame,
 )
-from schemas.website_session import WebsiteSessionAccess
-from services import website_session
+from schemas.website_poll import WebsitePollAccess
+from services import website_poll, website_session
 from services.common import db_clock
 from services.delivery_ledger import _record_reconciliation
 from services.text_delivery import (
@@ -95,11 +96,12 @@ async def _supersede(session: AsyncSession, intent: DeliveryAttempt,
         clock=await db_clock(session))
 
 
-async def work(database: Database, principal: Principal, request: WebsiteSessionAccess,
+async def work(database: Database, principal: Principal, request: WebsitePollAccess,
                settings: Settings) -> WebsiteDeliveryWorkResult:
     """Discover at most one frame; discovery never acquires a writer."""
     async with database.session_factory() as session, session.begin():
         root = await website_session.locked_access(session, principal, request, settings)
+        await website_poll.require_current(session, root.id, request)
         grant = await _grant(session, root, request.agent_id)
         turns = await session.scalars(select(AgentTurn).where(
             AgentTurn.conversation_id == root.id, AgentTurn.managed_contract_version == 3,
@@ -147,7 +149,7 @@ async def work(database: Database, principal: Principal, request: WebsiteSession
 
 
 async def _load(
-    session: AsyncSession, root: Conversation, request: WebsiteDeliveryBegin,
+    session: AsyncSession, root: Conversation, request: WebsiteDeliveryIdentity,
 ) -> tuple[InboxGrantScope, DeliveryAttempt, Source]:
     grant = await _grant(session, root, request.agent_id)
     intent = await session.scalar(select(DeliveryAttempt).where(
@@ -171,6 +173,7 @@ async def begin(database: Database, principal: Principal, request: WebsiteDelive
                 settings: Settings) -> WebsiteDeliveryBegun:
     async with database.session_factory() as session, session.begin():
         root = await website_session.locked_access(session, principal, request, settings)
+        await website_poll.require_current(session, root.id, request)
         grant, intent, source = await _load(session, root, request)
         descriptor = _descriptor(intent, source)
         current = False
