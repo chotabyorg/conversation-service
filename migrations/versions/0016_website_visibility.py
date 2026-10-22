@@ -42,6 +42,13 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     bind = op.get_bind()
+    # Dropping a child FK also locks its parents. Match 0015's issuance/lifecycle
+    # order before taking any child lock, including an empty visibility index.
+    for table in ("inbox_grant_scopes", "inbox_grant_lifecycle_receipts",
+                  "handoff_cases", "inbox_command_receipts"):
+        bind.execute(sa.text(f"LOCK TABLE {table} IN ACCESS EXCLUSIVE MODE"))
+    bind.execute(sa.text("LOCK TABLE conversations IN SHARE ROW EXCLUSIVE MODE"))
+    bind.execute(sa.text("LOCK TABLE website_session_capabilities IN ACCESS EXCLUSIVE MODE"))
     bind.execute(sa.text("LOCK TABLE website_visible_messages IN ACCESS EXCLUSIVE MODE"))
     if bind.scalar(sa.text("SELECT EXISTS (SELECT 1 FROM website_visible_messages)")):
         raise RuntimeError("Retained Website visibility positions require a compatible reader")

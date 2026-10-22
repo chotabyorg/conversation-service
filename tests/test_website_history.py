@@ -11,6 +11,7 @@ from services import website_history
 from tests.conftest import error
 from tests.test_common_text_delivery import human_intents
 from tests.test_database import violation
+from tests.test_managed_migration import migrate
 from tests.test_website_grant import suppliers as supplier_fixture
 from tests.test_website_idle_delivery import call, completion, drafted, identity, visitor, work
 from tests.test_website_session import sh as session_fixture
@@ -134,3 +135,14 @@ async def test_visibility_positions_are_immutable_and_cannot_cross_roots(wh, sql
     await violation(sql, "DELETE FROM website_visible_messages", {}, "23514")
     async with sql.connect() as connection:
         assert await connection.scalar(text("SELECT count(*) FROM website_visible_messages")) == 1
+
+
+async def test_downgrade_keeps_retained_visibility_and_restart_cursor(wh, database_url):
+    await append(wh)
+    first = (await page(wh)).json()
+    cursor = first["items"][0]["id"]
+    rejected = migrate(database_url, "downgrade", "0015_website_grant_epoch", expected=1)
+    assert "Retained Website visibility positions require a compatible reader" in rejected.stderr
+    assert await wh.database.ready()
+    assert (await page(wh)).json() == first
+    assert (await page(wh, cursor)).json()["items"] == []
