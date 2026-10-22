@@ -22,9 +22,11 @@ from models.entities import (
     WebsiteResponseAttempt,
 )
 from models.voice import VoiceCall, VoiceInput, VoicePlaybackEvent, VoiceResponse
+from models.website_history import WebsiteVisibleMessage
 from models.website_session import WebsiteSessionCapability
 
 __all__ = [
+    "WebsiteVisibleMessage",
     "WebsiteSessionCapability",
     "CatchUpMember",
     "CatchUpSelection",

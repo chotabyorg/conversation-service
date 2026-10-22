@@ -22,17 +22,26 @@ from schemas.website_delivery import (
     WebsiteDeliveryCompleted,
     WebsiteDeliveryWorkResult,
 )
+from schemas.website_history import WebsiteHistoryPage, WebsiteHistoryRequest
 from schemas.website_session import (
     WebsiteSessionAccess,
     WebsiteSessionAdmission,
     WebsiteSessionCreated,
     WebsiteSessionScope,
 )
-from services import website, website_delivery, website_ingress
+from services import website, website_delivery, website_history, website_ingress
 from services.website_evidence import operational_evidence
 from services.website_session import create as create_session
 
 router = APIRouter(prefix="/internal/v1/website")
+
+
+@router.post("/sessions/history", response_model=WebsiteHistoryPage)
+async def session_history(
+    request: WebsiteHistoryRequest, database: AppDatabase,
+    principal: TrustedPrincipal, settings: AppSettings,
+) -> WebsiteHistoryPage:
+    return await website_history.history(database, principal, request, settings)
 
 
 @router.post("/sessions", response_model=WebsiteSessionCreated, status_code=201)
