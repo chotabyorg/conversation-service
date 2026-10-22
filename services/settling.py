@@ -29,7 +29,13 @@ from models import (
 from schemas.contracts import Channel, ErrorCode, Principal
 from schemas.managed import MAX_MESSAGES
 from services import catch_up
-from services.common import db_clock, fingerprint, message_is_consumed, scope_filter
+from services.common import (
+    db_clock,
+    fingerprint,
+    handoff_was_ever_enrolled,
+    message_is_consumed,
+    scope_filter,
+)
 from services.history_projection import freeze_website_projection
 
 MAX_BURST_MESSAGES = MAX_MESSAGES
@@ -439,6 +445,12 @@ async def select_settled_turn(
                         .execution_options(populate_existing=True)
                     )
                     if conversation is None or conversation.control_mode != "AGENT":
+                        continue
+                    if (channel == Channel.WEBSITE_WIDGET
+                            and await handoff_was_ever_enrolled(session, conversation)):
+                        # Website remains on the legacy v2 selector until the
+                        # common v3 adapter is ready. Retained floors survive
+                        # configuration removal and forbid fresh selection.
                         continue
                     active = await session.scalar(
                         select(AgentTurn)

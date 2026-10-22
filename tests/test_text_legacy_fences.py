@@ -1,14 +1,18 @@
 """Real PostgreSQL legacy text fences using the common grant rows."""
 import asyncio
+from datetime import timedelta
 from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy import select, text
 
+from core.config import SettlingPolicy
 from core.errors import DomainError
 from models import Conversation, InboxGrantScope
-from schemas.contracts import ControlTransition, DeliveryCreate, ErrorCode, TurnCreate
+from schemas.contracts import Channel, ControlTransition, DeliveryCreate, ErrorCode, TurnCreate
 from services import authority, delivery, inbox_lifecycle, turns
+from services.settling import select_settled_turn
+from services.website_worker import select_immediate
 from tests.conftest import error, observed_waiters
 from tests.test_website import admit, identity, payload, v2_response_attempt_id
 
@@ -181,3 +185,29 @@ async def test_stale_settings_post_root_check_observes_new_website_scope(wh, sql
         await pending
     assert captured.value.code == ErrorCode.HANDOFF_CONFLICT
     assert (await root(wh)).control_mode == "AGENT"
+
+
+async def test_immediate_website_coordinator_cannot_select_after_enrollment(wh, sql):
+    await admit(wh, payload(wh))
+    await enrolled(wh)
+    assert await select_immediate(wh.database, wh.principal, wh.settings) is None
+    assert not await wh.worker.run_once()
+    assert wh.ai.calls == []
+    async with sql.connect() as conn:
+        assert await conn.scalar(text("SELECT count(*) FROM agent_turns")) == 0
+
+
+async def test_settling_website_coordinator_cannot_select_after_enrollment(
+    wh, sql, test_database_clock,
+):
+    policy = SettlingPolicy(version="website-inbox-fence", channel=Channel.WEBSITE_WIDGET,
+                           quiet_window_ms=250, max_wait_ms=1200)
+    settings = wh.settings.model_copy(update={"turn_settling_policies": (policy,)})
+    wh.client._transport.app.state.settings = settings
+    await admit(wh, payload(wh))
+    test_database_clock.advance_to(test_database_clock.current + timedelta(seconds=2))
+    await enrolled(wh)
+    assert await select_settled_turn(wh.database, wh.principal, settings,
+                                     (Channel.WEBSITE_WIDGET,)) is None
+    async with sql.connect() as conn:
+        assert await conn.scalar(text("SELECT count(*) FROM agent_turns")) == 0
