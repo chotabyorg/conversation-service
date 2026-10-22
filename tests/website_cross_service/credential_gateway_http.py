@@ -20,6 +20,7 @@ from sqlalchemy import select
 from core.config import Settings
 from models import DeliveryAttempt
 from schemas.handoff import HumanPrincipal
+from services.common import reset_test_database_clock, set_test_database_clock
 from services.human_auth import INBOX_ORIGIN
 from services.website_worker import WebsiteWorker
 from tests.test_website_inbox_provision import sh as session_fixture
@@ -76,9 +77,17 @@ async def composed(wh, suppliers, monkeypatch, tmp_path, network_allowlist):
     input_file = tmp_path / "private-gateway.json"
     input_file.write_text(json.dumps(config), encoding="utf-8")
     app = wh.client._transport.app
+
+    async def shared_clock_app(scope, receive, send):
+        token = set_test_database_clock(wh.clock.current)
+        try:
+            await app(scope, receive, send)
+        finally:
+            reset_test_database_clock(token)
+
     server = uvicorn.Server(
         uvicorn.Config(
-            app,
+            shared_clock_app,
             host="127.0.0.1",
             port=conversation_port,
             ssl_certfile=fixture["ca_file"],
@@ -103,7 +112,7 @@ async def composed(wh, suppliers, monkeypatch, tmp_path, network_allowlist):
         MANAGED_WEBSITE_GUARDED_INTEGRATIONS=selected,
         COMMON_WEBSITE_TRUSTED_PROXY_CIDRS="127.0.0.1/32",
         COMMON_WEBSITE_POLL_ENABLED="true",
-        COMMON_WEBSITE_POLL_WAIT_SECONDS="0.5",
+        COMMON_WEBSITE_POLL_WAIT_SECONDS="2",
         COMMON_WEBSITE_CONVERSATION_URL=config["conversation_url"],
         COMMON_WEBSITE_CONVERSATION_PEER="127.0.0.1",
         COMMON_WEBSITE_S2S_TOKEN=config["service_token"],
@@ -188,7 +197,9 @@ async def accepted_poll(peer, session):
     )
     assert response.status_code == 200
     result = response.json()
-    assert result["state"] == "DELIVERY"
+    assert result["state"] == "DELIVERY", {
+        key: result.get(key) for key in ("state", "status", "writer_state")
+    }
     # Receiving the frame is not end proof: wait for the original Gateway
     # completion/cleanup request and inspect the Conversation-owned ledger.
     for _ in range(100):
