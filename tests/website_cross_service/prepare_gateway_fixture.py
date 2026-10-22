@@ -1,6 +1,7 @@
 """Prepare ephemeral TLS and exact clean Gateway inputs for the opt-in HTTP suite."""
 import argparse
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -29,7 +30,9 @@ def main():
         "-keyout", str(key), "-out", str(certificate)], check=True, capture_output=True)
     key.chmod(0o600)
     config = dict(gateway_source=str(root), gateway_revision=revision,
-        gateway_python=str(args.gateway_python.resolve()),
+        # Preserve a POSIX venv launcher symlink: resolving it selects the base
+        # interpreter and silently loses the separately installed dependencies.
+        gateway_python=os.path.abspath(args.gateway_python),
         network_guard=str(args.network_guard.resolve()),
         ca_file=str(certificate), key_file=str(key))
     (output / "input.json").write_text(json.dumps(config, indent=2), encoding="utf-8")

@@ -3,6 +3,7 @@
 import asyncio
 import json
 import os
+import re
 import socket
 import ssl
 import subprocess
@@ -149,9 +150,13 @@ async def composed(wh, suppliers, monkeypatch, tmp_path, network_allowlist):
                 ) as owner_api,
             ):
                 for _ in range(100):
-                    assert process.poll() is None, (
-                        "Gateway fixture exited; inspect private peer log"
-                    )
+                    if process.poll() is not None:
+                        log.flush()
+                        text = (tmp_path / "private-gateway.log").read_text(
+                            encoding="utf-8", errors="replace"
+                        )
+                        pytest.fail(str(dict(peer_exit=process.returncode, error_classes=sorted(
+                            set(re.findall(r"\b[A-Za-z_]+(?:Error|Exception)\b", text))))))
                     try:
                         if server.started and (await public.get("/health")).status_code == 200:
                             break
