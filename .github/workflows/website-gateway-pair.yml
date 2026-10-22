@@ -35,7 +35,7 @@ jobs:
           --health-interval 2s --health-timeout 2s --health-retries 20
     env:
       GATEWAY_REVISION: ef38586ccffb093772f24849282ea40cfa7ef490
-      AI_GUARD_REVISION: 547cffe066f3296fe4bc75fe8772b3b191182964
+      AI_GUARD_REVISION: 058df0b5ad508e3ec3a551c0f58a9f0d715ebf3e
       CONVERSATION_REVISION: ${{ github.event.pull_request.head.sha }}
       DATABASE_URL: postgresql+asyncpg://website_pair:isolated_website_pair_fixture@127.0.0.1:5432/website_pair_test
       TEST_DATABASE_URL: postgresql+asyncpg://website_pair:isolated_website_pair_fixture@127.0.0.1:5432/website_pair_test
