@@ -88,7 +88,11 @@ try {
   for (const width of [320, 1440]) {
     await page.setViewportSize({ width, height: 900 });
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false);
-    await page.screenshot({ path: config.screenshot_prefix + '-' + width + '.png' });
+    await page.screenshot({ path: config.screenshot_prefix + '-' + width + '.png', animations: 'disabled' });
+    assert.equal(await page.evaluate(() => {
+      const send = document.querySelector('.chw-send'), rect = send.getBoundingClientRect();
+      return send.contains(document.elementFromPoint(rect.x + rect.width / 2, rect.y + rect.height / 2));
+    }), true);
   }
   assert.equal(unexpected, 0);
   assert.deepEqual(pageErrors, []);
