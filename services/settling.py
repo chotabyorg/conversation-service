@@ -429,7 +429,7 @@ async def select_settled_turn(
                                     for key, value in values.items()
                                 ]
                             )
-                            .with_for_update()
+                            .with_for_update(read=channel == Channel.WEBSITE_WIDGET)
                             .execution_options(populate_existing=True)
                         )
                         if lifecycle_scope is None and channel == Channel.TELEGRAM:
