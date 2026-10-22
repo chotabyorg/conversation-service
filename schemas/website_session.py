@@ -4,7 +4,7 @@ from uuid import UUID
 
 from pydantic import Field, SecretStr, field_serializer
 
-from schemas.contracts import Contract, OwnerId, PositiveCounter
+from schemas.contracts import Contract, OwnerId, PositiveCounter, TextContent
 
 
 class WebsiteSessionScope(Contract):
@@ -27,3 +27,8 @@ class WebsiteSessionCreated(Contract):
 class WebsiteSessionAccess(WebsiteSessionScope):
     session_id: UUID
     session_token: SecretStr = Field(repr=False)
+
+
+class WebsiteSessionAdmission(WebsiteSessionAccess):
+    message_id: UUID
+    text: TextContent

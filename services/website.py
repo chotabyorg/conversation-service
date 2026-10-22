@@ -112,6 +112,49 @@ async def _lock_legacy_scope(
         extra_agent_ids=(request.agent_id,))
 
 
+async def append_canonical_message(
+    session: AsyncSession, conversation: Conversation, request: AdmissionRequest,
+    settings: Settings, *, digest: str, separate_authority_epoch: bool,
+) -> UUID:
+    """Append to the existing journal while the caller holds the canonical root."""
+    event_id, canonical_id = uuid4(), uuid4()
+    conversation.last_message_sequence += 1
+    conversation.input_revision += 1
+    # Input freshness fences previous drafts even in immediate mode.
+    conversation.settling_revision += 1
+    policy = settings.settling_policy_for(
+        Channel.WEBSITE_WIDGET, request.integration_id
+    )
+    clock, burst_id, policy_version, quiet_ms, max_ms = (
+        await freeze_admission_membership(
+            session, conversation, policy, conversation.last_message_sequence,
+            separate_authority_epoch=separate_authority_epoch,
+        )
+    )
+    conversation.updated_at = clock
+    event = InboundEvent(
+        id=event_id, conversation_id=conversation.id, owner_id=request.owner_id,
+        integration_id=request.integration_id, channel="WEBSITE_WIDGET",
+        provider_namespace=WEBSITE_NAMESPACE, provider_event_id=str(request.message_id),
+        contract_version=1, fingerprint=digest, accepted_at=clock,
+    )
+    session.add(event)
+    await session.flush()
+    session.add(Message(id=canonical_id, conversation_id=conversation.id,
+                        sequence=conversation.last_message_sequence,
+                        input_revision=conversation.input_revision,
+                        settling_revision=conversation.settling_revision,
+                        settling_policy_version=policy_version,
+                        settling_quiet_window_ms=quiet_ms,
+                        settling_max_wait_ms=max_ms,
+                        settling_burst_id=burst_id,
+                        actor="CUSTOMER",
+                        direction="INBOUND", content_type="TEXT", text=request.text,
+                        source_inbound_event_id=event_id, created_at=clock))
+    await session.flush()
+    return canonical_id
+
+
 async def admit(database: Database, principal: Principal, request: AdmissionRequest,
                 settings: Settings) -> WebsiteAdmissionResult:
     authorize(principal, request, settings)
@@ -157,44 +200,12 @@ async def admit(database: Database, principal: Principal, request: AdmissionRequ
                 await _reject_credentialed_root(session, request)
                 if await handoff_was_ever_enrolled(session, conversation):
                     raise DomainError(ErrorCode.HANDOFF_CONFLICT)
-                event_id, canonical_id = uuid4(), uuid4()
-                conversation.last_message_sequence += 1
-                conversation.input_revision += 1
-                # Input freshness fences previous drafts even in immediate mode.
-                conversation.settling_revision += 1
-                policy = settings.settling_policy_for(
-                    Channel.WEBSITE_WIDGET, request.integration_id
+                canonical_id = await append_canonical_message(
+                    session, conversation, request, settings, digest=digest,
+                    separate_authority_epoch=catch_up.scope_enabled(
+                        settings, request.owner_id, request.integration_id,
+                        "WEBSITE_WIDGET", request.agent_id),
                 )
-                clock, burst_id, policy_version, quiet_ms, max_ms = (
-                    await freeze_admission_membership(
-                        session, conversation, policy, conversation.last_message_sequence,
-                        separate_authority_epoch=catch_up.scope_enabled(
-                            settings, request.owner_id, request.integration_id,
-                            "WEBSITE_WIDGET", request.agent_id,
-                        ),
-                    )
-                )
-                conversation.updated_at = clock
-                event = InboundEvent(
-                    id=event_id, conversation_id=conversation.id, owner_id=request.owner_id,
-                    integration_id=request.integration_id, channel="WEBSITE_WIDGET",
-                    provider_namespace=WEBSITE_NAMESPACE, provider_event_id=str(request.message_id),
-                    contract_version=1, fingerprint=digest, accepted_at=clock,
-                )
-                session.add(event)
-                await session.flush()
-                session.add(Message(id=canonical_id, conversation_id=conversation.id,
-                                    sequence=conversation.last_message_sequence,
-                                    input_revision=conversation.input_revision,
-                                    settling_revision=conversation.settling_revision,
-                                    settling_policy_version=policy_version,
-                                    settling_quiet_window_ms=quiet_ms,
-                                    settling_max_wait_ms=max_ms,
-                                    settling_burst_id=burst_id,
-                                    actor="CUSTOMER",
-                                    direction="INBOUND", content_type="TEXT", text=request.text,
-                                    source_inbound_event_id=event_id, created_at=clock))
-                await session.flush()
                 conversation_id = conversation.id
             admission = WebsiteAdmission(
                 id=uuid4(), owner_id=request.owner_id, integration_id=request.integration_id,
