@@ -18,6 +18,7 @@ _CONFLICT_MESSAGES = {
     ErrorCode.GRANT_CONFLICT: "Current Inbox grant is inactive or stale.",
     ErrorCode.HANDOFF_CONFLICT: "Handoff identity or current state conflicts.",
     ErrorCode.TELEGRAM_WRITER_LIVE: "An earlier Telegram transport writer is still active.",
+    ErrorCode.WEBSITE_WRITER_LIVE: "An earlier Website transport writer is still unresolved.",
     ErrorCode.EVENT_CONFLICT: "Event identity has different immutable content.",
     ErrorCode.TURN_SELECTION_CONFLICT: "Turn selection identity has different content.",
     ErrorCode.ACTIVE_TURN_EXISTS: "An active turn already exists.",
