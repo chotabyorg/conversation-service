@@ -795,7 +795,9 @@ class InboxGrantLifecycleReceipt(Base):
             name="uq_inbox_grant_lifecycle_command",
         ),
         CheckConstraint(OWNER_BOUNDS, name="ck_inbox_grant_lifecycle_owner_bounds"),
-        CheckConstraint("channel IN ('TELEGRAM','WEBSITE_WIDGET')", name="ck_inbox_grant_lifecycle_channel"),
+        CheckConstraint(
+            "channel IN ('TELEGRAM','WEBSITE_WIDGET')", name="ck_inbox_grant_lifecycle_channel"
+        ),
         CheckConstraint(
             "kind IN ('PROVISION','REVOKE_CONTROL_PLANE','REVOKE_AI_AGENT')",
             name="ck_inbox_grant_lifecycle_kind",
@@ -952,7 +954,9 @@ class InboxCommandReceipt(Base):
             name="fk_inbox_command_delivery",
             ondelete="RESTRICT",
         ),
-        CheckConstraint("channel IN ('TELEGRAM','WEBSITE_WIDGET')", name="ck_inbox_command_channel"),
+        CheckConstraint(
+            "channel IN ('TELEGRAM','WEBSITE_WIDGET')", name="ck_inbox_command_channel"
+        ),
         CheckConstraint(
             "kind IN ('CLAIM','SEND_HUMAN','RETURN_TO_AGENT')", name="ck_inbox_command_kind"
         ),

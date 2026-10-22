@@ -237,7 +237,8 @@ async def test_migration_refuses_to_discard_credential_evidence(sh, database_url
     created = await issued(sh)
     await sh.database.dispose()
     rejected = migrate(database_url, "downgrade", "0013_writer_retirement", expected=1)
-    assert "Retained Website session credentials and common grant epochs prevent downgrade" in rejected.stderr
+    assert ("Retained Website session credentials and common grant epochs prevent downgrade"
+            in rejected.stderr)
     assert await sh.database.ready()
     await authorized(sh, access(sh, created))
 
@@ -269,6 +270,7 @@ async def test_downgrade_refuses_during_issuance_and_keeps_its_committed_credent
     created = await creating
     assert migration is not None
     rejected = await asyncio.wait_for(migration, timeout=30)
-    assert "Retained Website session credentials and common grant epochs prevent downgrade" in rejected.stderr
+    assert ("Retained Website session credentials and common grant epochs prevent downgrade"
+            in rejected.stderr)
     assert await sh.database.ready()
     await authorized(sh, access(sh, created))
