@@ -50,8 +50,10 @@ async def revoke(wh, kind):
         if kind == "grant":
             scope.active = False
         elif kind == "cp_floor":
+            scope.active = False
             scope.cp_binding_high_water = scope.cp_binding_generation
         elif kind == "ai_floor":
+            scope.active = False
             scope.agent_lifecycle_high_water = scope.agent_lifecycle_generation
         elif kind == "epoch":
             scope.grant_generation += 1
