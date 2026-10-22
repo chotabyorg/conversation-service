@@ -459,7 +459,9 @@ async def _run_command(
                     .limit(1)
                 )
                 if live_writer is not None:
-                    raise DomainError(ErrorCode.TELEGRAM_WRITER_LIVE)
+                    raise DomainError(ErrorCode.WEBSITE_WRITER_LIVE
+                                      if case.channel == "WEBSITE_WIDGET"
+                                      else ErrorCode.TELEGRAM_WRITER_LIVE)
                 from services.authority import advance_authority
                 from services.telegram import _reconciliation_key, _record_reconciliation
                 from services.telegram_delivery_v2 import response_attempt_id

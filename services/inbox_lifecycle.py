@@ -26,9 +26,10 @@ from models import (
     TelegramAdmission,
     TelegramResponseAttempt,
     WebsiteAdmission,
+    WebsiteResponseAttempt,
     WebsiteSessionCapability,
 )
-from schemas.contracts import ErrorCode
+from schemas.contracts import Channel, ErrorCode
 from schemas.handoff import (
     AiAgentProof,
     AiAgentProofRequest,
@@ -63,9 +64,27 @@ def _wire_fingerprint(request: BaseModel) -> str:
 
 
 def _cohort(settings: Settings, integration_id: UUID, channel: str) -> None:
-    # Reader support does not enroll Website before its full transport ships.
-    if channel != "TELEGRAM" or integration_id not in settings.handoff_cohort_integration_ids:
+    ids = (settings.website_handoff_cohort_integration_ids if channel == "WEBSITE_WIDGET"
+           else settings.handoff_cohort_integration_ids if channel == "TELEGRAM" else ())
+    if integration_id not in ids:
         raise DomainError(ErrorCode.NOT_FOUND)
+
+
+def _website_provision_policy(settings: Settings, request: InboxGrantProvision) -> None:
+    if request.channel != "WEBSITE_WIDGET":
+        return
+    binding = next((b for b in settings.website_bindings
+                    if b.owner_id == request.owner_id and b.integration_id == request.integration_id
+                    and b.agent_id == request.agent_id
+                    and b.capability_generation == request.expected_binding_generation), None)
+    managed = any(b.owner_id == request.owner_id and b.integration_id == request.integration_id
+                  and b.agent_id == request.agent_id and b.channel == Channel.WEBSITE_WIDGET
+                  for b in settings.managed_ai_bindings)
+    if (binding is None or not managed or not settings.website_session_capabilities_enabled
+            or not settings.website_worker_enabled
+            or settings.settling_policy_for(
+                Channel.WEBSITE_WIDGET, request.integration_id) is None):
+        raise DomainError(ErrorCode.GRANT_CONFLICT)
 
 
 def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -268,6 +287,20 @@ async def _record_lifecycle_receipt(
 async def _has_unjoined_v1_writer(
     session: AsyncSession, request: InboxGrantProvision
 ) -> bool:
+    if request.channel == "WEBSITE_WIDGET":
+        # UNKNOWN writes record finished_at too. That timestamp is not positive
+        # task-end evidence and cannot authorize a cutover into common authority.
+        writer = await session.scalar(select(WebsiteResponseAttempt.id)
+            .join(WebsiteAdmission, WebsiteAdmission.id == WebsiteResponseAttempt.admission_id)
+            .where(WebsiteAdmission.owner_id == request.owner_id,
+                   WebsiteAdmission.integration_id == request.integration_id,
+                   WebsiteAdmission.channel == "WEBSITE_WIDGET",
+                   WebsiteAdmission.agent_id == request.agent_id,
+                   WebsiteResponseAttempt.send_authorized.is_(True),
+                   or_(WebsiteResponseAttempt.outcome.is_(None),
+                       WebsiteResponseAttempt.outcome == "UNKNOWN"))
+            .limit(1))
+        return writer is not None
     writer = await session.scalar(
         select(TelegramResponseAttempt.id)
         .join(TelegramAdmission, TelegramAdmission.id == TelegramResponseAttempt.admission_id)
@@ -372,6 +405,7 @@ async def provision_grant(
     replay = await _preflight(database, request, kind, InboxGrantProvisioned)
     if replay is not None:
         return replay
+    _website_provision_policy(settings, request)
     cp, ai = await _current_proofs(settings, request)
     values = _scope(request)
     async with database.session_factory() as session, session.begin():
@@ -393,7 +427,9 @@ async def provision_grant(
             if await _has_legacy_human_root_without_case(session, request):
                 raise DomainError(ErrorCode.HANDOFF_CONFLICT)
             if await _has_unjoined_v1_writer(session, request):
-                raise DomainError(ErrorCode.TELEGRAM_WRITER_LIVE)
+                raise DomainError(ErrorCode.WEBSITE_WRITER_LIVE
+                                  if request.channel == "WEBSITE_WIDGET"
+                                  else ErrorCode.TELEGRAM_WRITER_LIVE)
             if scope.active and (
                 scope.account_id != cp.account_id
                 or scope.agent_owner_id != ai.agent_owner_id
@@ -571,7 +607,18 @@ async def revoke_grant(
     settings: Settings,
     request: CpGrantRevoke | AiGrantRevoke,
 ) -> CpGrantRevoked | AiGrantRevoked:
-    _cohort(settings, request.integration_id, request.channel)
+    if (request.channel == "WEBSITE_WIDGET"
+            and request.integration_id not in settings.website_handoff_cohort_integration_ids):
+        # A config rollback cannot strand an existing Website lifecycle epoch.
+        # The authenticated supplier may still revoke only its exact retained scope.
+        async with database.session_factory() as session:
+            retained = await session.scalar(select(InboxGrantScope.owner_id).where(
+                *[getattr(InboxGrantScope, key) == value for key, value in _scope(request).items()]
+            ))
+        if retained is None:
+            raise DomainError(ErrorCode.NOT_FOUND)
+    else:
+        _cohort(settings, request.integration_id, request.channel)
     kind = _revoke_kind(request)
     digest = _wire_fingerprint(request)
     ack_model: type[CpGrantRevoked] | type[AiGrantRevoked]

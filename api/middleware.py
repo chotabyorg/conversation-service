@@ -109,7 +109,10 @@ class BoundaryMiddleware:
             public_inbox = path == "/public/v1/inbox" or path.startswith("/public/v1/inbox/")
             if public_inbox:
                 settings = getattr(scope["app"].state, "settings", None)
-                if settings is None or not settings.handoff_cohort_integration_ids:
+                if settings is None or not (
+                    settings.handoff_cohort_integration_ids
+                    or settings.website_handoff_cohort_integration_ids
+                ):
                     await reject(ErrorCode.NOT_FOUND)
                     return
                 if scope["method"] not in {"GET", "HEAD"}:

@@ -316,6 +316,12 @@ class Settings(BaseSettings):
         ),
         max_length=64,
     )
+    website_handoff_cohort_integration_ids: Annotated[tuple[UUID, ...], NoDecode] = Field(
+        default=(), alias="WEBSITE_HANDOFF_INTEGRATION_IDS",
+        validation_alias=AliasChoices(
+            "WEBSITE_HANDOFF_INTEGRATION_IDS", "website_handoff_cohort_integration_ids"
+        ), max_length=64,
+    )
     user_service_base_url: str | None = Field(
         default=None,
         alias="USER_SERVICE_BASE_URL",
@@ -451,6 +457,7 @@ class Settings(BaseSettings):
         "telegram_cohort_integration_ids",
         "voice_cohort_integration_ids",
         "handoff_cohort_integration_ids",
+        "website_handoff_cohort_integration_ids",
         mode="before",
     )
     @classmethod
@@ -592,6 +599,21 @@ class Settings(BaseSettings):
             or self.handoff_ai_lifecycle_token is None
         ):
             raise ValueError("incomplete Telegram handoff configuration")
+        website_handoff_ids = self.website_handoff_cohort_integration_ids
+        if len(set(website_handoff_ids)) != len(website_handoff_ids) or any(
+            not any(b.integration_id == integration_id for b in self.website_bindings)
+            for integration_id in website_handoff_ids
+        ):
+            raise ValueError("invalid Website handoff configuration")
+        if website_handoff_ids and (
+            not self.website_session_capabilities_enabled or not self.website_worker_enabled
+            or self.user_service_base_url is None or self.cp_handoff_base_url is None
+            or self.ai_handoff_base_url is None or self.inbox_lifecycle_token is None
+            or self.handoff_ai_lifecycle_token is None
+            or any(self.settling_policy_for(Channel.WEBSITE_WIDGET, integration_id) is None
+                   for integration_id in website_handoff_ids)
+        ):
+            raise ValueError("incomplete Website handoff configuration")
         lifecycle_tokens = {
             token.get_secret_value()
             for token in (self.inbox_lifecycle_token, self.handoff_ai_lifecycle_token,
