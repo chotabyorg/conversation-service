@@ -173,6 +173,7 @@ async def test_oversized_first_human_intent_is_terminal_and_next_fifo_can_procee
         _grant, _root, first, source = await load(session, ids[0])
         descriptor = website_delivery._descriptor(first, source).model_dump(mode="json")
         assert source[2] == text
+    await poll(wh)
     request = identity(wh, {"item": descriptor})
     result = await call(wh, "work", dict(visitor(wh), **wh.poll_access)) if path == "work" else (
         await call(wh, "begin", request))
