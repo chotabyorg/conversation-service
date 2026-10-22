@@ -207,6 +207,14 @@ async def locked_access(
         or probe.provision_command_id is None
     ):
         raise DomainError(ErrorCode.NOT_FOUND)
+    # Preserve indistinguishable visitor rejection even if suppliers are down.
+    # This early check is repeated after the root lock by locked_credential.
+    if (
+        probe.binding_generation != request.binding_generation
+        or probe.revoked_at is not None
+        or await db_clock(session) >= probe.expires_at
+    ):
+        raise DomainError(ErrorCode.NOT_FOUND)
     issued_epoch = website_grant.WebsiteGrantEpoch(
         probe.grant_generation, probe.agent_lifecycle_generation, probe.provision_command_id
     )

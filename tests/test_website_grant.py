@@ -219,6 +219,29 @@ async def test_unavailable_proof_does_not_fall_back_to_credential(sh, suppliers)
     assert captured.value.code == ErrorCode.SERVICE_UNAVAILABLE
 
 
+@pytest.mark.parametrize("invalid", ["expired", "revoked"])
+async def test_expired_or_revoked_visitor_is_404_before_supplier_io(sh, suppliers, sql, invalid):
+    await enroll(sh, suppliers)
+    created = await issued(sh)
+    async with sql.begin() as conn:
+        if invalid == "expired":
+            await conn.execute(
+                text(
+                    "UPDATE website_session_capabilities "
+                    "SET issued_at=clock_timestamp()-interval '2 seconds',"
+                    "expires_at=clock_timestamp()-interval '1 second'"
+                )
+            )
+        else:
+            await conn.execute(
+                text("UPDATE website_session_capabilities SET revoked_at=clock_timestamp()")
+            )
+    suppliers.calls.clear()
+    suppliers.failure = ErrorCode.SERVICE_UNAVAILABLE
+    await denied(sh, created)
+    assert suppliers.calls == []
+
+
 async def test_revoke_floors_and_reenrollment_cannot_reactivate_old_credential(sh, suppliers):
     await enroll(sh, suppliers)
     old = await issued(sh)
