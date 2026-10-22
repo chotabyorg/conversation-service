@@ -6,6 +6,8 @@ import subprocess
 import sys
 from uuid import UUID
 
+from alembic.config import Config
+from alembic.script import ScriptDirectory
 import httpx
 import pytest
 from asgi_lifespan import LifespanManager
@@ -373,7 +375,8 @@ def test_native_migration_database_source_priority_and_no_auth_requirement(
             timeout=30,
         )
         assert smoke.returncode == 0
-        assert "0015_website_grant_epoch" in smoke.stdout
+        expected = ScriptDirectory.from_config(Config(str(ROOT / "alembic.ini"))).get_current_head()
+        assert expected is not None and f"{expected} (head)" in smoke.stdout
     else:
         assert result.returncode != 0
         assert "DATABASE_URL must be a dedicated PostgreSQL asyncpg URL" in result.stderr
