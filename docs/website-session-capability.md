@@ -52,6 +52,10 @@ floors before any content read/admit/send; this helper is not that combined gate
 shared provision receipt and current CP/AI proofs. It requires a caller-owned
 transaction and retains the common scope lock before the canonical root lock
 through protected use. It does not expose a public content or delivery endpoint.
+Content access selects an existing scope with `FOR SHARE`, allowing distinct
+visitors' proof requests and protected use to proceed concurrently. It never
+inserts a scope. Issuance and lifecycle mutation retain `FOR UPDATE`, so revoke
+still waits for protected use and subsequent readers observe the new epoch.
 Issuance under an active common grant records its grant generation, AI lifecycle
 generation and original provision command UUID; the existing binding generation
 records CP's generation. CP proof reuses that retained command identity.

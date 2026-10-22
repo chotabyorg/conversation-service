@@ -15,7 +15,7 @@ from models import InboxGrantLifecycleReceipt, InboxGrantScope, WebsiteSessionCa
 from schemas.contracts import ErrorCode
 from schemas.handoff import InboxGrantProvision, InboxGrantProvisioned
 from schemas.website_session import WebsiteSessionScope
-from services import inbox_lifecycle, website_session
+from services import inbox_lifecycle, website_grant, website_session
 from tests.conftest import app_client, error, observed_waiters
 from tests.test_website_session import access, issued, scope
 
@@ -291,6 +291,68 @@ async def test_scope_lock_wait_observes_revocation_before_protected_use(sh, supp
     with pytest.raises(DomainError) as captured:
         await pending
     assert captured.value.code == ErrorCode.NOT_FOUND
+
+
+async def test_distinct_visitors_hold_shared_scope_and_fetch_proofs_concurrently(
+    sh,
+    suppliers,
+    monkeypatch,
+):
+    await enroll(sh, suppliers)
+    first, second = await issued(sh), await issued(sh)
+    original = inbox_lifecycle._post_proof
+    both_arrived = asyncio.Event()
+    arrivals = 0
+
+    async def barrier(url, path, headers, request, response_model):
+        nonlocal arrivals
+        if path.endswith("integration-proof"):
+            arrivals += 1
+            if arrivals == 2:
+                both_arrived.set()
+            await asyncio.wait_for(both_arrived.wait(), 3)
+        return await original(url, path, headers, request, response_model)
+
+    monkeypatch.setattr(inbox_lifecycle, "_post_proof", barrier)
+    roots = await asyncio.gather(content(sh, first), content(sh, second))
+    assert roots[0] != roots[1] and arrivals == 2
+
+
+async def test_revoke_waits_for_inflight_shared_scope_protected_use(sh, suppliers, sql):
+    await enroll(sh, suppliers)
+    created = await issued(sh)
+
+    async def revoke():
+        async with sh.database.session_factory() as session, session.begin():
+            row = await website_grant.lock_scope(
+                session, WebsiteSessionScope.model_validate(scope(sh))
+            )
+            row.active, row.grant_generation = False, 2
+
+    async with sh.database.session_factory() as reader, reader.begin():
+        await website_session.locked_access(
+            reader, sh.settings.auth_principals[0].principal(), access(sh, created), sh.settings
+        )
+        pid = await reader.scalar(text("SELECT pg_backend_pid()"))
+        pending = asyncio.create_task(revoke())
+        try:
+            await observed_waiters(sql, pid, 1, "website_revoke_after_shared_protected_use")
+        finally:
+            await reader.commit()
+    await pending
+    await denied(sh, created)
+
+
+async def test_content_read_never_allocates_missing_scope(sh, suppliers, sql):
+    await enroll(sh, suppliers)
+    created = await issued(sh)
+    async with sql.begin() as conn:
+        await conn.execute(text("DELETE FROM inbox_grant_scopes"))
+    suppliers.calls.clear()
+    await denied(sh, created)
+    assert suppliers.calls == []
+    async with sql.connect() as conn:
+        assert await conn.scalar(text("SELECT count(*) FROM inbox_grant_scopes")) == 0
 
 
 @pytest.mark.parametrize("mutation", ["fingerprint", "ack_epoch", "missing"])

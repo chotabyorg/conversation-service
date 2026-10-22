@@ -218,7 +218,7 @@ async def locked_access(
     issued_epoch = website_grant.WebsiteGrantEpoch(
         probe.grant_generation, probe.agent_lifecycle_generation, probe.provision_command_id
     )
-    scope = await website_grant.lock_scope(session, request)
+    scope = await website_grant.lock_scope(session, request, shared=True)
     await website_grant.current_epoch(session, scope, request, settings, expected=issued_epoch)
     root = await locked_credential(session, principal, request, settings)
     retained = await session.get(WebsiteSessionCapability, root.id, populate_existing=True)
