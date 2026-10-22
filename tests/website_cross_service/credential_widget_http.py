@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import subprocess
+from datetime import timedelta
 from pathlib import Path
 from uuid import uuid4
 
@@ -13,8 +14,12 @@ from models import DeliveryAttempt
 from services.website_worker import WebsiteWorker
 from tests.test_website_v3_execution import WebsiteV3Port
 from tests.website_common_fixture import due
+from tests.website_cross_service.credential_gateway_http import (
+    assert_no_session_work,
+    revision,
+    wait_poll_ended,
+)
 from tests.website_cross_service.credential_gateway_http import composed as gateway_fixture
-from tests.website_cross_service.credential_gateway_http import revision
 from tests.website_cross_service.credential_gateway_http import sh as session_fixture
 from tests.website_cross_service.credential_gateway_http import suppliers as supplier_fixture
 from tests.website_cross_service.credential_gateway_http import wh as provision_fixture
@@ -61,6 +66,7 @@ async def test_actual_widget_handoff_human_return_new_ai_and_reload(composed, tm
             assert value.get("event") == expected, {
                 "event": value.get("event"),
                 "error_type": value.get("error_type"),
+                "error_site": value.get("error_site"),
             }
             return value
 
@@ -77,7 +83,14 @@ async def test_actual_widget_handoff_human_return_new_ai_and_reload(composed, tm
             )
 
         try:
+            created = await event("SESSION_CREATED_EMPTY_DENIED")
+            await assert_no_session_work(peer, created["session_id"])
+            await wait_poll_ended(peer, created["session_id"])
+            peer.wh.clock.advance_to(peer.wh.clock.current + timedelta(seconds=2))
+            await peer.restart([created["session_id"]])
+            command("SESSION_SELECTED")
             first = await event("CUSTOMER_ADMITTED")
+            assert first["session_id"] == created["session_id"]
             await due(peer.wh)
             assert await WebsiteWorker(
                 peer.wh.database, peer.wh.settings, WebsiteV3Port("HANDOFF")

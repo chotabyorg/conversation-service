@@ -1,5 +1,6 @@
 /** Actual Widget and Gateway, all page requests intercepted to explicit loopback. */
 import assert from 'node:assert/strict';
+import { randomUUID } from 'node:crypto';
 import { readFile, writeFile } from 'node:fs/promises';
 import { createInterface } from 'node:readline';
 import { createRequire } from 'node:module';
@@ -19,7 +20,7 @@ const pending = [], waiting = [];
 input.on('line', line => waiting.length ? waiting.shift()(JSON.parse(line)) : pending.push(JSON.parse(line)));
 const next = () => pending.length ? Promise.resolve(pending.shift()) : new Promise(resolve => waiting.push(resolve));
 const emit = event => process.stdout.write(JSON.stringify(event) + '\n');
-let session = null, proxied = 0, unexpected = 0;
+let session = null, credential = null, proxied = 0, unexpected = 0;
 const pageErrors = [];
 const origin = 'https://composed-widget.invalid';
 await context.route('**/*', async route => {
@@ -42,7 +43,8 @@ await context.route('**/*', async route => {
       timeout: 10000, failOnStatusCode: false });
     const body = await response.body();
     if (url.pathname === '/v1/sessions' && response.status() === 201) {
-      session = JSON.parse(body.toString('utf8')).session_id;
+      credential = JSON.parse(body.toString('utf8'));
+      session = credential.session_id;
     }
     proxied += 1;
     await route.fulfill({ status: response.status(), headers: response.headers(), body });
@@ -57,7 +59,11 @@ try {
   await page.goto(origin);
   await page.locator('.chw-input').waitFor({ state: 'attached' });
   await page.waitForFunction(() => !document.querySelector('.chw-input').disabled);
+  const firstPoll = page.waitForResponse(response =>
+    new URL(response.url()).pathname === '/v1/sessions/poll' &&
+    response.request().method() === 'POST');
   await page.getByRole('button', { name: 'Открыть чат', exact: true }).click();
+  await page.waitForFunction(() => !document.querySelector('.chw-input').disabled);
   async function send(text) {
     await page.locator('.chw-input').fill(text);
     const admitted = page.waitForResponse(response =>
@@ -70,6 +76,25 @@ try {
     await page.waitForFunction(() => !document.querySelector('.chw-input').disabled);
     assert.equal(await page.locator('.chw-retry').count(), 0);
   }
+  assert.ok(session);
+  // The actual Widget created this capability while admission was empty. Probe
+  // with its valid credential without making the Widget discard it on a 404.
+  // Only the server-issued UUID leaves this browser harness; never the token.
+  const denied = await context.request.post(target.origin + '/v1/sessions/messages', {
+    headers: { 'X-Widget-Key': config.widget_key, 'X-Widget-Session-Token': credential.session_token,
+      'X-Forwarded-Proto': 'https', 'X-Real-IP': '192.0.2.10' },
+    data: { session_id: session, message_id: randomUUID(), message: 'Not admitted' } });
+  assert.equal(denied.status(), 404);
+  assert.deepEqual(await denied.json(), { error: 'Session unavailable' });
+  assert.equal(denied.headers()['cache-control'], 'no-store');
+  const idle = await firstPoll;
+  assert.equal(idle.status(), 200);
+  assert.equal((await idle.json()).state, 'EMPTY');
+  await page.locator('.chw-close').click();
+  emit({ event: 'SESSION_CREATED_EMPTY_DENIED', session_id: session });
+  assert.equal((await next()).command, 'SESSION_SELECTED');
+  await page.getByRole('button', { name: 'Открыть чат', exact: true }).click();
+  await page.waitForFunction(() => !document.querySelector('.chw-input').disabled);
   await send('Нужен оператор');
   assert.ok(session);
   emit({ event: 'CUSTOMER_ADMITTED', session_id: session });
@@ -107,7 +132,8 @@ try {
   await writeFile(config.result_file, JSON.stringify(result, null, 2));
   emit({ event: 'PASS', ...result });
 } catch (error) {
-  emit({ event: 'FAIL', error_type: error.name });
+  emit({ event: 'FAIL', error_type: error.name,
+    error_site: /widget_peer\.mjs:\d+:\d+/.exec(error.stack || '')?.[0] || null });
   process.exitCode = 1;
 } finally {
   input.close();
