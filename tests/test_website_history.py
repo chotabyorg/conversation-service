@@ -81,11 +81,11 @@ async def test_pagination_fifty_and_materialization_limit_never_skip_eligible_in
 
 
 async def test_full_serialized_json_byte_budget_keeps_escaped_content_and_cursor(wh):
-    payload = "\x01" * 16000
-    for _ in range(3):
+    payload = "\x01" * 10000
+    for _ in range(5):
         await append(wh, payload)
     first = await page(wh)
-    assert len(first.content) <= 262144 and len(first.json()["items"]) == 2
+    assert len(first.content) <= 262144 and len(first.json()["items"]) == 4
     cursor = first.json()["next_cursor"]
     assert cursor == first.json()["items"][-1]["id"]
     last = await page(wh, cursor)
