@@ -258,15 +258,17 @@ async def claim_turn(
         ).first()
         handoff_scope = None
         if probe is not None and probe.managed_contract_version == 3:
-            if probe.channel != "TELEGRAM" or probe.managed_projection_agent_id is None:
+            if (probe.channel not in {"TELEGRAM", "WEBSITE_WIDGET"}
+                    or probe.managed_projection_agent_id is None):
                 raise DomainError(ErrorCode.NOT_FOUND)
-            from services.telegram import _locked_handoff_scope_values
+            from services.handoff_scope import lock_scope
 
-            handoff_scope = await _locked_handoff_scope_values(
+            handoff_scope = await lock_scope(
                 session,
-                probe.owner_id,
-                probe.integration_id,
-                probe.managed_projection_agent_id,
+                owner_id=probe.owner_id,
+                integration_id=probe.integration_id,
+                channel=probe.channel,
+                agent_id=probe.managed_projection_agent_id,
             )
             if handoff_scope is None:
                 raise DomainError(ErrorCode.GRANT_CONFLICT)
