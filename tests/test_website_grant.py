@@ -14,11 +14,11 @@ from core.errors import DomainError
 from models import InboxGrantLifecycleReceipt, InboxGrantScope, WebsiteSessionCapability
 from schemas.contracts import ErrorCode
 from schemas.handoff import InboxGrantProvision, InboxGrantProvisioned
-from schemas.website_session import WebsiteSessionScope
+from schemas.website_session import WebsiteSessionCreate, WebsiteSessionScope
 from services import inbox_lifecycle, website_grant, website_session
 from tests.conftest import app_client, error, observed_waiters
 from tests.test_managed_migration import migrate
-from tests.test_website_session import access, issued, scope
+from tests.test_website_session import access, creation, issued, scope
 from tests.test_website_session import sh as website_session_fixture
 
 sh = website_session_fixture
@@ -252,7 +252,7 @@ async def test_revoke_floors_and_reenrollment_cannot_reactivate_old_credential(s
         row.active, row.grant_generation = False, 2
         row.cp_binding_high_water, row.agent_lifecycle_high_water = 8, 12
     await denied(sh, old)
-    response = await sh.call("POST", "/website/sessions", scope(sh))
+    response = await sh.call("POST", "/website/sessions", creation(sh))
     error(response, "NOT_FOUND", 404)
     suppliers.cp, suppliers.ai = 9, 13
     await enroll(sh, suppliers, generation=3)
@@ -268,7 +268,7 @@ async def test_revoke_floors_and_reenrollment_cannot_reactivate_old_credential(s
     fresh = await website_session.create(
         sh.database,
         settings.auth_principals[0].principal(),
-        WebsiteSessionScope.model_validate(dict(scope(sh), binding_generation=9)),
+        WebsiteSessionCreate.model_validate(dict(creation(sh), binding_generation=9)),
         settings,
     )
     value = dict(

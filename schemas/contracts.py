@@ -108,6 +108,7 @@ class DeliveryErrorCode(str, Enum):
 
 
 class ErrorCode(str, Enum):
+    RATE_LIMITED = "RATE_LIMITED"
     UNAUTHENTICATED = "UNAUTHENTICATED"
     FORBIDDEN = "FORBIDDEN"
     COMMAND_CONFLICT = "COMMAND_CONFLICT"

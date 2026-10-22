@@ -43,10 +43,14 @@ def scope(sh):
 
 
 async def issued(sh):
-    response = await sh.call("POST", "/website/sessions", scope(sh))
+    response = await sh.call("POST", "/website/sessions", creation(sh))
     assert response.status_code == 201, response.text
     assert response.headers["Cache-Control"] == "no-store"
     return response.json()
+
+
+def creation(sh):
+    return dict(scope(sh), client_ip="192.0.2.1")
 
 
 def access(sh, created, **changes):
@@ -121,7 +125,7 @@ async def test_generation_advance_disable_binding_removal_and_role_deny(sh):
         with pytest.raises(DomainError) as captured:
             await authorized(sh, access(sh, created), settings)
         assert captured.value.code == ErrorCode.NOT_FOUND
-    response = await sh.call("POST", "/website/sessions", scope(sh), principal="worker")
+    response = await sh.call("POST", "/website/sessions", creation(sh), principal="worker")
     error(response, "NOT_FOUND", 404)
     with pytest.raises(ValidationError):
         Settings(database_url=sh.settings.database_url,
@@ -134,7 +138,7 @@ async def test_generation_advance_disable_binding_removal_and_role_deny(sh):
 async def test_default_off_has_no_root_side_effects(sh, sql, database_url):
     settings = sh.settings.model_copy(update={"website_session_capabilities_enabled": False})
     async with app_client(settings, database_url) as (client, _):
-        response = await client.post("/internal/v1/website/sessions", json=scope(sh),
+        response = await client.post("/internal/v1/website/sessions", json=creation(sh),
                                      headers=sh.headers())
         error(response, "NOT_FOUND", 404)
     async with sql.connect() as conn:
@@ -145,7 +149,7 @@ async def test_collision_never_attaches_old_root_or_changes_credential(sh, sql, 
     created = await issued(sh)
     values = iter([UUID(created["session_id"]), uuid4()])
     monkeypatch.setattr(website_session, "uuid4", lambda: next(values))
-    response = await sh.call("POST", "/website/sessions", scope(sh))
+    response = await sh.call("POST", "/website/sessions", creation(sh))
     error(response, "NOT_FOUND", 404)
     await authorized(sh, access(sh, created))
     async with sql.connect() as conn:
@@ -237,8 +241,9 @@ async def test_migration_refuses_to_discard_credential_evidence(sh, database_url
     created = await issued(sh)
     await sh.database.dispose()
     rejected = migrate(database_url, "downgrade", "0013_writer_retirement", expected=1)
-    assert ("Retained Website session credentials and common grant epochs prevent downgrade"
-            in rejected.stderr)
+    assert any(message in rejected.stderr for message in (
+        "Retained Website session credentials and common grant epochs prevent downgrade",
+        "Retained Website creation admission requires a compatible reader"))
     assert await sh.database.ready()
     await authorized(sh, access(sh, created))
 
@@ -270,7 +275,8 @@ async def test_downgrade_refuses_during_issuance_and_keeps_its_committed_credent
     created = await creating
     assert migration is not None
     rejected = await asyncio.wait_for(migration, timeout=30)
-    assert ("Retained Website session credentials and common grant epochs prevent downgrade"
-            in rejected.stderr)
+    assert any(message in rejected.stderr for message in (
+        "Retained Website session credentials and common grant epochs prevent downgrade",
+        "Retained Website creation admission requires a compatible reader"))
     assert await sh.database.ready()
     await authorized(sh, access(sh, created))

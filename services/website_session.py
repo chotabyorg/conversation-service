@@ -23,8 +23,13 @@ from db.database import Database
 from models import Conversation, WebsiteSessionCapability
 from schemas.contracts import ErrorCode, Principal
 from schemas.website import WEBSITE_NAMESPACE
-from schemas.website_session import WebsiteSessionAccess, WebsiteSessionCreated, WebsiteSessionScope
-from services import website_grant
+from schemas.website_session import (
+    WebsiteSessionAccess,
+    WebsiteSessionCreate,
+    WebsiteSessionCreated,
+    WebsiteSessionScope,
+)
+from services import website_creation_limit, website_grant
 from services.common import db_clock
 
 
@@ -54,7 +59,7 @@ def authorize_scope(principal: Principal, request: WebsiteSessionScope, settings
 async def create(
     database: Database,
     principal: Principal,
-    request: WebsiteSessionScope,
+    request: WebsiteSessionCreate,
     settings: Settings,
 ) -> WebsiteSessionCreated:
     """Issue a fresh empty root and return its raw credential exactly once."""
@@ -72,6 +77,7 @@ async def create(
             or grant.agent_lifecycle_high_water is not None
         ):
             epoch = await website_grant.current_epoch(session, grant, request, settings)
+        await website_creation_limit.reserve(session, request)
         created = await session.scalar(
             insert(Conversation)
             .values(

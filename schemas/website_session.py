@@ -2,7 +2,7 @@
 from datetime import datetime
 from uuid import UUID
 
-from pydantic import Field, SecretStr, field_serializer
+from pydantic import Field, IPvAnyAddress, SecretStr, field_serializer
 
 from schemas.contracts import Contract, OwnerId, PositiveCounter, TextContent
 
@@ -22,6 +22,10 @@ class WebsiteSessionCreated(Contract):
     @field_serializer("session_token", when_used="json")
     def wire_token(self, value: SecretStr) -> str:
         return value.get_secret_value()
+
+
+class WebsiteSessionCreate(WebsiteSessionScope):
+    client_ip: IPvAnyAddress = Field(repr=False)
 
 
 class WebsiteSessionAccess(WebsiteSessionScope):

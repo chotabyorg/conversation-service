@@ -44,7 +44,10 @@ def error_response(request: Request, code: ErrorCode) -> JSONResponse:
 
 
 async def domain_error_handler(request: Request, error: DomainError) -> JSONResponse:
-    return error_response(request, error.code)
+    response = error_response(request, error.code)
+    if error.code == ErrorCode.RATE_LIMITED:
+        response.headers["Retry-After"] = str(max(1, min(60, error.retry_after or 60)))
+    return response
 
 
 async def validation_error_handler(request: Request, error: RequestValidationError) -> JSONResponse:

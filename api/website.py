@@ -26,8 +26,8 @@ from schemas.website_history import WebsiteHistoryPage, WebsiteHistoryRequest
 from schemas.website_session import (
     WebsiteSessionAccess,
     WebsiteSessionAdmission,
+    WebsiteSessionCreate,
     WebsiteSessionCreated,
-    WebsiteSessionScope,
 )
 from services import website, website_delivery, website_history, website_ingress
 from services.website_evidence import operational_evidence
@@ -46,7 +46,7 @@ async def session_history(
 
 @router.post("/sessions", response_model=WebsiteSessionCreated, status_code=201)
 async def session_create(
-    request: WebsiteSessionScope, database: AppDatabase,
+    request: WebsiteSessionCreate, database: AppDatabase,
     principal: TrustedPrincipal, settings: AppSettings,
 ) -> WebsiteSessionCreated:
     return await create_session(database, principal, request, settings)

@@ -155,6 +155,7 @@ async def test_migrated_catalog_constraints_indexes_utc_and_exact_collation(h, s
             "website_admissions",
             "website_session_capabilities",
             "website_visible_messages",
+            "website_creation_buckets",
             "website_immediate_turns",
             "website_response_attempts",
             "telegram_admissions",
@@ -177,7 +178,7 @@ async def test_migrated_catalog_constraints_indexes_utc_and_exact_collation(h, s
         }
         assert (
             await connection.scalar(text("SELECT version_num FROM alembic_version"))
-            == "0016_website_visibility"
+            == "0017_website_create_limits"
         )
         timestamps = (
             (
@@ -447,7 +448,7 @@ async def test_missing_or_wrong_revision_and_missing_table_are_not_ready(h, sql)
     finally:
         async with sql.begin() as connection:
             await connection.execute(
-                text("UPDATE alembic_version SET version_num='0016_website_visibility'")
+                text("UPDATE alembic_version SET version_num='0017_website_create_limits'")
             )
     async with sql.begin() as connection:
         await connection.execute(
