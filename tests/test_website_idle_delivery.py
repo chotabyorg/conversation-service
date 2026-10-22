@@ -174,8 +174,8 @@ async def test_oversized_first_human_intent_is_terminal_and_next_fifo_can_procee
         descriptor = website_delivery._descriptor(first, source).model_dump(mode="json")
         assert source[2] == text
     request = identity(wh, {"item": descriptor})
-    result = await call(wh, "work", visitor(wh)) if path == "work" else await call(
-        wh, "begin", request)
+    result = await call(wh, "work", dict(visitor(wh), **wh.poll_access)) if path == "work" else (
+        await call(wh, "begin", request))
     assert result.status_code == 200 and len(result.content) <= 4096
     assert result.json()["state"] == "FRAME_TOO_LARGE"
     assert result.json()["frame"] is None and result.json()["recovery"]["status"] == "SUPERSEDED"
