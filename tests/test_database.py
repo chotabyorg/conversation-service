@@ -59,6 +59,8 @@ async def test_migrated_catalog_constraints_indexes_utc_and_exact_collation(h, s
         "ck_website_session_generation",
         "ck_website_session_digest",
         "ck_website_session_clock",
+        "ck_website_session_grant_epoch",
+        "fk_website_session_grant_provision",
         "ck_conversation_counters",
         "ck_conversation_authority_input_floor",
         "ck_effect_permit_namespace",
@@ -174,7 +176,7 @@ async def test_migrated_catalog_constraints_indexes_utc_and_exact_collation(h, s
         }
         assert (
             await connection.scalar(text("SELECT version_num FROM alembic_version"))
-            == "0014_website_session"
+            == "0015_website_grant_epoch"
         )
         timestamps = (
             (
@@ -444,7 +446,7 @@ async def test_missing_or_wrong_revision_and_missing_table_are_not_ready(h, sql)
     finally:
         async with sql.begin() as connection:
             await connection.execute(
-                text("UPDATE alembic_version SET version_num='0014_website_session'")
+                text("UPDATE alembic_version SET version_num='0015_website_grant_epoch'")
             )
     async with sql.begin() as connection:
         await connection.execute(

@@ -749,7 +749,7 @@ class InboxGrantScope(Base):
     )
     __table_args__ = (
         CheckConstraint(OWNER_BOUNDS, name="ck_inbox_grant_owner_bounds"),
-        CheckConstraint("channel = 'TELEGRAM'", name="ck_inbox_grant_channel"),
+        CheckConstraint("channel IN ('TELEGRAM','WEBSITE_WIDGET')", name="ck_inbox_grant_channel"),
         CheckConstraint(
             "(cp_binding_high_water IS NULL OR cp_binding_high_water >= 0) AND "
             "(agent_lifecycle_high_water IS NULL OR agent_lifecycle_high_water >= 0) "
@@ -795,7 +795,9 @@ class InboxGrantLifecycleReceipt(Base):
             name="uq_inbox_grant_lifecycle_command",
         ),
         CheckConstraint(OWNER_BOUNDS, name="ck_inbox_grant_lifecycle_owner_bounds"),
-        CheckConstraint("channel = 'TELEGRAM'", name="ck_inbox_grant_lifecycle_channel"),
+        CheckConstraint(
+            "channel IN ('TELEGRAM','WEBSITE_WIDGET')", name="ck_inbox_grant_lifecycle_channel"
+        ),
         CheckConstraint(
             "kind IN ('PROVISION','REVOKE_CONTROL_PLANE','REVOKE_AI_AGENT')",
             name="ck_inbox_grant_lifecycle_kind",
@@ -868,7 +870,7 @@ class HandoffCase(Base):
             name="fk_handoff_case_source_turn",
             ondelete="RESTRICT",
         ),
-        CheckConstraint("channel = 'TELEGRAM'", name="ck_handoff_case_channel"),
+        CheckConstraint("channel IN ('TELEGRAM','WEBSITE_WIDGET')", name="ck_handoff_case_channel"),
         CheckConstraint(
             "reason IN ('CUSTOMER_REQUEST','AGENT_LIMIT','BUSINESS_UNCERTAIN',"
             "'POLICY_REQUIRES_HUMAN','OTHER')",
@@ -952,7 +954,9 @@ class InboxCommandReceipt(Base):
             name="fk_inbox_command_delivery",
             ondelete="RESTRICT",
         ),
-        CheckConstraint("channel = 'TELEGRAM'", name="ck_inbox_command_channel"),
+        CheckConstraint(
+            "channel IN ('TELEGRAM','WEBSITE_WIDGET')", name="ck_inbox_command_channel"
+        ),
         CheckConstraint(
             "kind IN ('CLAIM','SEND_HUMAN','RETURN_TO_AGENT')", name="ck_inbox_command_kind"
         ),

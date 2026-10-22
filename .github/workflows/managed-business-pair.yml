@@ -26,7 +26,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     env:
-      AI_REVISION: 362bd6c9ed43d75e96460bf1f96c596567aa502b
+      AI_REVISION: 547cffe066f3296fe4bc75fe8772b3b191182964
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:

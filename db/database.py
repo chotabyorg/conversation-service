@@ -50,7 +50,7 @@ class Database:
     async def dispose(self) -> None:
         await self.engine.dispose()
 
-    async def ready(self, expected_revision: str = "0014_website_session") -> bool:
+    async def ready(self, expected_revision: str = "0015_website_grant_epoch") -> bool:
         try:
             async with self.engine.connect() as connection:
                 if await connection.scalar(text("SELECT 1")) != 1:
@@ -63,7 +63,8 @@ class Database:
                 if versions != [expected_revision]:
                     return False
                 await connection.execute(text(
-                    "SELECT conversation_id,token_digest,binding_generation,expires_at "
+                    "SELECT conversation_id,token_digest,binding_generation,expires_at,"
+                    "grant_generation,agent_lifecycle_generation,provision_command_id "
                     "FROM website_session_capabilities LIMIT 1"
                 ))
                 await connection.execute(
