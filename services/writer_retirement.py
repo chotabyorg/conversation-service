@@ -10,21 +10,33 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from core.config import Settings
 from core.errors import DomainError
 from db.database import Database
-from models import DeliveryAttempt
+from models import Conversation, DeliveryAttempt, InboxGrantScope, WebsiteSessionCapability
 from schemas.contracts import ErrorCode, Principal
-from schemas.writer_retirement import WriterRetireCommand, WriterRetired, WriterTerminationProof
+from schemas.writer_retirement import (
+    RetireCommand,
+    TerminationEvidence,
+    WebsiteWriterRetireCommand,
+    WebsiteWriterTerminationProof,
+    WriterRetired,
+    WriterTerminationProof,
+)
 from services.common import db_clock, fingerprint
+from services.delivery_ledger import _record_reconciliation
 from services.inbox_lifecycle import _post_proof
-from services.telegram import _record_reconciliation
 from services.telegram_delivery_v2 import V2_NAMESPACE, _load_intent
 
 WRITER_PROOF_DEADLINE_SECONDS = 8.0
 
 
-def _authorize(principal: Principal, request: WriterRetireCommand, settings: Settings) -> None:
+def _authorize(principal: Principal, request: RetireCommand, settings: Settings) -> None:
     if (principal.principal_id != "delivery-writer-supervisor"
-        or principal.role != "INBOX_LIFECYCLE"
-        or request.integration_id not in settings.handoff_cohort_integration_ids
+        or principal.role != "INBOX_LIFECYCLE"):
+        raise DomainError(ErrorCode.NOT_FOUND)
+    # Website recovery is authorized against retained scope/capability rows below,
+    # including revoked/expired sessions and configuration rollback. It cannot
+    # allocate a root, grant, send permission or lifecycle row.
+    if not isinstance(request, WebsiteWriterRetireCommand) and (
+        request.integration_id not in settings.handoff_cohort_integration_ids
         or not any(binding.owner_id == request.owner_id
                    and binding.integration_id == request.integration_id
                    and binding.agent_id == request.agent_id
@@ -35,8 +47,40 @@ def _authorize(principal: Principal, request: WriterRetireCommand, settings: Set
         raise DomainError(ErrorCode.SERVICE_UNAVAILABLE)
 
 
+async def _load_writer(session: AsyncSession, principal: Principal,
+                       settings: Settings, request: RetireCommand
+                       ) -> tuple[InboxGrantScope, Conversation, DeliveryAttempt]:
+    if not isinstance(request, WebsiteWriterRetireCommand):
+        tg_grant, tg_root, tg_intent, _ = await _load_intent(session, principal, settings, request)
+        return tg_grant, tg_root, tg_intent
+    # Match existing retained authority first; unlike provisioning this path must
+    # never create a scope for a guessed or no-longer-configured integration.
+    grant = await session.scalar(select(InboxGrantScope).filter_by(
+        owner_id=request.owner_id, integration_id=request.integration_id,
+        channel="WEBSITE_WIDGET", agent_id=request.agent_id).with_for_update()
+        .execution_options(populate_existing=True))
+    if grant is None:
+        raise DomainError(ErrorCode.NOT_FOUND)
+    root = await session.scalar(select(Conversation).filter_by(id=request.conversation_id,
+        owner_id=request.owner_id, integration_id=request.integration_id,
+        channel="WEBSITE_WIDGET", provider_thread_id=str(request.session_id)).with_for_update()
+        .execution_options(populate_existing=True))
+    if root is None:
+        raise DomainError(ErrorCode.NOT_FOUND)
+    capability = await session.scalar(select(WebsiteSessionCapability).filter_by(
+        conversation_id=root.id, owner_id=request.owner_id, integration_id=request.integration_id,
+        channel="WEBSITE_WIDGET", provider_thread_id=str(request.session_id),
+        agent_id=request.agent_id, binding_generation=request.binding_generation))
+    if capability is None or capability.provision_command_id is None:
+        raise DomainError(ErrorCode.NOT_FOUND)
+    from services.website_delivery import _load
+
+    _grant, intent, _ = await _load(session, root, request, request.agent_id)
+    return grant, root, intent
+
+
 async def _retained(
-    session: AsyncSession, intent: DeliveryAttempt, request: WriterRetireCommand, digest: str,
+    session: AsyncSession, intent: DeliveryAttempt, request: RetireCommand, digest: str,
 ) -> WriterRetired | None:
     existing = await session.scalar(select(DeliveryAttempt.id).where(
         DeliveryAttempt.conversation_id == intent.conversation_id,
@@ -54,7 +98,7 @@ async def _retained(
     return None
 
 
-def _eligible(intent: DeliveryAttempt, request: WriterRetireCommand) -> None:
+def _eligible(intent: DeliveryAttempt, request: RetireCommand) -> None:
     if (intent.writer_state != "LIVE"
         or intent.writer_supplier_instance_id != request.supplier_instance_id
         or intent.writer_process_incarnation_id != request.process_incarnation_id):
@@ -64,16 +108,19 @@ def _eligible(intent: DeliveryAttempt, request: WriterRetireCommand) -> None:
 
 
 async def _termination_proof(
-    request: WriterRetireCommand, digest: str, settings: Settings,
-) -> WriterTerminationProof:
+    request: RetireCommand, digest: str, settings: Settings,
+) -> TerminationEvidence:
     if settings.writer_supervisor_base_url is None or settings.writer_supervisor_token is None:
         raise DomainError(ErrorCode.SERVICE_UNAVAILABLE)
     try:
         async with asyncio.timeout(WRITER_PROOF_DEADLINE_SECONDS):
+            proof_type = (WebsiteWriterTerminationProof
+                          if isinstance(request, WebsiteWriterRetireCommand)
+                          else WriterTerminationProof)
             proof = await _post_proof(settings.writer_supervisor_base_url,
                 "/internal/v1/writer-termination/proof",
                 {"X-Writer-Supervisor-Token": settings.writer_supervisor_token.get_secret_value()},
-                request, WriterTerminationProof)
+                request, proof_type)
     except TimeoutError:
         raise DomainError(ErrorCode.SERVICE_UNAVAILABLE) from None
     if (proof.request_fingerprint != digest or any(
@@ -85,13 +132,13 @@ async def _termination_proof(
 
 
 async def retire_writer(
-    database: Database, principal: Principal, request: WriterRetireCommand, settings: Settings,
+    database: Database, principal: Principal, request: RetireCommand, settings: Settings,
 ) -> WriterRetired:
     _authorize(principal, request, settings)
     digest = fingerprint(request.model_dump(mode="json"))
     # Replay precedes external dependencies and current delivery revision checks.
     async with database.session_factory() as session, session.begin():
-        _, _, intent, _ = await _load_intent(session, principal, settings, request)
+        _, _, intent = await _load_writer(session, principal, settings, request)
         retained = await _retained(session, intent, request, digest)
         if retained is not None:
             return retained
@@ -102,7 +149,7 @@ async def retire_writer(
     proof = await _termination_proof(request, digest, settings)
 
     async with database.session_factory() as session, session.begin():
-        _, conversation, intent, _ = await _load_intent(session, principal, settings, request)
+        _, conversation, intent = await _load_writer(session, principal, settings, request)
         retained = await _retained(session, intent, request, digest)
         if retained is not None:
             return retained
