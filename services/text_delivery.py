@@ -94,16 +94,15 @@ async def complete_writer(
                     actor="AGENT", direction="OUTBOUND",
                     content_type="TEXT", text=source[2], source_agent_turn_id=turn.id,
                     created_at=clock))
-    ended = intent.writer_state in {"ENDED", "RETIRED"}
+    was_ended = intent.writer_state in {"ENDED", "RETIRED"}
     if evidence.task_joined:
         if intent.writer_state == "LIVE":
             intent.writer_state, intent.writer_ended_at = "ENDED", await db_clock(session)
-            ended = True
-        elif not ended:
+        elif not was_ended:
             raise DomainError(ErrorCode.INVALID_DELIVERY_TRANSITION)
     await session.flush()
     return WriterCompletion(outcome=evidence.outcome,
-        replayed=same and (not evidence.task_joined or ended))
+        replayed=same and (not evidence.task_joined or was_ended))
 
 
 async def begin_writer(
