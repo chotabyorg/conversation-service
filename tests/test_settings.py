@@ -6,10 +6,10 @@ import subprocess
 import sys
 from uuid import UUID
 
-from alembic.config import Config
-from alembic.script import ScriptDirectory
 import httpx
 import pytest
+from alembic.config import Config
+from alembic.script import ScriptDirectory
 from asgi_lifespan import LifespanManager
 from pydantic import ValidationError
 
