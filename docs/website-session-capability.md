@@ -72,5 +72,7 @@ The schema can read Website cases and lifecycle receipts, but fresh Website comm
 provision/revoke remains rejected before supplier calls. Enabling it requires the
 remaining legacy Website fencing, common managed v3 execution, idle delivery and
 writer retirement work. No new lifecycle store or delivery mechanism is introduced.
-Migration 0015 refuses downgrade unconditionally to preserve retained epochs;
-before enabling issuance, prepare a compatible rollback reader or forward fix.
+Migration 0015 refuses downgrade while any Website credential or common Website
+scope, lifecycle receipt, case or command receipt remains. It locks writers before
+checking retained evidence; an empty schema can still downgrade and upgrade.
+Before enabling issuance, prepare a compatible rollback reader or forward fix.

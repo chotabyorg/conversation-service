@@ -45,6 +45,30 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    raise RuntimeError(
-        "Retained Website session credentials and common grant epochs prevent downgrade"
-    )
+    bind = op.get_bind()
+    # Match issuance/lifecycle scope-before-root ordering. A concurrent writer
+    # must commit before the evidence check, or wait until the old schema exists.
+    for table, _ in CONSTRAINTS:
+        bind.execute(sa.text(f"LOCK TABLE {table} IN ACCESS EXCLUSIVE MODE"))
+    bind.execute(sa.text("LOCK TABLE conversations IN SHARE ROW EXCLUSIVE MODE"))
+    bind.execute(sa.text("LOCK TABLE website_session_capabilities IN ACCESS EXCLUSIVE MODE"))
+    retained = bind.execute(sa.text(
+        "SELECT EXISTS (SELECT 1 FROM website_session_capabilities)"
+    )).scalar()
+    for table, _ in CONSTRAINTS:
+        retained = retained or bind.execute(sa.text(
+            f"SELECT EXISTS (SELECT 1 FROM {table} WHERE channel='WEBSITE_WIDGET')"
+        )).scalar()
+    if retained:
+        raise RuntimeError(
+            "Retained Website session credentials and common grant epochs prevent downgrade"
+        )
+    op.drop_constraint("fk_website_session_grant_provision", "website_session_capabilities",
+                       type_="foreignkey")
+    op.drop_constraint("ck_website_session_grant_epoch", "website_session_capabilities",
+                       type_="check")
+    for name in ("provision_command_id", "agent_lifecycle_generation", "grant_generation"):
+        op.drop_column("website_session_capabilities", name)
+    for table, name in CONSTRAINTS:
+        op.drop_constraint(name, table, type_="check")
+        op.create_check_constraint(name, table, "channel = 'TELEGRAM'")

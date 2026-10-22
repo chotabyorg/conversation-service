@@ -17,6 +17,7 @@ from schemas.handoff import InboxGrantProvision, InboxGrantProvisioned
 from schemas.website_session import WebsiteSessionScope
 from services import inbox_lifecycle, website_grant, website_session
 from tests.conftest import app_client, error, observed_waiters
+from tests.test_managed_migration import migrate
 from tests.test_website_session import access, issued, scope
 
 pytest_plugins = ["tests.test_website_session"]
@@ -426,3 +427,23 @@ async def test_common_website_enrollment_stays_disabled_before_transport(sh, sup
         )
     assert captured.value.code == ErrorCode.NOT_FOUND
     assert suppliers.calls == []
+
+
+@pytest.mark.parametrize("retained", ["scope", "receipt"])
+async def test_downgrade_keeps_common_website_evidence_without_credentials(
+    sh, suppliers, sql, database_url, retained,
+):
+    await enroll(sh, suppliers)
+    removed = ("inbox_grant_lifecycle_receipts" if retained == "scope"
+               else "inbox_grant_scopes")
+    kept = ("inbox_grant_scopes" if retained == "scope"
+            else "inbox_grant_lifecycle_receipts")
+    async with sql.begin() as conn:
+        await conn.execute(text(f"DELETE FROM {removed}"))
+    await sh.database.dispose()
+    rejected = migrate(database_url, "downgrade", "0014_website_session", expected=1)
+    assert "common grant epochs prevent downgrade" in rejected.stderr
+    assert await sh.database.ready()
+    async with sql.connect() as conn:
+        assert await conn.scalar(text(f"SELECT count(*) FROM {kept}")) == 1
+        assert await conn.scalar(text("SELECT count(*) FROM website_session_capabilities")) == 0
