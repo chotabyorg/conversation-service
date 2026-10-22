@@ -2,18 +2,17 @@
 
 from uuid import UUID
 
-from sqlalchemy import select
-
 from core.config import Settings
 from core.errors import DomainError
 from db.database import Database
-from models import Conversation, InboxGrantScope
-from schemas.contracts import Channel, ControlTransition, ConversationRead, ErrorCode, Principal
+from models import Conversation
+from schemas.contracts import ControlTransition, ConversationRead, ErrorCode, Principal
 from services.common import (
     authorized_conversation,
     db_clock,
-    telegram_handoff_was_ever_enrolled,
+    handoff_was_ever_enrolled,
 )
+from services.handoff_scope import lock_legacy_scopes
 
 
 def advance_authority(conversation: Conversation) -> None:
@@ -34,38 +33,12 @@ async def transition_control(
         # Discover immutable scope without taking the parent lock first. Handoff
         # lifecycle operations use the integration-scope -> Conversation order.
         probe = await authorized_conversation(session, principal, conversation_id)
-        if probe.channel == Channel.TELEGRAM.value:
-            from services import telegram
-
-            existing_agent_ids = set(
-                (
-                    await session.scalars(
-                        select(InboxGrantScope.agent_id).where(
-                            InboxGrantScope.owner_id == probe.owner_id,
-                            InboxGrantScope.integration_id == probe.integration_id,
-                            InboxGrantScope.channel == Channel.TELEGRAM.value,
-                        )
-                    )
-                ).all()
-            )
-            configured_agent_ids = {
-                binding.agent_id
-                for binding in settings.managed_ai_bindings
-                if binding.channel == Channel.TELEGRAM
-                and binding.owner_id == probe.owner_id
-                and binding.integration_id == probe.integration_id
-            }
-            scopes = [
-                await telegram._locked_handoff_scope_values(
-                    session, probe.owner_id, probe.integration_id, agent_id
-                )
-                for agent_id in sorted(existing_agent_ids | configured_agent_ids, key=str)
-            ]
-            if any(telegram._ever_enrolled(scope) for scope in scopes):
-                raise DomainError(ErrorCode.HANDOFF_CONFLICT)
+        if await lock_legacy_scopes(session, owner_id=probe.owner_id,
+                integration_id=probe.integration_id, channel=probe.channel, settings=settings):
+            raise DomainError(ErrorCode.HANDOFF_CONFLICT)
 
         conversation = await authorized_conversation(session, principal, conversation_id, lock=True)
-        if await telegram_handoff_was_ever_enrolled(session, conversation):
+        if await handoff_was_ever_enrolled(session, conversation):
             raise DomainError(ErrorCode.HANDOFF_CONFLICT)
         if request.expected_authority_revision != conversation.authority_revision:
             raise DomainError(ErrorCode.AUTHORITY_REVISION_CONFLICT)

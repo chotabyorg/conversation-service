@@ -90,10 +90,10 @@ async def authorized_conversation(
     return conversation
 
 
-async def telegram_handoff_was_ever_enrolled(
+async def handoff_was_ever_enrolled(
     session: AsyncSession, conversation: Conversation
 ) -> bool:
-    """Recheck the durable Telegram enrollment fence after locking its parent.
+    """Recheck the durable text enrollment fence after locking its parent.
 
     Generic legacy writers normally lock an existing/configured grant scope
     before the Conversation. A stale settings instance can miss a scope that
@@ -101,7 +101,7 @@ async def telegram_handoff_was_ever_enrolled(
     read-only post-lock check closes that gap without taking the scope lock in
     reverse order.
     """
-    if conversation.channel != "TELEGRAM":
+    if conversation.channel not in {"TELEGRAM", "WEBSITE_WIDGET"}:
         return False
     return bool(
         await session.scalar(
@@ -109,7 +109,7 @@ async def telegram_handoff_was_ever_enrolled(
             .where(
                 InboxGrantScope.owner_id == conversation.owner_id,
                 InboxGrantScope.integration_id == conversation.integration_id,
-                InboxGrantScope.channel == "TELEGRAM",
+                InboxGrantScope.channel == conversation.channel,
                 or_(
                     InboxGrantScope.grant_generation > 0,
                     InboxGrantScope.cp_binding_high_water.is_not(None),

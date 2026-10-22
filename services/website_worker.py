@@ -35,6 +35,7 @@ from services.common import (
     authorized_conversation,
     db_clock,
     fingerprint,
+    handoff_was_ever_enrolled,
     message_is_consumed,
     scope_filter,
 )
@@ -94,6 +95,7 @@ async def select_immediate(database: Database, principal: Principal,
                     conversation = await authorized_conversation(
                         session, principal, conversation_id, lock=True
                     )
+                    handoff_enrolled = await handoff_was_ever_enrolled(session, conversation)
                     active = await session.scalar(select(AgentTurn).where(
                         AgentTurn.conversation_id == conversation_id,
                         AgentTurn.status.in_(("PENDING", "CLAIMED")),
@@ -109,7 +111,7 @@ async def select_immediate(database: Database, principal: Principal,
                         if is_website is None:
                             continue
                         if active.managed_dispatch_epoch is None:
-                            if conversation.control_mode != "AGENT":
+                            if handoff_enrolled or conversation.control_mode != "AGENT":
                                 continue
                             admission = await session.scalar(
                                 select(WebsiteAdmission).join(
@@ -140,7 +142,7 @@ async def select_immediate(database: Database, principal: Principal,
                                 and active.lease_expires_at > clock):
                             continue
                         return active.id
-                    if conversation.control_mode != "AGENT":
+                    if handoff_enrolled or conversation.control_mode != "AGENT":
                         continue
                     if (configured_scope is None or not any(
                         item.owner_id == conversation.owner_id

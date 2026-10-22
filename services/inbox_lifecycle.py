@@ -25,6 +25,8 @@ from models import (
     InboxGrantScope,
     TelegramAdmission,
     TelegramResponseAttempt,
+    WebsiteAdmission,
+    WebsiteSessionCapability,
 )
 from schemas.contracts import ErrorCode
 from schemas.handoff import (
@@ -457,18 +459,26 @@ async def _fence_grant_outbound(
             )
         ).all()
     )
+    admission_model = WebsiteAdmission if scope.channel == "WEBSITE_WIDGET" else TelegramAdmission
     admissions = (
         await session.scalars(
-            select(TelegramAdmission.conversation_id).where(
-                TelegramAdmission.owner_id == scope.owner_id,
-                TelegramAdmission.integration_id == scope.integration_id,
-                TelegramAdmission.channel == scope.channel,
-                TelegramAdmission.agent_id == scope.agent_id,
-                TelegramAdmission.conversation_id.is_not(None),
+            select(admission_model.conversation_id).where(
+                admission_model.owner_id == scope.owner_id,
+                admission_model.integration_id == scope.integration_id,
+                admission_model.channel == scope.channel,
+                admission_model.agent_id == scope.agent_id,
+                admission_model.conversation_id.is_not(None),
             )
         )
     ).all()
     roots.update(root for root in admissions if root is not None)
+    if scope.channel == "WEBSITE_WIDGET":
+        roots.update(await session.scalars(select(WebsiteSessionCapability.conversation_id).where(
+            WebsiteSessionCapability.owner_id == scope.owner_id,
+            WebsiteSessionCapability.integration_id == scope.integration_id,
+            WebsiteSessionCapability.channel == scope.channel,
+            WebsiteSessionCapability.agent_id == scope.agent_id,
+        )))
     if not roots:
         return
     conversations = (
