@@ -341,3 +341,12 @@ supervisor proof provider. Keep the production Handoff cohort empty until a
 provider can prove termination/fencing of the exact acquired supplier/process
 incarnation. Heartbeat expiry, a missing pod, a new poller or an owner click are
 not positive evidence. Lost legacy identities without such proof stay blocked.
+
+## Text writer lifecycle evidence
+
+[Writer attestation](docs/writer-attestation.md) documents the dedicated scoped
+parent producer APIs, immutable closure fences, exact restart-safe recovery
+commands and `python retirement_worker.py` entrypoint. The additive readiness head
+is `0019_writer_attestation`. Registration enforcement defaults off; retained
+closures remain fencing facts across configuration rollback. These are lifecycle
+observations on the existing delivery journal, independent of provider outcomes.

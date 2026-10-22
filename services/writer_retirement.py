@@ -23,7 +23,8 @@ from schemas.writer_retirement import (
 from services.common import db_clock, fingerprint
 from services.delivery_ledger import _record_reconciliation
 from services.inbox_lifecycle import _post_proof
-from services.telegram_delivery_v2 import V2_NAMESPACE, _load_intent
+from services.telegram_delivery_v2 import V2_NAMESPACE, response_attempt_id
+from services.text_delivery import _source
 
 WRITER_PROOF_DEADLINE_SECONDS = 8.0
 
@@ -31,17 +32,6 @@ WRITER_PROOF_DEADLINE_SECONDS = 8.0
 def _authorize(principal: Principal, request: RetireCommand, settings: Settings) -> None:
     if (principal.principal_id != "delivery-writer-supervisor"
         or principal.role != "INBOX_LIFECYCLE"):
-        raise DomainError(ErrorCode.NOT_FOUND)
-    # Website recovery is authorized against retained scope/capability rows below,
-    # including revoked/expired sessions and configuration rollback. It cannot
-    # allocate a root, grant, send permission or lifecycle row.
-    if not isinstance(request, WebsiteWriterRetireCommand) and (
-        request.integration_id not in settings.handoff_cohort_integration_ids
-        or not any(binding.owner_id == request.owner_id
-                   and binding.integration_id == request.integration_id
-                   and binding.agent_id == request.agent_id
-                   and binding.channel.value == "TELEGRAM"
-                   for binding in settings.managed_ai_bindings)):
         raise DomainError(ErrorCode.NOT_FOUND)
     if settings.writer_supervisor_base_url is None or settings.writer_supervisor_token is None:
         raise DomainError(ErrorCode.SERVICE_UNAVAILABLE)
@@ -51,8 +41,31 @@ async def _load_writer(session: AsyncSession, principal: Principal,
                        settings: Settings, request: RetireCommand
                        ) -> tuple[InboxGrantScope, Conversation, DeliveryAttempt]:
     if not isinstance(request, WebsiteWriterRetireCommand):
-        tg_grant, tg_root, tg_intent, _ = await _load_intent(session, principal, settings, request)
-        return tg_grant, tg_root, tg_intent
+        # Retained-only recovery survives binding/cohort rollback and never provisions.
+        scope = await session.scalar(select(InboxGrantScope).filter_by(
+            owner_id=request.owner_id, integration_id=request.integration_id,
+            channel="TELEGRAM", agent_id=request.agent_id).with_for_update()
+            .execution_options(populate_existing=True))
+        if scope is None:
+            raise DomainError(ErrorCode.NOT_FOUND)
+        root = await session.scalar(select(Conversation).filter_by(
+            id=request.conversation_id, owner_id=request.owner_id,
+            integration_id=request.integration_id, channel="TELEGRAM",
+            provider_thread_id=request.provider_thread_id).with_for_update()
+            .execution_options(populate_existing=True))
+        if root is None:
+            raise DomainError(ErrorCode.NOT_FOUND)
+        intent = await session.scalar(select(DeliveryAttempt).filter_by(
+            id=request.outbound_intent_id, conversation_id=root.id,
+            outbound_ordinal=request.outbound_ordinal).with_for_update()
+            .execution_options(populate_existing=True))
+        if intent is None:
+            raise DomainError(ErrorCode.NOT_FOUND)
+        source = await _source(session, intent, root, scope, request.agent_id)
+        if (source is None or source[0] != request.source_kind or source[1] != request.source_id
+            or response_attempt_id(intent.id) != request.response_attempt_id):
+            raise DomainError(ErrorCode.DELIVERY_IDENTITY_CONFLICT)
+        return scope, root, intent
     # Match existing retained authority first; unlike provisioning this path must
     # never create a scope for a guessed or no-longer-configured integration.
     grant = await session.scalar(select(InboxGrantScope).filter_by(

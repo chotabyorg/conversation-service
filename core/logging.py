@@ -11,7 +11,8 @@ from uuid import UUID
 
 request_id_context: ContextVar[str] = ContextVar("request_id", default="")
 _IDS = ("conversation_id", "message_id", "event_id", "turn_id", "delivery_attempt_id")
-_STAGES = {"request", "startup", "shutdown", "journal", "turn", "authority", "delivery"}
+_STAGES = {"request", "startup", "shutdown", "journal", "turn", "authority",
+           "delivery", "writer_recovery"}
 
 
 class SafeJsonFormatter(logging.Formatter):
@@ -55,7 +56,8 @@ _MANAGED_DIAGNOSTIC_CODES = {
     for code in get_args(ManagedErrorCode)
 } | {"MANAGED_PREEXECUTION_UNAUTHENTICATED", "MANAGED_PREEXECUTION_AGENT_NOT_FOUND"}
 _SAFE_CODES = ({code.value for code in ErrorCode}
-               | {"REQUEST_COMPLETED", "STARTED", "STOPPED"}
+               | {"REQUEST_COMPLETED", "STARTED", "STOPPED", "WRITER_RECOVERY_PENDING",
+                  "WRITER_RECOVERY_RETRY", "WRITER_RECOVERY_STOPPED"}
                | _MANAGED_DIAGNOSTIC_CODES)
 logger = logging.getLogger("conversation")
 

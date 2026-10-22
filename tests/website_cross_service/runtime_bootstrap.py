@@ -146,7 +146,8 @@ def fixture_app(config):
         item = config["widgets"].get(api_key)
         if item is None:
             return JSONResponse(status_code=404, content={"detail": "not_found"})
-        return dict(item, config={})
+        # These historical v2 scenarios have no common credential-session grant.
+        return dict(item, config={}, conversation_required=False, binding_generation=1)
 
     @app.post("/v1/chat/completions")
     async def legacy(request: Request):

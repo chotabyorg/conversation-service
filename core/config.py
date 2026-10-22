@@ -67,6 +67,21 @@ class WebsiteBinding(BaseModel):
     capability_generation: int | None = Field(default=None, ge=1, le=9223372036854775807)
 
 
+class WriterProducerGrant(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    owner_id: OwnerId
+    integration_id: UUID
+    agent_id: UUID
+    channel: Literal["TELEGRAM", "WEBSITE_WIDGET"]
+
+
+class WriterProducer(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    principal_id: WorkerRef = Field(max_length=48)
+    token: ServiceToken = Field(repr=False)
+    grants: tuple[WriterProducerGrant, ...] = Field(min_length=1, max_length=64)
+
+
 class ManagedBinding(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
     owner_id: OwnerId
@@ -352,6 +367,19 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("HANDOFF_LIFECYCLE_TOKEN", "handoff_ai_lifecycle_token"),
         repr=False,
     )
+    writer_attestation_required: bool = Field(default=False,
+        validation_alias=AliasChoices("WRITER_ATTESTATION_REQUIRED", "writer_attestation_required"))
+    writer_producers: Annotated[tuple[WriterProducer, ...], NoDecode] = Field(default=(),
+        max_length=32, repr=False,
+        validation_alias=AliasChoices("WRITER_PRODUCERS", "writer_producers"))
+
+    @field_validator("writer_producers", mode="before")
+    @classmethod
+    def parse_writer_producers(cls, value: object) -> object:
+        if isinstance(value, str):
+            return json.loads(value)
+        return value
+
     writer_retirement_token: ServiceToken | None = Field(
         default=None, repr=False,
         validation_alias=AliasChoices("WRITER_RETIREMENT_TOKEN", "writer_retirement_token"),
@@ -634,6 +662,14 @@ class Settings(BaseSettings):
             )
         ):
             raise ValueError("invalid Telegram handoff credentials")
+        producer_tokens = [p.token.get_secret_value() for p in self.writer_producers]
+        if (len(set(producer_tokens)) != len(producer_tokens)
+            or len({p.principal_id for p in self.writer_producers}) != len(self.writer_producers)
+            or set(producer_tokens).intersection(lifecycle_tokens | set(tokens))
+            or any(t in {b.service_token.get_secret_value() for b in self.managed_ai_bindings}
+                   for t in producer_tokens)
+            or (self.writer_attestation_required and not self.writer_producers)):
+            raise ValueError("invalid writer producer configuration")
         writer_ports = (self.writer_retirement_token, self.writer_supervisor_token,
                         self.writer_supervisor_base_url)
         if any(value is not None for value in writer_ports) and not all(

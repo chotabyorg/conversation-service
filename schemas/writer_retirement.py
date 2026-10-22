@@ -1,4 +1,5 @@
 """Writer evidence only: no authority transition or new send permission."""
+
 from typing import Literal
 from uuid import UUID
 
@@ -17,14 +18,18 @@ class WriterRetireCommand(TelegramBeginRequest):
     proof_ref: UUID
 
 
-class WebsiteWriterRetireCommand(WebsiteSessionScope, WebsiteDeliveryDescriptor):
+class WebsiteWriterIdentity(WebsiteSessionScope, WebsiteDeliveryDescriptor):
     """Supervisor evidence identifies a retained writer without visitor secrets."""
+
     contract_version: ContractVersion1
     channel: Literal["WEBSITE_WIDGET"]
     conversation_id: UUID
     session_id: UUID
     supplier_instance_id: UUID
     process_incarnation_id: UUID
+
+
+class WebsiteWriterRetireCommand(WebsiteWriterIdentity):
     command_id: UUID
     expected_delivery_revision: Revision
     proof_ref: UUID

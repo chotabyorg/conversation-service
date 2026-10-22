@@ -13,17 +13,50 @@ def authenticate(headers: list[tuple[bytes, bytes]], settings: Settings) -> Prin
     tokens = [value for key, value in headers if key.lower() == b"x-service-token"]
     inbox_tokens = [value for key, value in headers if key.lower() == b"x-inbox-lifecycle-token"]
     retirement_tokens = [v for k, v in headers if k.lower() == b"x-writer-retirement-token"]
-    if len(tokens) + len(inbox_tokens) + len(retirement_tokens) != 1:
+    producer_tokens = [v for k, v in headers if k.lower() == b"x-writer-producer-token"]
+    proof_tokens = [v for k, v in headers if k.lower() == b"x-writer-supervisor-token"]
+    if (
+        len(tokens)
+        + len(inbox_tokens)
+        + len(retirement_tokens)
+        + len(producer_tokens)
+        + len(proof_tokens)
+    ) != 1:
+        return None
+    if producer_tokens or proof_tokens:
+        raw = (producer_tokens or proof_tokens)[0]
+        if re.fullmatch(rb"[A-Za-z0-9._~-]{32,256}", raw) is None:
+            return None
+        if proof_tokens:
+            expected_proof = settings.writer_supervisor_token
+            if expected_proof is not None and hmac.compare_digest(
+                raw, expected_proof.get_secret_value().encode("ascii")
+            ):
+                return Principal(
+                    principal_id="writer-proof-reader", role="INBOX_LIFECYCLE", grants=()
+                )
+        else:
+            for producer in settings.writer_producers:
+                if hmac.compare_digest(raw, producer.token.get_secret_value().encode("ascii")):
+                    return Principal(
+                        principal_id="writer-producer:" + producer.principal_id,
+                        role="INBOX_LIFECYCLE",
+                        grants=(),
+                    )
         return None
     if retirement_tokens:
         raw_retirement = retirement_tokens[0]
         expected_retirement = settings.writer_retirement_token
-        if (expected_retirement is not None
+        if (
+            expected_retirement is not None
             and re.fullmatch(rb"[A-Za-z0-9._~-]{32,256}", raw_retirement) is not None
             and hmac.compare_digest(
-                raw_retirement, expected_retirement.get_secret_value().encode("ascii"))):
-            return Principal(principal_id="delivery-writer-supervisor",
-                             role="INBOX_LIFECYCLE", grants=())
+                raw_retirement, expected_retirement.get_secret_value().encode("ascii")
+            )
+        ):
+            return Principal(
+                principal_id="delivery-writer-supervisor", role="INBOX_LIFECYCLE", grants=()
+            )
         return None
     is_cp_lifecycle = bool(inbox_tokens)
     raw = inbox_tokens[0] if is_cp_lifecycle else tokens[0]

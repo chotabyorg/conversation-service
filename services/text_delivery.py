@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Literal, TypeAlias
+from typing import Any, Literal, TypeAlias
 from uuid import UUID, uuid4
 
 from sqlalchemy import and_, or_, select
@@ -109,10 +109,24 @@ async def begin_writer(
     session: AsyncSession, intent: DeliveryAttempt, conversation: Conversation, source: Source,
     *, recover_only: bool, current: bool, supplier_instance_id: UUID,
     process_incarnation_id: UUID, superseded_key: UUID, dispatch_key: UUID,
+    attestation_required: bool = False,
+    registration_descriptor: dict[str, Any] | None = None,
 ) -> WriterAcquisition:
     """Acquire exactly one writer while the caller holds scope/root/intent locks."""
     if recover_only or intent.writer_state != "NONE" or intent.status != "GENERATED":
         return WriterAcquisition(send=False, replayed=True)
+    from models import WriterRegistration, WriterWitness
+
+    registration = await session.scalar(select(WriterRegistration).filter_by(
+        intent_id=intent.id, supplier_instance_id=supplier_instance_id,
+        process_incarnation_id=process_incarnation_id))
+    if registration is None and attestation_required:
+        return WriterAcquisition(send=False, replayed=False)
+    if registration is not None and (
+        registration.descriptor != registration_descriptor
+        or await session.get(WriterWitness, registration.id) is not None
+    ):
+        return WriterAcquisition(send=False, replayed=False)
     if not current:
         expected, fenced = _settling_fence(source, conversation)
         _record_reconciliation(session, intent, conversation.id, "SUPERSEDED",
