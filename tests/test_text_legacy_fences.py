@@ -15,8 +15,9 @@ from services.settling import select_settled_turn
 from services.website_worker import select_immediate
 from tests.conftest import error, observed_waiters
 from tests.test_website import admit, identity, payload, v2_response_attempt_id
+from tests.test_website import wh as website_fixture
 
-pytest_plugins = ["tests.test_website"]
+wh = website_fixture
 
 
 async def enrolled(wh, *, retained="generation"):
