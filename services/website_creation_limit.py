@@ -35,6 +35,12 @@ async def reserve(session: AsyncSession, request: WebsiteSessionCreate) -> datet
         WebsiteSessionCapability.expires_at > clock))
     if count is not None and count >= MAX_UNEXPIRED:
         raise DomainError(ErrorCode.RATE_LIMITED, retry_after=60)
+    # Prune before loading/updating bucket objects. A bulk DELETE after pending
+    # ORM updates could remove their old database versions before the flush.
+    await session.execute(delete(WebsiteCreationBucket).where(
+        WebsiteCreationBucket.owner_id == request.owner_id,
+        WebsiteCreationBucket.integration_id == request.integration_id,
+        WebsiteCreationBucket.theoretical_at < clock - timedelta(minutes=2)))
     ip: IPv4Address | IPv6Address = request.client_ip
     if isinstance(ip, IPv6Address) and ip.ipv4_mapped is not None:
         ip = ip.ipv4_mapped
@@ -55,8 +61,4 @@ async def reserve(session: AsyncSession, request: WebsiteSessionCreate) -> datet
     # Failed admission rolls back all new buckets and creates no root/credential.
     for row, next_at in updates:
         row.theoretical_at = next_at
-    await session.execute(delete(WebsiteCreationBucket).where(
-        WebsiteCreationBucket.owner_id == request.owner_id,
-        WebsiteCreationBucket.integration_id == request.integration_id,
-        WebsiteCreationBucket.theoretical_at < clock - timedelta(minutes=2)))
     return clock
