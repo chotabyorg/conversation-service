@@ -19,8 +19,9 @@ from services import inbox_lifecycle, website_grant, website_session
 from tests.conftest import app_client, error, observed_waiters
 from tests.test_managed_migration import migrate
 from tests.test_website_session import access, issued, scope
+from tests.test_website_session import sh as website_session_fixture
 
-pytest_plugins = ["tests.test_website_session"]
+sh = website_session_fixture
 
 
 @pytest_asyncio.fixture
