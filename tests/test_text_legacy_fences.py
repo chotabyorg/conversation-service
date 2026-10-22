@@ -11,6 +11,7 @@ from core.errors import DomainError
 from models import Conversation, InboxGrantScope
 from schemas.contracts import Channel, ControlTransition, DeliveryCreate, ErrorCode, TurnCreate
 from services import authority, delivery, inbox_lifecycle, turns, website_session
+from services.handoff_scope import lock_legacy_scopes
 from services.settling import select_settled_turn
 from services.website_worker import select_immediate
 from tests.conftest import error, observed_waiters
@@ -38,6 +39,28 @@ async def enrolled(wh, *, retained="generation"):
 async def root(wh):
     async with wh.database.session_factory() as session:
         return await session.scalar(select(Conversation))
+
+
+async def test_legacy_website_scope_reads_share_lock_but_order_revoke(wh, sql):
+    await enrolled(wh)
+    values = dict(owner_id=wh.grants["a"]["owner_id"],
+        integration_id=UUID(wh.grants["a"]["integration_id"]), channel="WEBSITE_WIDGET")
+    async def writer():
+        async with wh.database.session_factory() as session, session.begin():
+            await session.scalar(select(InboxGrantScope).with_for_update())
+
+    async with wh.database.session_factory() as first, first.begin():
+        assert await lock_legacy_scopes(first, **values)
+        pid = await first.scalar(text("SELECT pg_backend_pid()"))
+        async with wh.database.session_factory() as second, second.begin():
+            await second.execute(text("SET LOCAL lock_timeout = '500ms'"))
+            assert await lock_legacy_scopes(second, **values)
+        pending = asyncio.create_task(writer())
+        try:
+            await observed_waiters(sql, pid, 1, "legacy_shared_scope_orders_revoke")
+        finally:
+            await first.commit()
+            await pending
 
 
 async def test_unenrolled_legacy_website_does_not_create_common_lifecycle_rows(wh, sql):
