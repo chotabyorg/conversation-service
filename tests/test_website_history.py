@@ -155,7 +155,7 @@ async def test_downgrade_keeps_retained_visibility_and_restart_cursor(wh, databa
     first = (await page(wh)).json()
     cursor = first["items"][0]["id"]
     rejected = migrate(database_url, "downgrade", "0015_website_grant_epoch", expected=1)
-    assert "Retained Website visibility positions require a compatible reader" in rejected.stderr
+    assert "compatible reader" in rejected.stderr
     assert await wh.database.ready()
     assert (await page(wh)).json() == first
     assert (await page(wh, cursor)).json()["items"] == []

@@ -175,7 +175,7 @@ async def test_common_revoke_fences_website_agent_root_without_handoff_case(wh, 
         wh.client._transport.app.state.settings = settings
         created = await wh.call("POST", "/website/sessions", dict(owner_id=binding.owner_id,
             integration_id=str(binding.integration_id), agent_id=wh.agent_id,
-            binding_generation=7))
+            binding_generation=7, client_ip="192.0.2.1"))
         assert created.status_code == 201
     original = await root(wh)
     await enrolled(wh)
@@ -203,7 +203,8 @@ async def test_uuid_only_admission_cannot_attach_to_credentialed_root(wh, route,
                                              "website_bindings": (binding,)})
     wh.client._transport.app.state.settings = settings
     created = await wh.call("POST", "/website/sessions", dict(owner_id=binding.owner_id,
-        integration_id=str(binding.integration_id), agent_id=wh.agent_id, binding_generation=7))
+        integration_id=str(binding.integration_id), agent_id=wh.agent_id,
+        binding_generation=7, client_ip="192.0.2.1"))
     assert created.status_code == 201
     response = await wh.call("POST", "/website/admissions", payload(wh,
         session_id=created.json()["session_id"], desired_route=route))

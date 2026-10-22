@@ -9,6 +9,7 @@ from sqlalchemy import (
     CheckConstraint,
     DateTime,
     ForeignKeyConstraint,
+    Index,
     String,
     UniqueConstraint,
 )
@@ -36,6 +37,7 @@ class WebsiteSessionCapability(Base):
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     __table_args__ = (
+        Index("ix_website_session_unexpired", "owner_id", "integration_id", "expires_at"),
         UniqueConstraint("token_digest", name="uq_website_session_digest"),
         ForeignKeyConstraint(
             ["conversation_id", "owner_id", "integration_id", "channel", "provider_thread_id"],

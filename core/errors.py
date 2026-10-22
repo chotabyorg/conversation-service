@@ -3,6 +3,7 @@
 from schemas.contracts import ErrorCode
 
 _SPECIAL: dict[ErrorCode, tuple[int, str]] = {
+    ErrorCode.RATE_LIMITED: (429, "Request admission limit reached."),
     ErrorCode.UNAUTHENTICATED: (401, "Service authentication required."),
     ErrorCode.FORBIDDEN: (403, "Inbox access is not permitted."),
     ErrorCode.NOT_FOUND: (404, "Resource not found."),
@@ -42,8 +43,9 @@ _CONFLICT_MESSAGES = {
 
 
 class DomainError(Exception):
-    def __init__(self, code: ErrorCode) -> None:
+    def __init__(self, code: ErrorCode, *, retry_after: int | None = None) -> None:
         self.code = ErrorCode(code)
+        self.retry_after = retry_after
         self.status_code, self.message = _SPECIAL.get(
             self.code, (409, _CONFLICT_MESSAGES.get(self.code, "State conflict."))
         )
