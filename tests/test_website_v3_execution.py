@@ -13,7 +13,7 @@ from schemas.managed_v3 import (
     ManagedTurnV3Request,
     ManagedTurnV3Result,
 )
-from services import turns
+from services import inbox_lifecycle, turns
 from services.common import db_clock
 from services.managed_client import handoff_request_id, prepare_v3_request
 from services.managed_execution_v3 import execute_claimed_turn_v3
@@ -57,8 +57,10 @@ class WebsiteV3Port(SealedUnknownPort):
 async def selected(wh):
     await admit(wh, payload(wh))
     async with wh.database.session_factory() as session, session.begin():
-        scope = await session.scalar(select(InboxGrantScope).where(
-            InboxGrantScope.agent_id == UUID(wh.agent_id)).with_for_update())
+        binding = wh.settings.managed_ai_bindings[0]
+        scope = await inbox_lifecycle._lock_scope(session, dict(owner_id=binding.owner_id,
+            integration_id=binding.integration_id, channel=binding.channel.value,
+            agent_id=UUID(wh.agent_id)))
         scope.active, scope.grant_generation = True, 1
         scope.cp_binding_generation = scope.agent_lifecycle_generation = 1
         scope.account_id = scope.agent_owner_id = uuid4()
