@@ -15,6 +15,7 @@ from db.database import Database
 from models import (
     AgentTurn,
     Conversation,
+    InboxGrantScope,
     Message,
     TurnInputMessage,
     WebsiteAdmission,
@@ -30,7 +31,7 @@ from schemas.contracts import (
     TurnFailureCode,
     TurnRenew,
 )
-from services import managed_execution, turns
+from services import managed_execution, turns, website_grant
 from services.common import (
     authorized_conversation,
     db_clock,
@@ -39,6 +40,7 @@ from services.common import (
     message_is_consumed,
     scope_filter,
 )
+from services.handoff_scope import lock_legacy_scopes
 from services.history_projection import freeze_website_projection
 from services.managed_client import ManagedAIPort
 from services.settling import select_settled_turn
@@ -92,6 +94,10 @@ async def select_immediate(database: Database, principal: Principal,
         for conversation_id in ids:
             try:
                 async with database.session_factory() as session, session.begin():
+                    probe = await authorized_conversation(session, principal, conversation_id)
+                    await lock_legacy_scopes(session, owner_id=probe.owner_id,
+                        integration_id=probe.integration_id, channel=probe.channel,
+                        settings=settings)
                     conversation = await authorized_conversation(
                         session, principal, conversation_id, lock=True
                     )
@@ -111,7 +117,19 @@ async def select_immediate(database: Database, principal: Principal,
                         if is_website is None:
                             continue
                         if active.managed_dispatch_epoch is None:
-                            if handoff_enrolled or conversation.control_mode != "AGENT":
+                            if (active.retired_at is not None
+                                    or conversation.control_mode != "AGENT"):
+                                continue
+                            if active.managed_contract_version == 3:
+                                grant = await session.scalar(select(InboxGrantScope).filter_by(
+                                    owner_id=conversation.owner_id,
+                                    integration_id=conversation.integration_id,
+                                    channel=conversation.channel,
+                                    agent_id=active.managed_projection_agent_id))
+                                if (grant is None or not await website_grant.can_start_turn(
+                                        session, grant, conversation, settings)):
+                                    continue
+                            elif handoff_enrolled:
                                 continue
                             admission = await session.scalar(
                                 select(WebsiteAdmission).join(
@@ -134,7 +152,7 @@ async def select_immediate(database: Database, principal: Principal,
                                     or admission.owner_id != conversation.owner_id
                                     or admission.integration_id != conversation.integration_id
                                     or binding is None
-                                    or (active.managed_contract_version == 2
+                                    or (active.managed_contract_version in {2, 3}
                                         and active.managed_projection_agent_id
                                         != admission.agent_id)):
                                 continue

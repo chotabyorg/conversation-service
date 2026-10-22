@@ -12,9 +12,9 @@ evidence and Handoff case. It preserves UNKNOWN references and same-body recover
 a revoked grant may resolve the original dispatch but cannot create fresh HUMAN
 authority. No second Business runtime, operation ledger or Handoff manager exists.
 
-This slice does not enable Website enrollment or select a Website v3 Turn in
-production. The private PG tests seed the common enrollment and selected Turn to
-exercise the real claim/executor/case transactions. Credential-bearing ingress,
-common selection, bounded idle transport and trusted writer termination are still
-required before the cohort can open. All external model ports in these tests are
-local fakes.
+Website enrollment remains disabled in production. The private PG tests seed an
+acknowledged common enrollment, issue a real visitor credential, admit canonical
+input and select the v3 Turn through the common settling coordinator before the
+real claim/executor/case transactions. See [Website selection](website-common-selection.md).
+Bounded idle transport and trusted writer termination are still required before
+the cohort can open. All external model ports in these tests are local fakes.

@@ -9,11 +9,18 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.config import Settings
 from core.errors import DomainError
-from models import InboxGrantLifecycleReceipt, InboxGrantScope
+from models import (
+    Conversation,
+    DeliveryAttempt,
+    InboxGrantLifecycleReceipt,
+    InboxGrantScope,
+    WebsiteSessionCapability,
+)
 from schemas.contracts import ErrorCode
 from schemas.handoff import InboxGrantProvision, InboxGrantProvisioned
 from schemas.website_session import WebsiteSessionScope
 from services import inbox_lifecycle
+from services.common import db_clock
 
 
 @dataclass(frozen=True)
@@ -52,15 +59,14 @@ async def lock_scope(
     return scope
 
 
-async def current_epoch(
+async def retained_epoch(
     session: AsyncSession,
     scope: InboxGrantScope,
     request: WebsiteSessionScope,
-    settings: Settings,
     *,
     expected: WebsiteGrantEpoch | None = None,
 ) -> WebsiteGrantEpoch:
-    """Caller retains the shared scope lock through root locking and protected use."""
+    """Validate retained local evidence while the caller holds its scope lock."""
     if not session.in_transaction():
         raise RuntimeError("Website grant access requires the caller transaction")
     if (
@@ -142,6 +148,27 @@ async def current_epoch(
         or receipt.request_fingerprint != inbox_lifecycle._wire_fingerprint(proof_request)
     ):
         raise DomainError(ErrorCode.NOT_FOUND)
+    return WebsiteGrantEpoch(
+        scope.grant_generation, scope.agent_lifecycle_generation, receipt.command_id
+    )
+
+
+async def current_epoch(
+    session: AsyncSession,
+    scope: InboxGrantScope,
+    request: WebsiteSessionScope,
+    settings: Settings,
+    *,
+    expected: WebsiteGrantEpoch | None = None,
+) -> WebsiteGrantEpoch:
+    """Authorize content with fresh suppliers before taking its canonical root."""
+    epoch = await retained_epoch(session, scope, request, expected=expected)
+    proof_request = InboxGrantProvision(
+        contract_version=1, command_id=epoch.provision_command_id,
+        owner_id=request.owner_id, integration_id=request.integration_id,
+        channel="WEBSITE_WIDGET", agent_id=request.agent_id,
+        expected_binding_generation=request.binding_generation,
+    )
     try:
         cp, ai = await inbox_lifecycle._current_proofs(settings, proof_request)
     except DomainError as error:
@@ -155,6 +182,53 @@ async def current_epoch(
         or ai.agent_lifecycle_generation != scope.agent_lifecycle_generation
     ):
         raise DomainError(ErrorCode.NOT_FOUND)
-    return WebsiteGrantEpoch(
-        scope.grant_generation, scope.agent_lifecycle_generation, receipt.command_id
-    )
+    return epoch
+
+
+async def can_start_turn(
+    session: AsyncSession, scope: InboxGrantScope, root: Conversation,
+    settings: Settings,
+) -> bool:
+    """Recheck accepted visitor work under scope then root locks, without HTTP.
+
+    Ingress already required live supplier proofs. Scheduling uses their retained
+    grant epoch; revocation shares these locks. This never authorizes content reads
+    or new enrollment and never substitutes a lease for writer termination.
+    """
+    if not settings.website_session_capabilities_enabled or root.control_mode != "AGENT":
+        return False
+    if not any(binding.owner_id == root.owner_id
+            and binding.integration_id == root.integration_id
+            and binding.channel.value == "WEBSITE_WIDGET"
+            and binding.agent_id == scope.agent_id for binding in settings.managed_ai_bindings):
+        return False
+    capability = await session.get(WebsiteSessionCapability, root.id, populate_existing=True)
+    if (capability is None or capability.revoked_at is not None
+            or capability.expires_at <= await db_clock(session)
+            or capability.grant_generation is None
+            or capability.agent_lifecycle_generation is None
+            or capability.provision_command_id is None
+            or capability.owner_id != root.owner_id
+            or capability.integration_id != root.integration_id
+            or capability.channel != root.channel
+            or capability.provider_thread_id != root.provider_thread_id
+            or capability.agent_id != scope.agent_id
+            or not any(binding.owner_id == root.owner_id
+                and binding.integration_id == root.integration_id
+                and binding.agent_id == capability.agent_id
+                and binding.capability_generation == capability.binding_generation
+                for binding in settings.website_bindings)):
+        return False
+    request = WebsiteSessionScope(owner_id=root.owner_id, integration_id=root.integration_id,
+        agent_id=capability.agent_id, binding_generation=capability.binding_generation)
+    try:
+        await retained_epoch(session, scope, request, expected=WebsiteGrantEpoch(
+            capability.grant_generation, capability.agent_lifecycle_generation,
+            capability.provision_command_id))
+    except DomainError as error:
+        if error.code == ErrorCode.NOT_FOUND:
+            return False
+        raise
+    return await session.scalar(select(DeliveryAttempt.id).where(
+        DeliveryAttempt.conversation_id == root.id,
+        DeliveryAttempt.writer_state == "LIVE").limit(1)) is None

@@ -45,7 +45,7 @@ from schemas.managed_v3 import (
     V3Message,
     V3OperationReference,
 )
-from services import catch_up, turns
+from services import catch_up, turns, website_grant
 from services.common import authorized_conversation, db_clock, fingerprint, scope_filter
 from services.handoff_scope import lock_scope
 from services.history_projection import canonical_window
@@ -375,6 +375,10 @@ async def _prepare_dispatch(
         if binding is None or settings.managed_ai_base_url is None:
             raise DomainError(ErrorCode.SERVICE_UNAVAILABLE)
         if turn.managed_v3_snapshot is None:
+            if (conversation.channel == "WEBSITE_WIDGET"
+                    and not await website_grant.can_start_turn(
+                        session, scope, conversation, settings)):
+                raise DomainError(ErrorCode.GRANT_CONFLICT)
             if not await catch_up.validate(session, conversation, turn, binding.agent_id):
                 raise DomainError(ErrorCode.VALIDATION_ERROR)
             if (
