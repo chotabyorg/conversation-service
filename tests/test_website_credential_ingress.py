@@ -99,7 +99,7 @@ async def test_input_waiter_observes_revoke_before_canonical_append(sh, supplier
 async def test_human_input_is_canonical_and_post_return_burst_has_new_authority(sh, suppliers):
     await enroll(sh, suppliers)
     created = await issued(sh)
-    settings = sh.settings.model_copy(update={"settling_policies": (SettlingPolicy(
+    settings = sh.settings.model_copy(update={"turn_settling_policies": (SettlingPolicy(
         integration_id=UUID(str(scope(sh)["integration_id"])), channel="WEBSITE_WIDGET",
         version="credential-ingress-v1", quiet_window_ms=1000, max_wait_ms=2000),)})
     sh.client._transport.app.state.settings = settings
