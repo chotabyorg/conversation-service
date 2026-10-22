@@ -77,7 +77,7 @@ async def test_website_agent_writer_is_one_shot_and_canonical_output_is_unique(w
                                     .where(Message.actor == "AGENT")) == 1
 
 
-async def human_intents(wh, suppliers):
+async def human_intents(wh, suppliers, texts=("owner reply", "owner reply")):
     await run(wh, "HANDOFF")
     async with wh.database.session_factory() as session:
         case = await session.scalar(select(HandoffCase))
@@ -87,11 +87,11 @@ async def human_intents(wh, suppliers):
         command_id=uuid4(), expected_case_revision=case.case_revision,
         expected_authority_revision=case.authority_revision))
     current, intents = claimed.case, []
-    for _ in range(2):
+    for text in texts:
         sent = await inbox.send_human(wh.database, principal, case.id, SendHumanCommand(
             command_id=uuid4(), expected_case_revision=current.case_revision,
             expected_authority_revision=current.authority_revision,
-            expected_assignment_revision=current.assignment_revision, text="owner reply"))
+            expected_assignment_revision=current.assignment_revision, text=text))
         current = sent.case
         intents.append(sent.receipt.outbound_intent_id)
     return principal, current, intents

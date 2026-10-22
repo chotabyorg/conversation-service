@@ -87,10 +87,11 @@ async def _grant(session: AsyncSession, root: Conversation, agent_id: UUID) -> I
 
 
 async def _supersede(session: AsyncSession, intent: DeliveryAttempt,
-                     root: Conversation, source: Source) -> None:
+                     root: Conversation, source: Source, *, error_code: str | None = None) -> None:
     expected, fenced = _settling_fence(source, root)
     _record_reconciliation(session, intent, root.id, "SUPERSEDED",
-        key=_key(intent.id, "SUPERSEDED"), expected_revision=intent.revision,
+        key=_key(intent.id, "SUPERSEDED", error_code or ""), error_code=error_code,
+        expected_revision=intent.revision,
         expected_settling_revision=expected, result_settling_revision=fenced,
         clock=await db_clock(session))
 
@@ -139,6 +140,7 @@ async def work(database: Database, principal: Principal, request: WebsiteSession
             result = WebsiteDeliveryWorkResult(state="SEND_CANDIDATE", item=descriptor,
                                                 frame=_frame(intent, source))
             if not _fits(result):
+                await _supersede(session, intent, root, source, error_code="FRAME_TOO_LARGE")
                 return WebsiteDeliveryWorkResult(state="FRAME_TOO_LARGE", item=descriptor,
                     recovery=_recovery(intent))
             return result
@@ -180,6 +182,7 @@ async def begin(database: Database, principal: Principal, request: WebsiteDelive
                     "status": "WRITE_IN_PROGRESS", "writer_state": "LIVE"}),
                 frame=_frame(intent, source))
             if not _fits(candidate):
+                await _supersede(session, intent, root, source, error_code="FRAME_TOO_LARGE")
                 return WebsiteDeliveryBegun(state="FRAME_TOO_LARGE", item=descriptor,
                     send=False, replayed=False, recovery=_recovery(intent))
             current = (_valid_authority(intent, source, root, grant)
