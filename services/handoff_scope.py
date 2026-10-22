@@ -22,7 +22,7 @@ async def lock_legacy_scopes(
         raise RuntimeError("Text Handoff fencing requires the caller transaction")
     if channel not in {"TELEGRAM", "WEBSITE_WIDGET"}:
         return False
-    from services import inbox_lifecycle, telegram
+    from services import telegram
 
     agent_ids = set(await session.scalars(select(InboxGrantScope.agent_id).where(
         InboxGrantScope.owner_id == owner_id,
@@ -38,12 +38,18 @@ async def lock_legacy_scopes(
                 if binding.owner_id == owner_id and binding.integration_id == integration_id)
     scopes = []
     for agent_id in sorted(agent_ids, key=str):
+        row: InboxGrantScope | None
         if channel == "TELEGRAM":
             # Preserve the existing supplier hook and lock contract.
             row = await telegram._locked_handoff_scope_values(
                 session, owner_id, integration_id, agent_id)
         else:
-            row = await inbox_lifecycle._lock_scope(session, dict(owner_id=owner_id,
-                integration_id=integration_id, channel=channel, agent_id=agent_id))
-        scopes.append(row)
+            # Legacy Website must not allocate a new common lifecycle row.
+            # Enrollment locks the root before committing; the caller's root
+            # recheck orders a concurrent first enrollment when no row exists.
+            row = await session.scalar(select(InboxGrantScope).filter_by(owner_id=owner_id,
+                integration_id=integration_id, channel=channel, agent_id=agent_id)
+                .with_for_update().execution_options(populate_existing=True))
+        if row is not None:
+            scopes.append(row)
     return any(telegram._ever_enrolled(row) for row in scopes)
