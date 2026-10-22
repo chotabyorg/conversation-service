@@ -13,7 +13,7 @@ from sqlalchemy.exc import IntegrityError
 from core.config import Settings
 from core.errors import DomainError
 from db.database import Database
-from models import AgentTurn, Conversation, InboxGrantScope, Message, TurnInputMessage
+from models import AgentTurn, Conversation, Message, TurnInputMessage
 from schemas.contracts import (
     ErrorCode,
     Principal,
@@ -30,12 +30,13 @@ from services.common import (
     authorized_conversation,
     db_clock,
     fingerprint,
+    handoff_was_ever_enrolled,
     locked_turn,
     message_is_consumed,
     scope_filter,
-    telegram_handoff_was_ever_enrolled,
     unique_violation,
 )
+from services.handoff_scope import lock_legacy_scopes
 
 
 async def create_turn(
@@ -70,36 +71,8 @@ async def create_turn(
                     raise DomainError(ErrorCode.TURN_SELECTION_CONFLICT)
                 result = TurnResult(turn=TurnRead.model_validate(turn), replayed=True)
             else:
-                handoff_enrolled = False
-                if probe.channel == "TELEGRAM":
-                    from services.telegram import _ever_enrolled, _locked_handoff_scope_values
-
-                    agent_ids = set(
-                        (
-                            await session.scalars(
-                                select(InboxGrantScope.agent_id).where(
-                                    InboxGrantScope.owner_id == probe.owner_id,
-                                    InboxGrantScope.integration_id == probe.integration_id,
-                                    InboxGrantScope.channel == "TELEGRAM",
-                                )
-                            )
-                        ).all()
-                    )
-                    if settings is not None:
-                        agent_ids.update(
-                            binding.agent_id
-                            for binding in settings.managed_ai_bindings
-                            if binding.channel.value == "TELEGRAM"
-                            and binding.owner_id == probe.owner_id
-                            and binding.integration_id == probe.integration_id
-                        )
-                    handoff_scopes = [
-                        await _locked_handoff_scope_values(
-                            session, probe.owner_id, probe.integration_id, agent_id
-                        )
-                        for agent_id in sorted(agent_ids, key=str)
-                    ]
-                    handoff_enrolled = any(_ever_enrolled(scope) for scope in handoff_scopes)
+                handoff_enrolled = await lock_legacy_scopes(session, owner_id=probe.owner_id,
+                    integration_id=probe.integration_id, channel=probe.channel, settings=settings)
                 conversation = await authorized_conversation(
                     session, principal, conversation_id, lock=True
                 )
@@ -116,7 +89,7 @@ async def create_turn(
                         raise DomainError(ErrorCode.TURN_SELECTION_CONFLICT)
                     result = TurnResult(turn=TurnRead.model_validate(turn), replayed=True)
                     return result
-                if handoff_enrolled or await telegram_handoff_was_ever_enrolled(
+                if handoff_enrolled or await handoff_was_ever_enrolled(
                     session, conversation
                 ):
                     raise DomainError(ErrorCode.HANDOFF_CONFLICT)

@@ -8,7 +8,7 @@ from sqlalchemy.exc import IntegrityError
 from core.config import Settings
 from core.errors import DomainError
 from db.database import Database
-from models import AgentTurn, Conversation, DeliveryAttempt, DeliveryReconciliation, InboxGrantScope
+from models import AgentTurn, Conversation, DeliveryAttempt, DeliveryReconciliation
 from schemas.contracts import (
     DeliveryAttemptRead,
     DeliveryCreate,
@@ -22,11 +22,12 @@ from services.common import (
     authorized_conversation,
     db_clock,
     fingerprint,
+    handoff_was_ever_enrolled,
     locked_delivery,
     scope_filter,
-    telegram_handoff_was_ever_enrolled,
     unique_violation,
 )
+from services.handoff_scope import lock_legacy_scopes
 
 TRANSITIONS: dict[str, frozenset[str]] = {
     "GENERATED": frozenset({"DISPATCH_REQUESTED", "SUPERSEDED"}),
@@ -110,38 +111,12 @@ async def create_delivery(
                 )
                 if source_probe is None:
                     raise DomainError(ErrorCode.NOT_FOUND)
-                if probe.channel == "TELEGRAM":
-                    from services.telegram import _ever_enrolled, _locked_handoff_scope_values
-
-                    agent_ids = set(
-                        (
-                            await session.scalars(
-                                select(InboxGrantScope.agent_id).where(
-                                    InboxGrantScope.owner_id == probe.owner_id,
-                                    InboxGrantScope.integration_id == probe.integration_id,
-                                    InboxGrantScope.channel == "TELEGRAM",
-                                )
-                            )
-                        ).all()
-                    )
-                    if source_probe.managed_projection_agent_id is not None:
-                        agent_ids.add(source_probe.managed_projection_agent_id)
-                    if settings is not None:
-                        agent_ids.update(
-                            binding.agent_id
-                            for binding in settings.managed_ai_bindings
-                            if binding.channel.value == "TELEGRAM"
-                            and binding.owner_id == probe.owner_id
-                            and binding.integration_id == probe.integration_id
-                        )
-                    handoff_scopes = [
-                        await _locked_handoff_scope_values(
-                            session, probe.owner_id, probe.integration_id, agent_id
-                        )
-                        for agent_id in sorted(agent_ids, key=str)
-                    ]
-                    if any(_ever_enrolled(scope) for scope in handoff_scopes):
-                        raise DomainError(ErrorCode.HANDOFF_CONFLICT)
+                if await lock_legacy_scopes(session, owner_id=probe.owner_id,
+                        integration_id=probe.integration_id, channel=probe.channel,
+                        settings=settings, extra_agent_ids=(
+                            (source_probe.managed_projection_agent_id,)
+                            if source_probe.managed_projection_agent_id is not None else ())):
+                    raise DomainError(ErrorCode.HANDOFF_CONFLICT)
 
                 conversation = await authorized_conversation(
                     session, principal, conversation_id, lock=True
@@ -159,7 +134,7 @@ async def create_delivery(
                         attempt=DeliveryAttemptRead.model_validate(existing), replayed=True
                     )
                     return result
-                if await telegram_handoff_was_ever_enrolled(session, conversation):
+                if await handoff_was_ever_enrolled(session, conversation):
                     raise DomainError(ErrorCode.HANDOFF_CONFLICT)
                 source = await session.scalar(
                     select(AgentTurn)

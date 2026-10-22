@@ -20,6 +20,7 @@ from models import (
     WebsiteAdmission,
     WebsiteImmediateTurn,
     WebsiteResponseAttempt,
+    WebsiteSessionCapability,
 )
 from schemas.contracts import (
     Channel,
@@ -44,7 +45,13 @@ from schemas.website import (
     WebsiteAdmission as AdmissionRequest,
 )
 from services import catch_up
-from services.common import authorized_conversation, db_clock, fingerprint
+from services.common import (
+    authorized_conversation,
+    db_clock,
+    fingerprint,
+    handoff_was_ever_enrolled,
+)
+from services.handoff_scope import lock_legacy_scopes
 from services.settling import freeze_admission_membership
 
 
@@ -85,6 +92,26 @@ async def retained(session: AsyncSession, request: WebsiteIdentity) -> WebsiteAd
     return admission
 
 
+async def _reject_credentialed_root(session: AsyncSession, request: WebsiteIdentity) -> None:
+    """A UUID-only legacy caller cannot attach to or read a visitor credential root."""
+    credential = await session.scalar(select(WebsiteSessionCapability.conversation_id).where(
+        WebsiteSessionCapability.owner_id == request.owner_id,
+        WebsiteSessionCapability.integration_id == request.integration_id,
+        WebsiteSessionCapability.channel == "WEBSITE_WIDGET",
+        WebsiteSessionCapability.provider_thread_id == str(request.session_id),
+    ))
+    if credential is not None:
+        raise DomainError(ErrorCode.NOT_FOUND)
+
+
+async def _lock_legacy_scope(
+    session: AsyncSession, request: WebsiteIdentity, settings: Settings,
+) -> bool:
+    return await lock_legacy_scopes(session, owner_id=request.owner_id,
+        integration_id=request.integration_id, channel="WEBSITE_WIDGET", settings=settings,
+        extra_agent_ids=(request.agent_id,))
+
+
 async def admit(database: Database, principal: Principal, request: AdmissionRequest,
                 settings: Settings) -> WebsiteAdmissionResult:
     authorize(principal, request, settings)
@@ -92,6 +119,7 @@ async def admit(database: Database, principal: Principal, request: AdmissionRequ
                           "provider_namespace": WEBSITE_NAMESPACE,
                           **request.model_dump(mode="json", exclude={"desired_route"})})
     async with database.session_factory() as session, session.begin():
+        handoff_enrolled = await _lock_legacy_scope(session, request, settings)
         # Serialize old/new routing policies before creating any candidate parents.
         # The scoped transaction advisory lock and retained unique constraint both
         # protect the decision; managed parents and decision share this transaction.
@@ -109,6 +137,9 @@ async def admit(database: Database, principal: Principal, request: AdmissionRequ
                                             admission_id=existing.id,
                                             replayed=True)
         else:
+            if handoff_enrolled:
+                raise DomainError(ErrorCode.HANDOFF_CONFLICT)
+            await _reject_credentialed_root(session, request)
             conversation_id = canonical_id = None
             if request.desired_route == "MANAGED":
                 await session.execute(insert(Conversation).values(
@@ -123,6 +154,9 @@ async def admit(database: Database, principal: Principal, request: AdmissionRequ
                 ).with_for_update().execution_options(populate_existing=True))
                 if conversation is None:
                     raise DomainError(ErrorCode.NOT_FOUND)
+                await _reject_credentialed_root(session, request)
+                if await handoff_was_ever_enrolled(session, conversation):
+                    raise DomainError(ErrorCode.HANDOFF_CONFLICT)
                 event_id, canonical_id = uuid4(), uuid4()
                 conversation.last_message_sequence += 1
                 conversation.input_revision += 1
@@ -190,7 +224,11 @@ async def result(database: Database, principal: Principal, request: WebsiteIdent
                  settings: Settings) -> WebsiteResult:
     authorize(principal, request, settings)
     async with database.session_factory() as session, session.begin():
+        await _lock_legacy_scope(session, request, settings)
         admission = await retained(session, request)
+        if admission.conversation_id is not None:
+            await authorized_conversation(session, principal, admission.conversation_id, lock=True)
+        await _reject_credentialed_root(session, request)
         turn = await admission_turn(session, admission)
         if turn is None or turn.status in {"PENDING", "CLAIMED"}:
             return WebsiteResult(state="PENDING")
@@ -206,11 +244,15 @@ async def begin_response(database: Database, principal: Principal, request: Webs
                          settings: Settings) -> WebsiteResponseBegun:
     authorize(principal, request, settings)
     async with database.session_factory() as session, session.begin():
+        handoff_enrolled = await _lock_legacy_scope(session, request, settings)
         admission = await retained(session, request)
         if admission.conversation_id is None:
             raise DomainError(ErrorCode.NOT_FOUND)
         conversation = await authorized_conversation(session, principal,
                                                       admission.conversation_id, lock=True)
+        await _reject_credentialed_root(session, request)
+        handoff_enrolled = handoff_enrolled or await handoff_was_ever_enrolled(
+            session, conversation)
         retained_turn = await admission_turn(session, admission)
         if retained_turn is None:
             raise DomainError(ErrorCode.NOT_FOUND)
@@ -310,7 +352,8 @@ async def begin_response(database: Database, principal: Principal, request: Webs
                 session, conversation, turn,
             )
         permission_current = (
-            authority_current and settling_revision_is_current() and not settling_stale
+            not handoff_enrolled and authority_current
+            and settling_revision_is_current() and not settling_stale
         )
 
         if (attempt is not None and attempt.send_authorized
