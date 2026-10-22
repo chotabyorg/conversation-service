@@ -23,18 +23,19 @@ pytest_plugins = ["tests.test_website_session"]
 
 
 @pytest_asyncio.fixture
-async def suppliers(sh, monkeypatch):
+async def suppliers(sh, monkeypatch, database_url):
     state = SimpleNamespace(
         account=uuid4(), cp=7, ai=11, calls=[], failure=None, channel="WEBSITE_WIDGET"
     )
-    for field, value in dict(
-        cp_handoff_base_url="https://cp.invalid",
-        ai_handoff_base_url="https://ai.invalid",
-        inbox_lifecycle_token=SecretStr("local-cp-fixture"),
-        handoff_ai_lifecycle_token=SecretStr("local-ai-fixture"),
-        website_session_ttl_seconds=86400,
-    ).items():
-        monkeypatch.setattr(sh.settings, field, value)
+    settings = sh.settings.model_copy(
+        update=dict(
+            cp_handoff_base_url="https://cp.invalid",
+            ai_handoff_base_url="https://ai.invalid",
+            inbox_lifecycle_token=SecretStr("local-cp-fixture"),
+            handoff_ai_lifecycle_token=SecretStr("local-ai-fixture"),
+            website_session_ttl_seconds=86400,
+        )
+    )
 
     async def proof(url, path, headers, request, response_model):
         state.calls.append(request)
@@ -54,7 +55,13 @@ async def suppliers(sh, monkeypatch):
         return response_model.model_validate(value)
 
     monkeypatch.setattr(inbox_lifecycle, "_post_proof", proof)
-    return state
+    previous = sh.client, sh.database, sh.settings
+    async with app_client(settings, database_url) as (client, database):
+        sh.client, sh.database, sh.settings = client, database, settings
+        try:
+            yield state
+        finally:
+            sh.client, sh.database, sh.settings = previous
 
 
 async def enroll(sh, suppliers, *, generation=1):
