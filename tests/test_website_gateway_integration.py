@@ -19,6 +19,7 @@ from sqlalchemy import select
 
 from models import DeliveryAttempt
 from schemas.handoff import HumanPrincipal
+from services.human_auth import INBOX_ORIGIN
 from services.website_worker import WebsiteWorker
 from tests.test_website_inbox_provision import sh as session_fixture
 from tests.test_website_inbox_provision import suppliers as supplier_fixture
@@ -133,7 +134,8 @@ async def composed(wh, suppliers, monkeypatch, tmp_path, network_allowlist):
                     base_url=f"http://127.0.0.1:{gateway_port}", trust_env=False, timeout=5
                 ) as public,
                 httpx.AsyncClient(
-                    base_url=config["conversation_url"], verify=tls, trust_env=False, timeout=5
+                    base_url=config["conversation_url"], verify=tls, trust_env=False, timeout=5,
+                    headers={"Origin": INBOX_ORIGIN},
                 ) as owner_api,
             ):
                 for _ in range(100):
