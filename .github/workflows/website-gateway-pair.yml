@@ -106,6 +106,8 @@ jobs:
                        ai_user_cp='SYNTHETIC', public_ingress='SYNTHETIC_TRUSTED_LOOPBACK_PROXY')
           (root / 'website-gateway-pair-summary.json').write_text(json.dumps(value, indent=2))
           print(json.dumps(value))
+          if value['status'] != 'PASS':
+              raise SystemExit('website-gateway pair summary failed')
           PY
       - name: Upload sanitized pair evidence
         if: always()
