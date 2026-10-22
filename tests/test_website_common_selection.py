@@ -1,6 +1,7 @@
 """Credential input uses the common selector, restart recovery and writer barrier."""
+import asyncio
 from datetime import timedelta
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy import func, select
@@ -34,6 +35,17 @@ sh, suppliers, wh = session_fixture, supplier_fixture, common_website
 async def settled(wh, settings=None):
     return await select_settled_turn(wh.database, wh.principal, settings or wh.settings,
                                       (Channel.WEBSITE_WIDGET,))
+
+
+async def test_website_selector_shares_scope_with_credential_ingress(wh):
+    await append(wh)
+    await due(wh)
+    async with wh.database.session_factory() as session, session.begin():
+        assert await session.scalar(select(InboxGrantScope).with_for_update(read=True))
+        # This real second transaction must finish while the admission-style
+        # shared scope lock remains held. Lifecycle writers still need FOR UPDATE.
+        selected = await asyncio.wait_for(settled(wh), timeout=3)
+        assert isinstance(selected, UUID)
 
 
 async def proof(wh, turn_id):
