@@ -162,7 +162,8 @@ async def test_live_writer_blocks_new_dispatch_until_positive_end(wh):
     async with wh.database.session_factory() as session, session.begin():
         attempt = await session.get(DeliveryAttempt, attempt_id)
         attempt.writer_state, attempt.writer_ended_at = "ENDED", await db_clock(session)
-    assert await select_immediate(wh.database, wh.principal, wh.settings) == turn_id
+    # The existing claim still owns its live lease after the writer has ended.
+    assert await select_immediate(wh.database, wh.principal, wh.settings) is None
     result = await execute_claimed_turn_v3(wh.database, wh.principal, turn_id, claim,
                                           wh.settings, port)
     assert result.turn.status == "COMPLETED" and len(port.requests) == 1
