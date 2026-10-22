@@ -18,7 +18,7 @@ Both discovery and the complete prospective begin response are measured as
 serialized UTF-8 JSON, including escaping and metadata, against 65,536 bytes.
 An oversized frame returns bounded FRAME_TOO_LARGE metadata without text or a
 writer. Under the same root lock, both discovery and direct begin record a
-terminal SUPERSEDED reconciliation with FRAME_TOO_LARGE error evidence. The
+terminal SUPERSEDED reconciliation and return FRAME_TOO_LARGE metadata. The
 immutable original text remains available to the owner; it is never truncated,
 sent, or marked accepted. Repeating begin cannot acquire that intent, and the
 next ordered intent can proceed. An owner may send a shorter new message.

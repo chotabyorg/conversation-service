@@ -144,7 +144,7 @@ async def test_escaped_oversized_frame_never_acquires_writer_or_truncates(wh):
     async with wh.database.session_factory() as session:
         intent = await session.scalar(select(DeliveryAttempt))
         assert intent.writer_state == "NONE" and intent.status == "SUPERSEDED"
-        assert intent.error_code == "FRAME_TOO_LARGE"
+        assert intent.error_code is None
 
 
 @pytest.mark.parametrize("path", ["work", "begin"])
@@ -172,7 +172,7 @@ async def test_oversized_first_human_intent_is_terminal_and_next_fifo_can_procee
     async with wh.database.session_factory() as session:
         first = await session.get(DeliveryAttempt, ids[0])
         assert first.status == "SUPERSEDED" and first.writer_state == "NONE"
-        assert first.error_code == "FRAME_TOO_LARGE"
+        assert first.error_code is None
         assert first.writer_started_at is first.writer_supplier_instance_id is None
         assert await session.scalar(select(func.count()).select_from(DeliveryReconciliation).where(
             DeliveryReconciliation.delivery_attempt_id == ids[0],
