@@ -69,3 +69,13 @@ private task-owned loopback `TEST_DATABASE_URL` and prepared
 The paired CI pins Website `6f4db23bfbca840e6178eb7bc46e82e91e0d1dc6`, which
 implements this empty-default policy. Widget source and browser dependencies are
 explicit local fixture inputs; the Gateway CI job does not claim browser coverage.
+
+Browser response events prove the UI observed the actual HTTP status. The proxy
+retains the exact already-read upstream bytes supplied to `route.fulfill`, keyed
+by the same Playwright Request object, and awaits that fulfillment before
+asserting ACCEPTED (or EMPTY for the initial idle poll). This avoids a second
+DevTools body lookup whose availability is not implied by receiving status 202.
+The message request must retain the issued session/token and expected UI text;
+exactly two distinct UI message IDs and two upstream UI message requests are
+required. No body substitute, network retry or extra observation request is made.
+UI no-retry, canonical history, PostgreSQL and original-writer checks remain.

@@ -22,6 +22,9 @@ const next = () => pending.length ? Promise.resolve(pending.shift()) : new Promi
 const emit = event => process.stdout.write(JSON.stringify(event) + '\n');
 let session = null, credential = null, proxied = 0, unexpected = 0;
 const pageErrors = [];
+const intercepted = new WeakMap();
+const messageIds = new Set();
+let messageRequests = 0;
 const origin = 'https://composed-widget.invalid';
 await context.route('**/*', async route => {
   try {
@@ -47,7 +50,21 @@ await context.route('**/*', async route => {
       session = credential.session_id;
     }
     proxied += 1;
-    await route.fulfill({ status: response.status(), headers: response.headers(), body });
+    // Keep the real upstream bytes already read for fulfillment. A browser
+    // response event exposes headers; a second DevTools body read can fail for
+    // intercepted responses even after 202. Correlate by exact Request identity.
+    const observation = { status: response.status(), body, fulfilled: null };
+    intercepted.set(request, observation);
+    if (url.pathname === '/v1/sessions/messages') {
+      messageRequests += 1;
+      const envelope = request.postDataJSON();
+      assert.equal(envelope.session_id, credential.session_id);
+      assert.equal(headers['x-widget-session-token'], credential.session_token);
+      assert.equal(messageIds.has(envelope.message_id), false);
+      messageIds.add(envelope.message_id);
+    }
+    observation.fulfilled = route.fulfill({ status: response.status(), headers: response.headers(), body });
+    await observation.fulfilled;
   } catch {
     unexpected += 1;
     await route.abort().catch(() => {});
@@ -72,7 +89,14 @@ try {
     await page.getByRole('button', { name: 'Отправить', exact: true }).click();
     const response = await admitted;
     assert.equal(response.status(), 202);
-    assert.equal((await response.json()).status, 'ACCEPTED');
+    const request = response.request();
+    const observation = intercepted.get(request);
+    assert.ok(observation);
+    assert.equal(observation.status, response.status());
+    assert.equal(request.postDataJSON().session_id, session);
+    assert.equal(request.postDataJSON().message, text);
+    await observation.fulfilled;
+    assert.equal(JSON.parse(observation.body.toString('utf8')).status, 'ACCEPTED');
     await page.waitForFunction(() => !document.querySelector('.chw-input').disabled);
     assert.equal(await page.locator('.chw-retry').count(), 0);
   }
@@ -89,7 +113,11 @@ try {
   assert.equal(denied.headers()['cache-control'], 'no-store');
   const idle = await firstPoll;
   assert.equal(idle.status(), 200);
-  assert.equal((await idle.json()).state, 'EMPTY');
+  const idleObservation = intercepted.get(idle.request());
+  assert.ok(idleObservation);
+  assert.equal(idleObservation.status, idle.status());
+  await idleObservation.fulfilled;
+  assert.equal(JSON.parse(idleObservation.body.toString('utf8')).state, 'EMPTY');
   await page.locator('.chw-close').click();
   emit({ event: 'SESSION_CREATED_EMPTY_DENIED', session_id: session });
   assert.equal((await next()).command, 'SESSION_SELECTED');
@@ -125,10 +153,13 @@ try {
       return send.contains(document.elementFromPoint(rect.x + rect.width / 2, rect.y + rect.height / 2));
     }), true);
   }
+  assert.equal(messageRequests, 2);
+  assert.equal(messageIds.size, 2);
   assert.equal(unexpected, 0);
   assert.deepEqual(pageErrors, []);
   const result = { status: 'PASS', proxied_loopback_requests: proxied, unexpected_requests: 0,
-    continued_page_requests: 0, external_provider_requests: 0, browser: 'CHROMIUM', widths: [320, 1440] };
+    continued_page_requests: 0, external_provider_requests: 0, ui_message_requests: messageRequests,
+    unique_ui_message_ids: messageIds.size, browser: 'CHROMIUM', widths: [320, 1440] };
   await writeFile(config.result_file, JSON.stringify(result, null, 2));
   emit({ event: 'PASS', ...result });
 } catch (error) {
