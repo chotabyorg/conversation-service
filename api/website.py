@@ -23,17 +23,37 @@ from schemas.website_delivery import (
     WebsiteDeliveryWorkResult,
 )
 from schemas.website_history import WebsiteHistoryPage, WebsiteHistoryRequest
+from schemas.website_poll import (
+    WebsitePollAccess,
+    WebsitePollBegin,
+    WebsitePollEnded,
+    WebsitePollStarted,
+)
 from schemas.website_session import (
-    WebsiteSessionAccess,
     WebsiteSessionAdmission,
     WebsiteSessionCreate,
     WebsiteSessionCreated,
 )
-from services import website, website_delivery, website_history, website_ingress
+from services import website, website_delivery, website_history, website_ingress, website_poll
 from services.website_evidence import operational_evidence
 from services.website_session import create as create_session
 
 router = APIRouter(prefix="/internal/v1/website")
+
+
+@router.post("/sessions/polls/begin", response_model=WebsitePollStarted)
+async def session_poll_begin(
+    request: WebsitePollBegin, database: AppDatabase,
+    principal: TrustedPrincipal, settings: AppSettings,
+) -> WebsitePollStarted:
+    return await website_poll.begin(database, principal, request, settings)
+
+
+@router.post("/sessions/polls/end", response_model=WebsitePollEnded)
+async def session_poll_end(
+    request: WebsitePollAccess, database: AppDatabase, principal: TrustedPrincipal,
+) -> WebsitePollEnded:
+    return await website_poll.end(database, principal, request)
 
 
 @router.post("/sessions/history", response_model=WebsiteHistoryPage)
@@ -68,7 +88,7 @@ async def session_admit(
 
 @router.post("/sessions/delivery/work", response_model=WebsiteDeliveryWorkResult)
 async def session_delivery_work(
-    request: WebsiteSessionAccess, database: AppDatabase,
+    request: WebsitePollAccess, database: AppDatabase,
     principal: TrustedPrincipal, settings: AppSettings,
 ) -> WebsiteDeliveryWorkResult:
     return await website_delivery.work(database, principal, request, settings)
