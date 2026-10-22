@@ -23,3 +23,13 @@ delivery. Reading a response body is not used as termination proof. The imported
 network guard blocks remote connections/DNS in the Gateway child; the parent
 permits only PostgreSQL and its two exact owned HTTP ports. No provider credentials,
 paid experiments, production enrollment or permanent-writer proof daemon are used.
+
+`credential_widget_http.py` additionally runs the actual Widget from an exact clean
+Site revision in Chromium. Supply explicit `widget_source`, `widget_revision`,
+`node`, `playwright_module` and `browser` fixture inputs. Every page request is
+intercepted: static fixture HTML/Widget source or a strict public-port allowlist
+proxied to the exact local Gateway. It verifies visible HUMAN and AGENT replies,
+Return and fresh-input ownership, reload/history deduplication, both original
+writers ENDED, and settled 320/1440 layouts with a reachable send control. It is
+local composed acceptance; hosted ingress, real User/CP/model and other browser
+engines remain separate acceptance gates.

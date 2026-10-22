@@ -132,3 +132,6 @@ async def test_actual_widget_handoff_human_return_new_ai_and_reload(composed, tm
             process.stdout.close()
     assert revision(widget, "rev-parse", "HEAD") == source["widget_revision"]
     assert not revision(widget, "status", "--porcelain")
+    async with peer.wh.database.session_factory() as db:
+        attempts = list(await db.scalars(select(DeliveryAttempt)))
+        assert len(attempts) == 2 and all(item.writer_state == "ENDED" for item in attempts)

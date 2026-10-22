@@ -156,7 +156,10 @@ async def composed(wh, suppliers, monkeypatch, tmp_path, network_allowlist):
                             encoding="utf-8", errors="replace"
                         )
                         pytest.fail(str(dict(peer_exit=process.returncode, error_classes=sorted(
-                            set(re.findall(r"\b[A-Za-z_]+(?:Error|Exception)\b", text))))))
+                            set(re.findall(r"\b[A-Za-z_]+(?:Error|Exception)\b", text))),
+                            missing_modules=re.findall(
+                                r"ModuleNotFoundError: No module named '([A-Za-z_][A-Za-z0-9_.]*)'",
+                                text))))
                     try:
                         if server.started and (await public.get("/health")).status_code == 200:
                             break

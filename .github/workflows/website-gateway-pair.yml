@@ -68,7 +68,7 @@ jobs:
           python -m venv conversation/.venv
           python -m venv gateway/.venv
           conversation/.venv/bin/python -m pip install -r conversation/requirements-dev.txt
-          gateway/.venv/bin/python -m pip install -r gateway/requirements-dev.txt
+          gateway/.venv/bin/python -m pip install -r gateway/requirements.txt -r gateway/requirements-dev.txt
           conversation/.venv/bin/python -m pip check
           gateway/.venv/bin/python -m pip check
       - name: Prepare ephemeral loopback TLS and exact peer input
