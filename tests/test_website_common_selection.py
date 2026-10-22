@@ -60,6 +60,7 @@ async def revoke(wh, kind):
         elif kind == "credential":
             cap.revoked_at = await db_clock(session)
         elif kind == "expiry":
+            cap.expires_at = await db_clock(session) + timedelta(milliseconds=1)
             wh.clock.advance_to(cap.expires_at)
         else:
             raise AssertionError("Unknown fixture fence")
