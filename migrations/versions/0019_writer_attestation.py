@@ -12,6 +12,12 @@ depends_on = None
 
 def upgrade() -> None:
     op.create_table(
+        "writer_recovery_scan",
+        sa.Column("name", sa.String(32), primary_key=True),
+        sa.Column("after_registration_id", sa.UUID(), nullable=True),
+        sa.CheckConstraint("name='text-v1'", name="ck_writer_recovery_scan_name"),
+    )
+    op.create_table(
         "writer_registrations",
         sa.Column("id", sa.UUID(), primary_key=True),
         sa.Column("intent_id", sa.UUID(), sa.ForeignKey("delivery_attempts.id"), nullable=False),
@@ -65,10 +71,12 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    op.execute("LOCK TABLE writer_recovery_scan IN ACCESS EXCLUSIVE MODE")
     for table in ("writer_registrations", "writer_witnesses", "writer_recovery_commands"):
         op.execute(f"LOCK TABLE {table} IN ACCESS EXCLUSIVE MODE")
     if op.get_bind().scalar(sa.text("SELECT EXISTS (SELECT 1 FROM writer_registrations)")):
         raise RuntimeError("Retained writer evidence requires a compatible reader")
     for table in ("writer_recovery_commands", "writer_witnesses", "writer_registrations"):
         op.drop_table(table)
+    op.drop_table("writer_recovery_scan")
     op.execute("DROP FUNCTION forbid_writer_evidence_mutation()")

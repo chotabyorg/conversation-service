@@ -63,6 +63,8 @@ class Database:
                 if versions != [expected_revision]:
                     return False
                 await connection.execute(text(
+                    "SELECT name,after_registration_id FROM writer_recovery_scan LIMIT 1"))
+                await connection.execute(text(
                     "SELECT r.id,w.proof_ref,c.command FROM writer_registrations r "
                     "LEFT JOIN writer_witnesses w ON w.registration_id=r.id "
                     "LEFT JOIN writer_recovery_commands c ON c.registration_id=r.id LIMIT 1"))

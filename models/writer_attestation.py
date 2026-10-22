@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import BigInteger, DateTime, ForeignKey, String, UniqueConstraint
+from sqlalchemy import BigInteger, CheckConstraint, DateTime, ForeignKey, String, UniqueConstraint
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -57,3 +57,12 @@ class WriterRecoveryCommand(Base):
             "registration_id", "expected_revision", name="uq_writer_recovery_revision"
         ),
     )
+
+
+class WriterRecoveryScan(Base):
+    """Mutable traversal position only; never writer authority or evidence."""
+
+    __tablename__ = "writer_recovery_scan"
+    name: Mapped[str] = mapped_column(String(32), primary_key=True)
+    after_registration_id: Mapped[UUID | None] = mapped_column()
+    __table_args__ = (CheckConstraint("name='text-v1'", name="ck_writer_recovery_scan_name"),)

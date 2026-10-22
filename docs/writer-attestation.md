@@ -3,7 +3,9 @@
 This additive lifecycle journal supports the existing common text delivery journal.
 It creates no Conversation, authority, delivery, grant, Business operation or send
 permission. Migration `0019_writer_attestation` adds append-only registrations,
-positive witnesses and exact retirement commands. It synthesizes no old evidence;
+positive witnesses and exact retirement commands. A separate singleton
+`writer_recovery_scan` holds mutable traversal position only; it has no authority,
+outcome, permit or delivery fields. Migration creates no historical evidence, and
 downgrade refuses retained registrations. Software rollback must retain a reader
 that honors CLOSED evidence even when `WRITER_ATTESTATION_REQUIRED=false`.
 
@@ -67,12 +69,24 @@ completion requires no retirement. Response contains no text or visitor credenti
 Run `python retirement_worker.py` as a separate worker using the existing service
 image and database, with dedicated WRITER_RETIREMENT_TOKEN, WRITER_SUPERVISOR_TOKEN
 and WRITER_SUPERVISOR_BASE_URL pointing to the Conversation API. The bounded sweep
-selects at most 100 matching LIVE witnessed writers, releases its DB session,
+selects at most 100 matching LIVE witnessed writers using a durable UUID keyset
+cursor shared by all drivers. The short cursor transaction commits progress before
+attempting the page and releases its DB session. Tail exhaustion wraps to the
+beginning, so earlier inserts and failed rows remain eligible; a restart can skip
+an unfinished page until the next wrap, but cannot remove its evidence or command.
+A persistent failed page cannot starve later eligible writers. The driver then
 persists/reads exact recovery commands, then calls the existing retirement consumer.
 That consumer reads proof with an eight-second deadline outside every DB session
 and re-locks/revalidates afterward; original completion and retirement receipt
-precedence remain unchanged. A sweep repeats every five seconds. Multiple drivers
-are safe through common journal locks and immutable command identity.
+precedence remain unchanged. A sweep repeats every five seconds.
+Database/connection/timeout failures at the
+snapshot and row boundaries retain all uncertain state and emit finite sanitized
+retry diagnostics. Readiness/outage retries wait five seconds and wake on shutdown;
+cancellation propagates through the owning transaction and a stop request prevents
+starting another row. Unexpected startup/runtime failures exit nonzero with a
+finite diagnostic rather than an exception/SQL traceback. Multiple drivers share
+only scan traversal progress and remain safe through common journal locks and
+immutable command identity.
 
 Keep the worker and producer secrets separate from child environment. No standalone
 public endpoint, new database or automatic image publication was added. Deploy this

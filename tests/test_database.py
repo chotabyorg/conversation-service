@@ -160,6 +160,7 @@ async def test_migrated_catalog_constraints_indexes_utc_and_exact_collation(h, s
             "writer_registrations",
             "writer_witnesses",
             "writer_recovery_commands",
+            "writer_recovery_scan",
             "website_immediate_turns",
             "website_response_attempts",
             "telegram_admissions",
