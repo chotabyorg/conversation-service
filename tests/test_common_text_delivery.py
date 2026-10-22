@@ -105,8 +105,9 @@ async def test_website_human_unknown_does_not_end_writer_or_authorize_resend(wh,
     unknown = WriterCompletionEvidence(supplier, process, "UNKNOWN", None, "TIMEOUT", False)
     async with wh.database.session_factory() as session, session.begin():
         _grant, root, intent, source = await load(session, ids[0])
-        await complete_writer(session, intent, root, source, unknown,
-                              recover_only=True, reconciliation_key=uuid4())
+        result = await complete_writer(session, intent, root, source, unknown,
+                                       recover_only=True, reconciliation_key=uuid4())
+        assert not result.replayed
         assert intent.writer_state == "LIVE" and intent.status == "UNKNOWN"
         assert not (await acquire(session, await load(session, ids[1]), uuid4(), uuid4())).send
         assert not (await acquire(session, (_grant, root, intent, source), supplier, process)).send
@@ -118,9 +119,15 @@ async def test_website_human_unknown_does_not_end_writer_or_authorize_resend(wh,
     joined = WriterCompletionEvidence(supplier, process, "UNKNOWN", None, "TIMEOUT", True)
     async with wh.database.session_factory() as session, session.begin():
         _grant, root, intent, source = await load(session, ids[0])
-        await complete_writer(session, intent, root, source, joined,
-                              recover_only=True, reconciliation_key=uuid4())
+        result = await complete_writer(session, intent, root, source, joined,
+                                       recover_only=True, reconciliation_key=uuid4())
+        assert not result.replayed
         assert intent.writer_state == "ENDED" and intent.status == "UNKNOWN"
+    async with wh.database.session_factory() as session, session.begin():
+        _grant, root, intent, source = await load(session, ids[0])
+        repeated = await complete_writer(session, intent, root, source, joined,
+                                         recover_only=True, reconciliation_key=uuid4())
+        assert repeated.replayed
     returned = await inbox.return_to_agent(wh.database, principal, case.case_id, command)
     assert returned.case.status == "RETURNED"
     async with wh.database.session_factory() as session:
