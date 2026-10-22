@@ -34,7 +34,7 @@ def revision(root, *args):
 
 
 @pytest_asyncio.fixture
-async def composed(wh, suppliers, monkeypatch, tmp_path):
+async def composed(wh, suppliers, monkeypatch, tmp_path, network_allowlist):
     fixture_file = os.environ.get("TRACK_WEBSITE_FIXTURE_INPUT")
     if not fixture_file:
         pytest.skip("Opt-in real Gateway source, runtime and ephemeral TLS fixture required")
@@ -58,6 +58,7 @@ async def composed(wh, suppliers, monkeypatch, tmp_path):
     probe.bind(("127.0.0.1", 0))
     gateway_port = probe.getsockname()[1]
     probe.close()
+    network_allowlist.update(("127.0.0.1", port) for port in (conversation_port, gateway_port))
     config = dict(
         fixture,
         conversation_port=conversation_port,
