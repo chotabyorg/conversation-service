@@ -16,7 +16,6 @@ from schemas.website_delivery import (
     WebsiteDeliveryComplete,
     WebsiteDeliveryCompleted,
     WebsiteDeliveryDescriptor,
-    WebsiteDeliveryIdentity,
     WebsiteDeliveryRecovery,
     WebsiteDeliveryWorkResult,
     WebsitePublicFrame,
@@ -149,9 +148,9 @@ async def work(database: Database, principal: Principal, request: WebsitePollAcc
 
 
 async def _load(
-    session: AsyncSession, root: Conversation, request: WebsiteDeliveryIdentity,
+    session: AsyncSession, root: Conversation, request: WebsiteDeliveryDescriptor, agent_id: UUID,
 ) -> tuple[InboxGrantScope, DeliveryAttempt, Source]:
-    grant = await _grant(session, root, request.agent_id)
+    grant = await _grant(session, root, agent_id)
     intent = await session.scalar(select(DeliveryAttempt).where(
         DeliveryAttempt.conversation_id == root.id,
         DeliveryAttempt.id == request.outbound_intent_id,
@@ -159,7 +158,7 @@ async def _load(
     ).with_for_update().execution_options(populate_existing=True))
     if intent is None:
         raise DomainError(ErrorCode.NOT_FOUND)
-    source = await _source(session, intent, root, grant, request.agent_id)
+    source = await _source(session, intent, root, grant, agent_id)
     if source is None:
         raise DomainError(ErrorCode.DELIVERY_IDENTITY_CONFLICT)
     descriptor = _descriptor(intent, source)
@@ -174,7 +173,7 @@ async def begin(database: Database, principal: Principal, request: WebsiteDelive
     async with database.session_factory() as session, session.begin():
         root = await website_session.locked_access(session, principal, request, settings)
         await website_poll.require_current(session, root.id, request)
-        grant, intent, source = await _load(session, root, request)
+        grant, intent, source = await _load(session, root, request, request.agent_id)
         descriptor = _descriptor(intent, source)
         current = False
         if (not request.recover_only and intent.writer_state == "NONE"
@@ -207,7 +206,7 @@ async def complete(database: Database, principal: Principal,
                    request: WebsiteDeliveryComplete) -> WebsiteDeliveryCompleted:
     async with database.session_factory() as session, session.begin():
         root = await website_session.locked_original_writer(session, principal, request)
-        _grant_value, intent, source = await _load(session, root, request)
+        _grant_value, intent, source = await _load(session, root, request, request.agent_id)
         outcome = {"WRITE_COMPLETED": "PROVIDER_ACCEPTED", "WRITE_FAILED": "FAILED",
                     "UNKNOWN": "UNKNOWN"}[request.outcome]
         provider_id = str(request.delivery_id) if request.outcome == "WRITE_COMPLETED" else None
