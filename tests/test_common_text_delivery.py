@@ -109,7 +109,10 @@ async def test_website_human_unknown_does_not_end_writer_or_authorize_resend(wh,
                                        recover_only=True, reconciliation_key=uuid4())
         assert not result.replayed
         assert intent.writer_state == "LIVE" and intent.status == "UNKNOWN"
-        assert not (await acquire(session, await load(session, ids[1]), uuid4(), uuid4())).send
+        second = await load(session, ids[1])
+        deferred = await acquire(session, second, uuid4(), uuid4())
+        assert not deferred.send and not deferred.replayed
+        assert second[2].status == "GENERATED" and second[2].writer_state == "NONE"
         assert not (await acquire(session, (_grant, root, intent, source), supplier, process)).send
     command = ReturnToAgentCommand(command_id=uuid4(),
         expected_authority_revision=case.authority_revision,
