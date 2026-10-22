@@ -33,6 +33,8 @@ def upgrade() -> None:
         BEGIN
             RAISE EXCEPTION 'Website visibility positions are immutable' USING ERRCODE='23514';
         END $$;
+    """)
+    op.execute("""
         CREATE TRIGGER website_visibility_immutable BEFORE UPDATE OR DELETE
         ON website_visible_messages FOR EACH ROW EXECUTE FUNCTION website_visibility_immutable();
     """)
