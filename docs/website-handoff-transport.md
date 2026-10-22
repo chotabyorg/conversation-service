@@ -59,7 +59,10 @@ unchanged. They cannot be promoted to a private mailbox by knowing their UUID.
    metadata only from the configured ingress, never arbitrary forwarded headers.
    The private Gateway-to-Conversation capability hop also requires TLS or an
    explicitly approved encrypted service transport before production enrollment.
-   Existing plaintext private HTTP does not satisfy that gate. This contract
+   Before forwarding a capability, validate the intended Conversation peer's
+   identity using certificate verification or equivalent authenticated service
+   transport. Encryption and private-network placement alone do not satisfy
+   this gate; plaintext private HTTP also fails it. This contract
    changes no network configuration owned by the separate infrastructure track.
 3. Browser keeps session ID and capability together in tab sessionStorage under
    the full integration/widget identity. When storage is unavailable, keep both
@@ -160,6 +163,15 @@ using the existing Conversation middleware limit. Customer/HUMAN text follows
 One poll waits at most 20 seconds and yields zero or one frame, at most 65,536
 UTF-8 response bytes. A history page holds at most 50 messages and 262,144 UTF-8
 response bytes, stopping before either bound and returning an opaque cursor.
+All bounds apply to the complete serialized JSON response, including escaping
+and metadata, not only raw text bytes. An oversized retained poll frame returns
+a bounded `FRAME_TOO_LARGE` outcome with its opaque delivery ID and no text;
+it acquires no writer and does not mark the frame delivered or retryable.
+History adds only messages that fit the remaining serialized byte budget and
+advances its cursor only after inclusion. If even the first eligible message
+cannot fit an empty page, return the same bounded size outcome and retain the
+original cursor. Never silently skip or truncate stored evidence. Tests must
+include control characters whose JSON escaping expands otherwise valid text.
 Recovery responses are at most 4,096 UTF-8 bytes and contain zero text fields.
 Unknown DTO fields are rejected. Oversized chunked input, escaped Unicode,
 response serialization, cursor paging and poll cancellation require HTTP tests
