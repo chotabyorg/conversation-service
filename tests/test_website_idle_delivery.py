@@ -114,7 +114,8 @@ async def test_idle_human_delivery_unknown_join_return_and_fresh_agent_input(wh,
                                     .where(Message.actor == "AGENT")) == 1
 
 
-@pytest.mark.parametrize("text", ["\x01" * 10000, "я" * 16000])
+@pytest.mark.parametrize("text", ["\x01" * 10000, "я" * 16000],
+                         ids=["escaped-controls", "utf8-multibyte"])
 async def test_serialized_work_and_begin_frames_fit_full_json_limit(wh, text):
     await drafted(wh, text)
     value = await work(wh)
