@@ -42,6 +42,17 @@ new v3 input without a seeded grant. Supplier proofs, User authentication, model
 responses and socket evidence are explicitly synthetic. This does not prove
 Gateway-to-browser or live provider acceptance.
 
+The separate opt-in `tests/website_cross_service/credential_gateway_http.py`
+profile additionally runs the real Gateway over verified private loopback TLS.
+Its three cases cover owner Handoff/reply/Return, quota and credential isolation,
+and one bounded catch-up after three settled input windows. The optional
+`credential_widget_http.py` case loads the actual pinned Widget in Chromium,
+verifies both original delivery writers ENDED, and restores canonical history
+after reload. AI/User/CP are synthetic in these profiles; actual ChotaCRM has its
+own native v3 matrix. The CI profiles pin the merged AI reader revision explicitly.
+These results establish local composition, with hosted ingress and the complete
+production service identity chain still requiring release acceptance.
+
 Production enrollment remains prohibited until the matching Gateway/Widget
 releases, intended-peer TLS and privacy evidence, positive legacy writer
 retirement, the common trusted termination proof source, full actual-CRM/common
