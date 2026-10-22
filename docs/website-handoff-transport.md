@@ -28,7 +28,9 @@ unchanged. They cannot be promoted to a private mailbox by knowing their UUID.
    and derives owner/integration/agent from that trusted response.
    Before enrollment, Gateway must enforce creation admission: 5 requests/minute
    per integration and trusted client IP (burst 2), 60/minute per integration
-   across clients (burst 10), and one in-flight create per browser tab. Only a
+   across clients (burst 10). The browser also limits itself to one in-flight
+   create per tab; this is client UX only, not an authoritative server quota.
+   Only a
    configured trusted ingress may supply the client IP; arbitrary forwarded
    headers cannot choose a rate-limit key. Conversation owns the durable quota:
    at most 1,000 unexpired credentials per integration, checked under an
@@ -52,6 +54,13 @@ unchanged. They cannot be promoted to a private mailbox by knowing their UUID.
    secret is returned once, never logged or placed
    in a URL. A lost create response may create another empty session, not recover
    access to the first session's history.
+   The public API requires HTTPS before issuance and before accepting/forwarding
+   a capability-bearing request. Reject plaintext requests; trust original-scheme
+   metadata only from the configured ingress, never arbitrary forwarded headers.
+   The private Gateway-to-Conversation capability hop also requires TLS or an
+   explicitly approved encrypted service transport before production enrollment.
+   Existing plaintext private HTTP does not satisfy that gate. This contract
+   changes no network configuration owned by the separate infrastructure track.
 3. Browser keeps session ID and capability together in tab sessionStorage under
    the full integration/widget identity. When storage is unavailable, keep both
    in memory. Reload cannot invent a credential for an old UUID. Expiry or loss
@@ -94,6 +103,15 @@ membership alone must never select another channel or agent.
 
 Extend CP binding proof and AI lifecycle scope validation for Website using the
 same lifecycle protocol and generation checks. Do not add a Website grant manager.
+An anonymous visitor maps only to the exact credential-bound canonical session,
+never to a HUMAN principal or an invented user account. The private adapter uses
+its configured `WEBSITE` service principal and exact namespace grants. Where the
+shared delivery guard needs `account_id`, Conversation obtains it from that
+session's active `InboxGrantScope`, verifies it against the current CP/AI proofs
+and retained credential epoch, and invokes the existing guard. Browser-supplied
+account/owner identities cannot provide or override it. Owner Inbox commands keep
+the existing User Service-authenticated `HumanPrincipal` and account checks; the
+visitor adapter cannot call claim, HUMAN send or Return as that owner.
 Only a capability-bound session under a live reviewed Website grant can select
 managed v3. Existing legacy/v2 sessions keep their current wire profile and
 cannot expose Handoff tools or owner replies. Reader-first deployment is required.
@@ -135,6 +153,17 @@ Wrong/expired credentials, wrong scope and unknown retained identities preserve
 the existing indistinguishable 404 behavior. Public recovery responses expose
 only bounded delivery state and the opaque public delivery ID; no internal IDs,
 canonical pending text, credential digests or execution metadata.
+
+Wire bounds are server enforced: at most 65,536 UTF-8 bytes per JSON request,
+using the existing Conversation middleware limit. Customer/HUMAN text follows
+`TextContent` in `schemas/contracts.py`; no new unbounded text type is permitted.
+One poll waits at most 20 seconds and yields zero or one frame, at most 65,536
+UTF-8 response bytes. A history page holds at most 50 messages and 262,144 UTF-8
+response bytes, stopping before either bound and returning an opaque cursor.
+Recovery responses are at most 4,096 UTF-8 bytes and contain zero text fields.
+Unknown DTO fields are rejected. Oversized chunked input, escaped Unicode,
+response serialization, cursor paging and poll cancellation require HTTP tests
+before enrollment; transport limits never truncate immutable stored evidence.
 
 An authenticated history read must not become an alternative delivery path for
 unacquired or UNKNOWN outbound intents. Visitor-facing history includes its own
