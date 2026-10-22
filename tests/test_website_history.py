@@ -14,6 +14,7 @@ from tests.test_database import violation
 from tests.test_managed_migration import migrate
 from tests.test_website_grant import suppliers as supplier_fixture
 from tests.test_website_idle_delivery import call, completion, drafted, identity, visitor, work
+from tests.test_website_session import issued
 from tests.test_website_session import sh as session_fixture
 from tests.website_common_fixture import append, common_website
 
@@ -128,13 +129,25 @@ async def test_unknown_cursor_proof_outage_and_closed_http_shape(wh, suppliers):
     assert (await page(wh, internal_id=str(uuid4()))).status_code == 422
 
 
-async def test_visibility_positions_are_immutable_and_cannot_cross_roots(wh, sql):
+async def test_visibility_positions_are_immutable(wh, sql):
     await append(wh)
     await page(wh)
     await violation(sql, "UPDATE website_visible_messages SET ordinal=ordinal+1", {}, "23514")
     await violation(sql, "DELETE FROM website_visible_messages", {}, "23514")
     async with sql.connect() as connection:
         assert await connection.scalar(text("SELECT count(*) FROM website_visible_messages")) == 1
+
+
+async def test_second_credential_cannot_use_first_visitors_cursor_or_history(wh):
+    await append(wh, "first visitor input")
+    original = (await page(wh)).json()["items"][0]
+    wh.created = await issued(wh)
+    assert (await page(wh)).json()["items"] == []
+    error(await page(wh, original["id"]), "NOT_FOUND", 404)
+    await append(wh, "second visitor input")
+    separate = (await page(wh)).json()["items"]
+    assert len(separate) == 1 and separate[0]["id"] != original["id"]
+    assert separate[0]["client_message_id"] != original["client_message_id"]
 
 
 async def test_downgrade_keeps_retained_visibility_and_restart_cursor(wh, database_url):
