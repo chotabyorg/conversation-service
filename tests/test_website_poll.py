@@ -8,6 +8,7 @@ from sqlalchemy import func, select
 from models import Conversation, DeliveryAttempt, InboxGrantScope, WebsitePollState
 from schemas.contracts import ErrorCode
 from tests.conftest import error
+from tests.test_managed_migration import migrate
 from tests.test_website_grant import suppliers as supplier_fixture
 from tests.test_website_idle_delivery import call, completion, drafted, identity, visitor, work
 from tests.test_website_session import sh as session_fixture
@@ -158,3 +159,15 @@ async def test_original_poll_supplier_and_process_bind_work_and_writer(wh):
     changed = dict(current, process_incarnation_id=str(uuid4()))
     error(await call(wh, "begin", changed), "NOT_FOUND", 404)
     assert (await call(wh, "begin", current)).json()["send"]
+
+
+async def test_retained_poll_debt_cannot_be_dropped_by_older_reader(wh, database_url):
+    original = request(wh)
+    result = await begin(wh, original)
+    await end(wh, access(wh, original, result.json()))
+    await wh.database.dispose()
+    rejected = migrate(database_url, "downgrade", "0017_website_create_limits", expected=1)
+    assert "Retained Website poll admission requires a compatible reader" in rejected.stderr
+    assert await wh.database.ready()
+    async with wh.database.session_factory() as session:
+        assert await session.scalar(select(func.count()).select_from(WebsitePollState)) == 1
