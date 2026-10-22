@@ -23,18 +23,33 @@ class WebsiteGrantEpoch:
     provision_command_id: UUID
 
 
-async def lock_scope(session: AsyncSession, request: WebsiteSessionScope) -> InboxGrantScope:
+async def lock_scope(
+    session: AsyncSession,
+    request: WebsiteSessionScope,
+    *,
+    shared: bool = False,
+) -> InboxGrantScope:
     if not session.in_transaction():
         raise RuntimeError("Website grant access requires the caller transaction")
-    return await inbox_lifecycle._lock_scope(
-        session,
-        dict(
-            owner_id=request.owner_id,
-            integration_id=request.integration_id,
-            channel="WEBSITE_WIDGET",
-            agent_id=request.agent_id,
-        ),
+    values = dict(
+        owner_id=request.owner_id,
+        integration_id=request.integration_id,
+        channel="WEBSITE_WIDGET",
+        agent_id=request.agent_id,
     )
+    if not shared:
+        return await inbox_lifecycle._lock_scope(session, values)
+    # FOR SHARE permits parallel visitors and conflicts with lifecycle writers.
+    # Content reads never allocate or exclusively lock an integration scope.
+    scope = await session.scalar(
+        select(InboxGrantScope)
+        .where(*[getattr(InboxGrantScope, key) == value for key, value in values.items()])
+        .with_for_update(read=True)
+        .execution_options(populate_existing=True)
+    )
+    if scope is None:
+        raise DomainError(ErrorCode.NOT_FOUND)
+    return scope
 
 
 async def current_epoch(
