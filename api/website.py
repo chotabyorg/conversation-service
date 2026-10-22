@@ -15,8 +15,12 @@ from schemas.website import (
     WebsiteResponseCompleted,
     WebsiteResult,
 )
-from schemas.website_session import WebsiteSessionCreated, WebsiteSessionScope
-from services import website
+from schemas.website_session import (
+    WebsiteSessionAdmission,
+    WebsiteSessionCreated,
+    WebsiteSessionScope,
+)
+from services import website, website_ingress
 from services.website_evidence import operational_evidence
 from services.website_session import create as create_session
 
@@ -35,6 +39,14 @@ async def session_create(
 async def admit(request: WebsiteAdmission, database: AppDatabase,
                 principal: TrustedPrincipal, settings: AppSettings) -> WebsiteAdmissionResult:
     return await website.admit(database, principal, request, settings)
+
+
+@router.post("/sessions/admissions", response_model=WebsiteAdmissionResult)
+async def session_admit(
+    request: WebsiteSessionAdmission, database: AppDatabase,
+    principal: TrustedPrincipal, settings: AppSettings,
+) -> WebsiteAdmissionResult:
+    return await website_ingress.admit(database, principal, request, settings)
 
 
 @router.post("/results", response_model=WebsiteResult)
