@@ -39,7 +39,7 @@ def revision(root, *args):
 async def composed(wh, suppliers, monkeypatch, tmp_path, network_allowlist):
     fixture_file = os.environ.get("TRACK_WEBSITE_FIXTURE_INPUT")
     if not fixture_file:
-        pytest.skip("Opt-in real Gateway source, runtime and ephemeral TLS fixture required")
+        pytest.fail("Explicit real Gateway source, runtime and ephemeral TLS fixture required")
     fixture = json.loads(Path(fixture_file).read_text(encoding="utf-8"))
     gateway = Path(fixture["gateway_source"])
     assert revision(gateway, "rev-parse", "HEAD") == fixture["gateway_revision"]
@@ -122,7 +122,7 @@ async def composed(wh, suppliers, monkeypatch, tmp_path, network_allowlist):
             process = subprocess.Popen(
                 [
                     fixture["gateway_python"],
-                    str(Path(__file__).with_name("website_gateway_peer.py")),
+                    str(Path(__file__).with_name("gateway_peer.py")),
                     str(input_file),
                 ],
                 cwd=gateway,

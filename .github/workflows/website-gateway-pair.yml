@@ -1,0 +1,117 @@
+name: Website Gateway HTTP and Inbox pair
+
+on:
+  pull_request:
+    paths:
+      - api/**
+      - core/**
+      - db/**
+      - migrations/**
+      - models/**
+      - schemas/**
+      - services/**
+      - tests/**
+      - main.py
+      - requirements*.txt
+      - .github/workflows/website-gateway-pair.yml
+
+permissions:
+  contents: read
+
+jobs:
+  website-gateway-native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: website_pair
+          POSTGRES_PASSWORD: isolated_website_pair_fixture
+          POSTGRES_DB: website_pair_test
+        ports: [5432:5432]
+        options: >-
+          --health-cmd "pg_isready -U website_pair -d website_pair_test"
+          --health-interval 2s --health-timeout 2s --health-retries 20
+    env:
+      GATEWAY_REVISION: ef38586ccffb093772f24849282ea40cfa7ef490
+      AI_GUARD_REVISION: 547cffe066f3296fe4bc75fe8772b3b191182964
+      CONVERSATION_REVISION: ${{ github.event.pull_request.head.sha }}
+      DATABASE_URL: postgresql+asyncpg://website_pair:isolated_website_pair_fixture@127.0.0.1:5432/website_pair_test
+      TEST_DATABASE_URL: postgresql+asyncpg://website_pair:isolated_website_pair_fixture@127.0.0.1:5432/website_pair_test
+      TEST_DATABASE_DISPOSABLE: "yes"
+      CONVERSATION_AUTH_PRINCIPALS: '[{"principal_id":"ci-worker","token":"ci-synthetic-token-00000000000000000000","grants":[{"owner_id":"ci-owner","integration_id":"00000000-0000-4000-8000-000000000001","channel":"WEBSITE_WIDGET","provider_namespace":"ci.widget"}]}]'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: conversation
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: chotabyorg/website-gateway-service
+          ref: ${{ env.GATEWAY_REVISION }}
+          path: gateway
+          persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: chotabyorg/ai-agent-service
+          ref: ${{ env.AI_GUARD_REVISION }}
+          path: ai
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.11'
+      - name: Install separate pinned environments
+        run: |
+          python -m venv conversation/.venv
+          python -m venv gateway/.venv
+          conversation/.venv/bin/python -m pip install -r conversation/requirements-dev.txt
+          gateway/.venv/bin/python -m pip install -r gateway/requirements-dev.txt
+          conversation/.venv/bin/python -m pip check
+          gateway/.venv/bin/python -m pip check
+      - name: Prepare ephemeral loopback TLS and exact peer input
+        run: |
+          test "$(git -C conversation rev-parse HEAD)" = "${{ github.event.pull_request.head.sha }}"
+          test "$(git -C ai rev-parse HEAD)" = "$AI_GUARD_REVISION"
+          conversation/.venv/bin/python conversation/tests/website_cross_service/prepare_gateway_fixture.py \
+            --gateway-root "$GITHUB_WORKSPACE/gateway" \
+            --gateway-python "$GITHUB_WORKSPACE/gateway/.venv/bin/python" \
+            --expected-gateway-revision "$GATEWAY_REVISION" \
+            --network-guard "$GITHUB_WORKSPACE/ai/tests/goal5_business_bridge/network.py" \
+            --output "$RUNNER_TEMP/website-gateway-fixture"
+      - name: Verify real HTTPS session and Inbox composition
+        working-directory: conversation
+        env:
+          TRACK_WEBSITE_FIXTURE_INPUT: ${{ runner.temp }}/website-gateway-fixture/input.json
+        run: .venv/bin/python -m pytest -q tests/website_cross_service/credential_gateway_http.py --junitxml="$RUNNER_TEMP/website-gateway-pair.xml"
+      - name: Save sanitized pair summary
+        if: always()
+        run: |
+          python - <<'PY'
+          import json, os, pathlib, subprocess, xml.etree.ElementTree as ET
+          root = pathlib.Path(os.environ['RUNNER_TEMP'])
+          report = root / 'website-gateway-pair.xml'
+          cases = list(ET.parse(report).iter('testcase')) if report.exists() else []
+          failed = sum(c.find('failure') is not None or c.find('error') is not None for c in cases)
+          skipped = sum(c.find('skipped') is not None for c in cases)
+          sources = {name: subprocess.check_output(['git', '-C', name, 'rev-parse', 'HEAD'], text=True).strip() for name in ('conversation', 'gateway', 'ai')}
+          expected = dict(conversation=os.environ['CONVERSATION_REVISION'], gateway=os.environ['GATEWAY_REVISION'], ai=os.environ['AI_GUARD_REVISION'])
+          unchanged = sources == expected and all(not subprocess.check_output(['git', '-C', name, 'status', '--porcelain'], text=True).strip() for name in sources)
+          value = dict(sources=sources, tests=len(cases), failed=failed, skipped=skipped,
+                       status='PASS' if len(cases) == 3 and not failed and not skipped and unchanged else 'FAIL',
+                       source_unchanged=unchanged,
+                       external_provider_requests=0, production_mutations=False,
+                       ai_user_cp='SYNTHETIC', public_ingress='SYNTHETIC_TRUSTED_LOOPBACK_PROXY')
+          (root / 'website-gateway-pair-summary.json').write_text(json.dumps(value, indent=2))
+          print(json.dumps(value))
+          PY
+      - name: Upload sanitized pair evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: website-gateway-pair-${{ github.event.pull_request.head.sha }}
+          path: ${{ runner.temp }}/website-gateway-pair-summary.json
+          if-no-files-found: error
+          retention-days: 30
