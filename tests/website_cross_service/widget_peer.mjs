@@ -69,7 +69,8 @@ try {
   emit({ event: 'CUSTOMER_ADMITTED', session_id: session });
   assert.equal((await next()).command, 'EXPECT_HUMAN');
   await page.getByText('Ответ владельца', { exact: true }).waitFor({ timeout: 10000 });
-  assert.equal(await page.locator('.chw-msg-bot').count(), 1);
+  assert.equal(await page.getByText('Ответ владельца', { exact: true }).count(), 1);
+  assert.equal(await page.getByText('common Website reply', { exact: true }).count(), 0);
   emit({ event: 'HUMAN_VISIBLE' });
   assert.equal((await next()).command, 'SEND_NEW_INPUT');
   await send('Новый запрос');
@@ -81,7 +82,8 @@ try {
   await page.getByRole('button', { name: 'Открыть чат', exact: true }).click();
   await page.getByText('Ответ владельца', { exact: true }).waitFor();
   await page.getByText('common Website reply', { exact: true }).waitFor();
-  assert.equal(await page.locator('.chw-msg-bot').count(), 2);
+  assert.equal(await page.getByText('Ответ владельца', { exact: true }).count(), 1);
+  assert.equal(await page.getByText('common Website reply', { exact: true }).count(), 1);
   assert.equal(await page.locator('.chw-msg-user').count(), 2);
   for (const width of [320, 1440]) {
     await page.setViewportSize({ width, height: 900 });
