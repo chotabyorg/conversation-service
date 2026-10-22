@@ -17,6 +17,7 @@ import pytest_asyncio
 import uvicorn
 from sqlalchemy import select
 
+from core.config import Settings
 from models import DeliveryAttempt
 from schemas.handoff import HumanPrincipal
 from services.human_auth import INBOX_ORIGIN
@@ -283,3 +284,51 @@ async def test_composed_creation_quota_and_visitor_isolation(composed):
     headers = {key: value for key, value in peer.headers.items() if key != "X-Forwarded-Proto"}
     insecure = await peer.public.post("/v1/sessions", json={}, headers=headers)
     assert insecure.status_code == 400
+
+
+async def test_composed_busy_agent_has_one_bounded_catch_up_reply(composed):
+    peer = composed
+    values = peer.wh.settings.model_dump()
+    binding = peer.wh.settings.website_bindings[0]
+    values["catch_up_bindings"] = [dict(owner_id=binding.owner_id,
+        integration_id=binding.integration_id, agent_id=binding.agent_id, channel="WEBSITE_WIDGET")]
+    settings = Settings(**values, _env_file=None)
+    peer.wh.settings = peer.wh.client._transport.app.state.settings = settings
+
+    class PausedPort(WebsiteV3Port):
+        def __init__(self):
+            super().__init__("DRAFT")
+            self.started, self.release = asyncio.Event(), asyncio.Event()
+
+        async def execute_v3(self, prepared, binding, request_id=""):
+            self.started.set()
+            await self.release.wait()
+            return await super().execute_v3(prepared, binding, request_id)
+
+    session = await create_session(peer)
+    await message(peer, session, "Первый вопрос")
+    await due(peer.wh)
+    paused = PausedPort()
+    running = asyncio.create_task(WebsiteWorker(peer.wh.database, settings, paused).run_once())
+    try:
+        await asyncio.wait_for(paused.started.wait(), 5)
+        for text in ("Уточнение один", "Уточнение два", "Последнее уточнение"):
+            await message(peer, session, text)
+            await due(peer.wh)
+    finally:
+        paused.release.set()
+        assert await asyncio.wait_for(running, 5)
+    current = WebsiteV3Port("DRAFT")
+    worker = WebsiteWorker(peer.wh.database, settings, current)
+    assert await worker.run_once()
+    assert not await worker.run_once() and len(current.requests) == 1
+    request = current.requests[0].request
+    assert (request.input_first_sequence, request.input_last_sequence) == (2, 4)
+    selected = [item.text for item in request.messages
+                if item.id in request.selected_input_message_ids]
+    assert selected == ["Уточнение один", "Уточнение два", "Последнее уточнение"]
+    async with accepted_poll(peer, session) as delivered:
+        assert delivered["actor"] == "AGENT"
+    history = await peer.public.post("/v1/sessions/history", json=dict(session_id=session),
+                                      headers=peer.headers)
+    assert len([item for item in history.json()["items"] if item["actor"] == "AGENT"]) == 1
