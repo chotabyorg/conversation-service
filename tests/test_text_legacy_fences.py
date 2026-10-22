@@ -10,7 +10,7 @@ from core.config import SettlingPolicy
 from core.errors import DomainError
 from models import Conversation, InboxGrantScope
 from schemas.contracts import Channel, ControlTransition, DeliveryCreate, ErrorCode, TurnCreate
-from services import authority, delivery, inbox_lifecycle, turns
+from services import authority, delivery, inbox_lifecycle, turns, website_session
 from services.settling import select_settled_turn
 from services.website_worker import select_immediate
 from tests.conftest import error, observed_waiters
@@ -123,6 +123,38 @@ async def test_original_website_completion_remains_available_after_fence(wh):
                              dict(request, outcome="WRITE_COMPLETED"))
     assert completed.status_code == 200
     assert completed.json()["outcome"] == "WRITE_COMPLETED"
+
+
+@pytest.mark.parametrize("kind", ["admission", "credential"])
+async def test_common_revoke_fences_website_agent_root_without_handoff_case(wh, kind):
+    if kind == "admission":
+        await admit(wh, payload(wh))
+    else:
+        binding = wh.settings.website_bindings[0].model_copy(update={"capability_generation": 7})
+        settings = wh.settings.model_copy(update={"website_session_capabilities_enabled": True,
+                                                 "website_bindings": (binding,)})
+        wh.client._transport.app.state.settings = settings
+        created = await wh.call("POST", "/website/sessions", dict(owner_id=binding.owner_id,
+            integration_id=str(binding.integration_id), agent_id=wh.agent_id,
+            binding_generation=7))
+        assert created.status_code == 201
+    original = await root(wh)
+    await enrolled(wh)
+    async with wh.database.session_factory() as session, session.begin():
+        scope = await session.scalar(select(InboxGrantScope).with_for_update())
+        other = Conversation(id=uuid4(), owner_id=scope.owner_id,
+            integration_id=uuid4(), channel="WEBSITE_WIDGET", provider_thread_id=str(uuid4()))
+        session.add(other)
+        await session.flush()
+        await inbox_lifecycle._fence_grant_outbound(session, scope,
+                                                   await website_session.db_clock(session))
+        await session.refresh(other)
+        assert other.authority_revision == 0
+    async with wh.database.session_factory() as session:
+        current = await session.get(Conversation, original.id)
+        assert current.authority_revision == original.authority_revision + 1
+        assert current.control_mode == "AGENT"
+        assert current.handoff_resume_floor_sequence == current.last_message_sequence
 
 
 @pytest.mark.parametrize("route", ["LEGACY", "MANAGED"])
