@@ -263,8 +263,8 @@ async def test_downgrade_refuses_during_issuance_and_keeps_its_committed_credent
         await asyncio.wait_for(inserted.wait(), timeout=3)
         migration = asyncio.create_task(asyncio.to_thread(
             migrate, database_url, "downgrade", "0013_writer_retirement", expected=1))
-        rejected = await asyncio.wait_for(migration, timeout=30)
-        assert "common grant epochs prevent downgrade" in rejected.stderr
+        await observed_waiters(sql, pids[0], 1, "Website issuance before schema downgrade")
+        assert not migration.done()
     finally:
         release.set()
     created = await creating
