@@ -28,7 +28,7 @@ from models import (
 )
 from schemas.contracts import Channel, ErrorCode, Principal
 from schemas.managed import MAX_MESSAGES
-from services import catch_up
+from services import catch_up, website_grant
 from services.common import (
     db_clock,
     fingerprint,
@@ -404,20 +404,23 @@ async def select_settled_turn(
                     if binding is None:
                         continue
                     lifecycle_scope = None
-                    if channel == Channel.TELEGRAM:
+                    if channel in {Channel.TELEGRAM, Channel.WEBSITE_WIDGET}:
                         values = dict(
                             owner_id=candidate.owner_id,
                             integration_id=candidate.integration_id,
-                            channel=Channel.TELEGRAM.value,
+                            channel=channel.value,
                             agent_id=binding.agent_id,
                         )
-                        await session.execute(
-                            insert(InboxGrantScope)
-                            .values(**values)
-                            .on_conflict_do_nothing(
-                                index_elements=["owner_id", "integration_id", "channel", "agent_id"]
+                        if channel == Channel.TELEGRAM:
+                            await session.execute(
+                                insert(InboxGrantScope)
+                                .values(**values)
+                                .on_conflict_do_nothing(
+                                    index_elements=[
+                                        "owner_id", "integration_id", "channel", "agent_id"
+                                    ]
+                                )
                             )
-                        )
                         lifecycle_scope = await session.scalar(
                             select(InboxGrantScope)
                             .where(
@@ -429,14 +432,16 @@ async def select_settled_turn(
                             .with_for_update()
                             .execution_options(populate_existing=True)
                         )
-                        if lifecycle_scope is None:
+                        if lifecycle_scope is None and channel == Channel.TELEGRAM:
                             raise RuntimeError("Telegram grant scope unavailable")
                         ever_enrolled = bool(
-                            lifecycle_scope.grant_generation > 0
-                            or lifecycle_scope.cp_binding_high_water is not None
-                            or lifecycle_scope.agent_lifecycle_high_water is not None
+                            lifecycle_scope is not None and (
+                                lifecycle_scope.grant_generation > 0
+                                or lifecycle_scope.cp_binding_high_water is not None
+                                or lifecycle_scope.agent_lifecycle_high_water is not None)
                         )
-                        if ever_enrolled and not lifecycle_scope.active:
+                        if (ever_enrolled and lifecycle_scope is not None
+                                and not lifecycle_scope.active):
                             continue
                     conversation = await session.scalar(
                         select(Conversation)
@@ -446,12 +451,11 @@ async def select_settled_turn(
                     )
                     if conversation is None or conversation.control_mode != "AGENT":
                         continue
-                    if (channel == Channel.WEBSITE_WIDGET
-                            and await handoff_was_ever_enrolled(session, conversation)):
-                        # Website remains on the legacy v2 selector until the
-                        # common v3 adapter is ready. Retained floors survive
-                        # configuration removal and forbid fresh selection.
-                        continue
+                    if channel == Channel.WEBSITE_WIDGET:
+                        if await handoff_was_ever_enrolled(session, conversation):
+                            if (lifecycle_scope is None or not await website_grant.can_start_turn(
+                                    session, lifecycle_scope, conversation, settings)):
+                                continue
                     active = await session.scalar(
                         select(AgentTurn)
                         .where(
