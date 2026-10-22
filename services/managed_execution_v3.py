@@ -33,6 +33,7 @@ from schemas.contracts import (
     TurnRead,
     TurnResult,
 )
+from schemas.handoff import HandoffChannel
 from schemas.managed_v3 import (
     AuthorityEventFact,
     ControlEvidenceRequest,
@@ -44,8 +45,9 @@ from schemas.managed_v3 import (
     V3Message,
     V3OperationReference,
 )
-from services import catch_up, telegram, turns
+from services import catch_up, turns
 from services.common import authorized_conversation, db_clock, fingerprint, scope_filter
+from services.handoff_scope import lock_scope
 from services.history_projection import canonical_window
 from services.managed_client import (
     ManagedAIPort,
@@ -266,7 +268,7 @@ async def _build_request(
             owner_id=conversation.owner_id,
             integration_id=conversation.integration_id,
             agent_id=binding.agent_id,
-            channel="TELEGRAM",
+            channel=cast(HandoffChannel, conversation.channel),
             input_revision=turn.input_revision,
             authority_revision=turn.authority_revision,
             input_first_sequence=turn.input_first_sequence,
@@ -297,23 +299,26 @@ async def _locked_handoff_turn(
                 Conversation.id.label("conversation_id"),
                 Conversation.owner_id,
                 Conversation.integration_id,
+                Conversation.channel,
                 AgentTurn.managed_projection_agent_id,
             )
             .join(AgentTurn, AgentTurn.conversation_id == Conversation.id)
             .where(
                 AgentTurn.id == turn_id,
                 AgentTurn.managed_contract_version == 3,
+                Conversation.channel.in_(("TELEGRAM", "WEBSITE_WIDGET")),
                 scope_filter(principal),
             )
         )
     ).first()
     if discovered is None or discovered.managed_projection_agent_id is None:
         raise DomainError(ErrorCode.NOT_FOUND)
-    scope = await telegram._locked_handoff_scope_values(
+    scope = await lock_scope(
         session,
-        discovered.owner_id,
-        discovered.integration_id,
-        discovered.managed_projection_agent_id,
+        owner_id=discovered.owner_id,
+        integration_id=discovered.integration_id,
+        channel=discovered.channel,
+        agent_id=discovered.managed_projection_agent_id,
     )
     if scope is None:
         raise DomainError(ErrorCode.GRANT_CONFLICT)
@@ -360,7 +365,7 @@ async def _prepare_dispatch(
             (
                 item
                 for item in settings.managed_ai_bindings
-                if item.channel.value == "TELEGRAM"
+                if item.channel.value == conversation.channel
                 and item.owner_id == conversation.owner_id
                 and item.integration_id == conversation.integration_id
                 and item.agent_id == turn.managed_projection_agent_id
@@ -410,6 +415,9 @@ async def _prepare_dispatch(
                 or request.turn_id != turn.id
                 or request.conversation_id != conversation.id
                 or request.agent_id != binding.agent_id
+                or request.channel != conversation.channel
+                or request.owner_id != conversation.owner_id
+                or request.integration_id != conversation.integration_id
             ):
                 raise DomainError(ErrorCode.VALIDATION_ERROR)
         # Updating this claim epoch authorizes same-request recovery only; the
@@ -511,7 +519,7 @@ async def _finish_handoff(
                 HandoffCase.conversation_id == conversation.id,
                 HandoffCase.owner_id == conversation.owner_id,
                 HandoffCase.integration_id == conversation.integration_id,
-                HandoffCase.channel == "TELEGRAM",
+                HandoffCase.channel == conversation.channel,
                 HandoffCase.control_request_id == control.request_id,
             )
             .with_for_update()
@@ -594,7 +602,7 @@ async def _finish_handoff(
                 conversation_id=conversation.id,
                 owner_id=conversation.owner_id,
                 integration_id=conversation.integration_id,
-                channel="TELEGRAM",
+                channel=conversation.channel,
                 agent_id=turn.managed_projection_agent_id,
                 control_request_id=control.request_id,
                 control_request_fingerprint=control_fingerprint,
@@ -705,7 +713,7 @@ async def _evidence_request(prepared: PreparedManagedV3Request) -> ControlEviden
         contract_version=3,
         owner_id=value.owner_id,
         integration_id=value.integration_id,
-        channel="TELEGRAM",
+        channel=value.channel,
         agent_id=value.agent_id,
         conversation_id=value.conversation_id,
         turn_id=value.turn_id,
@@ -782,7 +790,7 @@ async def execute_claimed_turn_v3(
         (
             item
             for item in settings.managed_ai_bindings
-            if item.channel.value == "TELEGRAM"
+            if item.channel.value == prepared.request.channel
             and item.owner_id == prepared.request.owner_id
             and item.integration_id == prepared.request.integration_id
             and item.agent_id == prepared.request.agent_id

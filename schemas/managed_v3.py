@@ -8,6 +8,7 @@ from uuid import UUID
 from pydantic import BeforeValidator, Field, StrictInt, field_validator, model_validator
 
 from schemas.contracts import Contract, OwnerId, TextContent, validate_operation_id
+from schemas.handoff import HandoffChannel
 
 Counter = Annotated[StrictInt, Field(ge=1, le=9_223_372_036_854_775_807)]
 Revision = Annotated[StrictInt, Field(ge=0, le=9_223_372_036_854_775_807)]
@@ -124,7 +125,7 @@ class ManagedTurnV3Request(Contract):
     owner_id: OwnerId
     integration_id: CanonicalUUID
     agent_id: CanonicalUUID
-    channel: Literal["TELEGRAM"]
+    channel: HandoffChannel
     input_revision: Counter
     authority_revision: Revision
     input_first_sequence: Counter
@@ -276,7 +277,7 @@ class ControlEvidenceRequest(Contract):
     contract_version: ContractVersion3
     owner_id: OwnerId
     integration_id: CanonicalUUID
-    channel: Literal["TELEGRAM"]
+    channel: HandoffChannel
     agent_id: CanonicalUUID
     conversation_id: CanonicalUUID
     turn_id: CanonicalUUID

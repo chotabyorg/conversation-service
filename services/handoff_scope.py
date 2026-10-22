@@ -6,7 +6,27 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.config import Settings
+from core.errors import DomainError
 from models import InboxGrantScope
+from schemas.contracts import ErrorCode
+
+
+async def lock_scope(
+    session: AsyncSession, *, owner_id: str, integration_id: UUID,
+    channel: str, agent_id: UUID,
+) -> InboxGrantScope:
+    """Lock one exact text scope before its canonical root; retain Telegram hooks."""
+    if not session.in_transaction():
+        raise RuntimeError("Text Handoff fencing requires the caller transaction")
+    from services import inbox_lifecycle, telegram
+
+    if channel == "TELEGRAM":
+        return await telegram._locked_handoff_scope_values(
+            session, owner_id, integration_id, agent_id)
+    if channel == "WEBSITE_WIDGET":
+        return await inbox_lifecycle._lock_scope(session, dict(owner_id=owner_id,
+            integration_id=integration_id, channel=channel, agent_id=agent_id))
+    raise DomainError(ErrorCode.NOT_FOUND)
 
 
 async def lock_legacy_scopes(
@@ -22,7 +42,7 @@ async def lock_legacy_scopes(
         raise RuntimeError("Text Handoff fencing requires the caller transaction")
     if channel not in {"TELEGRAM", "WEBSITE_WIDGET"}:
         return False
-    from services import inbox_lifecycle, telegram
+    from services import telegram
 
     agent_ids = set(await session.scalars(select(InboxGrantScope.agent_id).where(
         InboxGrantScope.owner_id == owner_id,
@@ -38,12 +58,7 @@ async def lock_legacy_scopes(
                 if binding.owner_id == owner_id and binding.integration_id == integration_id)
     scopes = []
     for agent_id in sorted(agent_ids, key=str):
-        if channel == "TELEGRAM":
-            # Preserve the existing supplier hook and lock contract.
-            row = await telegram._locked_handoff_scope_values(
-                session, owner_id, integration_id, agent_id)
-        else:
-            row = await inbox_lifecycle._lock_scope(session, dict(owner_id=owner_id,
-                integration_id=integration_id, channel=channel, agent_id=agent_id))
+        row = await lock_scope(session, owner_id=owner_id, integration_id=integration_id,
+                               channel=channel, agent_id=agent_id)
         scopes.append(row)
     return any(telegram._ever_enrolled(row) for row in scopes)
